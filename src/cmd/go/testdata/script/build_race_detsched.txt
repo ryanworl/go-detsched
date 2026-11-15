@@ -1,0 +1,15 @@
+# The race detector randomizes the scheduler, which GOEXPERIMENT=detsched
+# makes deterministic, so the two can't be combined.
+
+env GOEXPERIMENT=detsched
+! go build -race .
+stderr '^go: -race is not supported with GOEXPERIMENT=detsched$'
+
+-- go.mod --
+module m
+
+go 1.27
+-- main.go --
+package main
+
+func main() {}

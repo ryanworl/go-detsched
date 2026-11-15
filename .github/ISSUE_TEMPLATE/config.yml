@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: A bug that stock Go has too
+    about: Report it to the Go project.
+    url: https://go.dev/issue/new
