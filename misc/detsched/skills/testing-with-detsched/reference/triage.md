@@ -10,7 +10,7 @@
 
 ## What a failure gives you
 
-For each failure signature, `detsched` prints the replay line and the path of the run's log, and says whether replaying it reproduced the failure. The log is the run's whole output:
+For each failure signature, `detsched` prints the path of the run's log, the replay line, and a `debug:` line that runs the replay under dlv, and says whether replaying it reproduced the failure. The log is the run's whole output:
 
 - its first line, `# ` followed by the replay line;
 - the test's output, every assertion failure (`detsched: assertion failed: MESSAGE DETAILS`), and the failing branch (`detsched: branch K (GODETBRANCH=K runs it in place)`);

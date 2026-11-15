@@ -46,20 +46,22 @@ That is all there is to it. detsched builds the package's test binary with
 the experiment, runs it on every core with one seed after another until you
 press Ctrl-C (or `-duration` passes, or `-n` runs have run), and shows
 progress as it goes. For each distinct failure it prints the log of its
-first run and a command that replays it, and checks that the command
-reproduces the failure:
+first run, a command that replays it, and the same command under Delve,
+and checks that the replay reproduces the failure:
 
 ```
 $ detsched ./testdata/bugcache
 FAIL panic: computed answer twice [recovered, repanicked]
 	log:    /tmp/detsched-334332647/fail-1.log
 	replay: cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 /tmp/detsched-334332647/bugcache.test
+	debug:  cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 dlv exec --disable-aslr /tmp/detsched-334332647/bugcache.test
 ^C
 detsched: ./testdata/bugcache: 489 runs, 174 failed, 1 signatures, 0 features, 736.0 runs/s, 1s
 ...
 FAIL 174 of 489 runs: panic: computed answer twice [recovered, repanicked]
 	log:    /tmp/detsched-334332647/fail-1.log (and 9 more in /tmp/detsched-334332647)
 	replay: cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 /tmp/detsched-334332647/bugcache.test
+	debug:  cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 dlv exec --disable-aslr /tmp/detsched-334332647/bugcache.test
 ```
 
 Flags, all optional:
@@ -141,15 +143,11 @@ program changes the schedule. Code that prints diagnostics should run only
 after an assertion has failed (`assert.Failures`), and never behind an
 environment variable that a passing run reads.
 
-To debug the failure, put `dlv exec --disable-aslr` in front of the binary
-and `--` before its arguments, on Linux and macOS alike (on macOS, without
-`--disable-aslr` the program restarts itself without ASLR and dlv's
-breakpoints are lost); [delve.md](delve.md) shows how to
-trace and inspect a replay without changing it:
-
-```
-cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 dlv exec --disable-aslr /tmp/detsched-334332647/bugcache.test --
-```
+To debug the failure, run the `debug:` line, the same command under
+Delve: `--disable-aslr` keeps dlv's breakpoints on macOS, where the
+program restarts itself without ASLR, and does nothing on Linux.
+[delve.md](delve.md) shows how to trace and inspect a replay without
+changing it.
 
 `GODETBRANCH` makes a composer timeline run its failing branch in the
 process itself rather than in a forked child, which a debugger does not

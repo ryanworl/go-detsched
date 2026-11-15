@@ -22,15 +22,17 @@ line tools.
 
 ## Replay first
 
-For each failure, `detsched` prints the path of the run's log and a replay
-line:
+For each failure, `detsched` prints the path of the run's log, a replay
+line, and the same line under Delve:
 
 ```
-cd /home/me/kv && GODETSEED=7 GODETBRANCH=10 /tmp/detsched-1234/kv.test
+	log:    /tmp/detsched-1234/fail-1.log
+	replay: cd /home/me/kv && GODETSEED=7 GODETBRANCH=10 /tmp/detsched-1234/kv.test
+	debug:  cd /home/me/kv && GODETSEED=7 GODETBRANCH=10 dlv exec --disable-aslr /tmp/detsched-1234/kv.test
 ```
 
-Run it as printed, with nothing added or removed. The run prints a trace
-line at exit,
+Run the replay line as printed, with nothing added or removed. The run
+prints a trace line at exit,
 
 ```
 detsched: trace=0x5a28688c3de0741d switches=44900 syncs=1035987
@@ -86,13 +88,18 @@ environment.
 
 ## Run it under Delve
 
-Put `dlv exec --disable-aslr` in front of the binary, and `--` in front
-of any arguments:
+Run the `debug:` line. It is the replay line with
+`dlv exec --disable-aslr` in front of the binary and `--` in front of any
+arguments:
 
 ```
 cd /home/me/kv && GODETSEED=7 GODETBRANCH=10 dlv exec --disable-aslr /tmp/detsched-1234/kv.test
 cd /home/me/kv && GODETSEED=7 GODETBRANCH=0 dlv exec --disable-aslr /tmp/detsched-1234/kv.test -- -test.run=TestCompose
 ```
+
+The log's first line holds only the replay line; make that edit yourself
+when you start from the log. Delve's own flags, such as `--init`, go right
+after the binary, before `--`.
 
 On macOS, `--disable-aslr` is required. A program built with the
 experiment that finds itself loaded at a random address runs itself again

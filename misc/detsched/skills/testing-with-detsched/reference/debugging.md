@@ -13,7 +13,7 @@ Run dlv non-interactively from a command file and read its saved output. The hum
 
 ## Run a replay under dlv
 
-Take the replay line and put `dlv exec --disable-aslr` before the binary and `--` before its arguments, keeping everything else:
+Take the `debug:` line `detsched` prints under the `replay:` line. It is the replay line with `dlv exec --disable-aslr` before the binary and `--` before its arguments (the log's first line has only the replay line; make that edit when starting from the log). Add dlv's flags right after the binary, before `--`:
 
 ```
 cd /abs/pkg && GODETSEED=N GODETBRANCH=K dlv exec --disable-aslr /tmp/detsched-XXXX/pkg.test --init cmds.dlv --allow-non-terminal-interactive=true -- -test.run=TestX </dev/null >dlv.out 2>&1

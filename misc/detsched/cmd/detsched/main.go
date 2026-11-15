@@ -149,6 +149,7 @@ type search struct {
 	claimed    map[int]bool // new features of plain runs' cells not stopped yet
 	kept       int          // cells when the search ended
 	lowMem     bool         // memory ran low, which has been reported
+	memWaited  time.Time    // when waitMem last reported waiting
 	baseTrace  string       // the trace line of the base run, seed 1
 	unstable   string       // how seed 1 ran two schedules, or ""
 	only       int          // the only arm to run, for measuring, or -1
@@ -171,6 +172,7 @@ type group struct {
 	runs   int      // runs that failed this way
 	logs   []string // the kept logs
 	replay string   // the command that replays the first run
+	debug  string   // the same under Delve
 	status string   // whether running replay reproduced the failure
 }
 
@@ -380,8 +382,11 @@ func addSearch(env []string, fields ...string) []string {
 func (s *search) temp(name string) string { return filepath.Join(s.out, name) }
 
 // replayLine returns a shell command line that runs r again, in place of
-// the branch of a composer timeline it failed in, if any.
-func (s *search) replayLine(r *result) string {
+// the branch of a composer timeline it failed in, if any. With debug, it
+// runs it under Delve instead: --disable-aslr because on macOS the
+// program re-executes itself without ASLR, which loses Delve's
+// breakpoints.
+func (s *search) replayLine(r *result, debug bool) string {
 	env := []string{fmt.Sprintf("GODETSEED=%d", r.seed), fmt.Sprintf("GODETBRANCH=%d", r.branch())}
 	if r.tape != "" {
 		env = addSearch(env, "tape="+r.tape)
@@ -393,7 +398,13 @@ func (s *search) replayLine(r *result) string {
 		k, v, _ := strings.Cut(e, "=")
 		fmt.Fprintf(&b, "%s=%s ", k, quote(v))
 	}
+	if debug {
+		b.WriteString("dlv exec --disable-aslr ")
+	}
 	b.WriteString(quote(s.bin))
+	if debug && len(s.args) > 0 {
+		b.WriteString(" --")
+	}
 	for _, a := range s.args {
 		b.WriteString(" " + quote(a))
 	}
@@ -654,7 +665,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	g := s.byKey[r.key()]
 	first := g == nil
 	if first {
-		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r), status: "replaying"}
+		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying"}
 		s.byKey[g.key] = g
 		s.groups = append(s.groups, g)
 	}
@@ -665,13 +676,13 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		g.logs = append(g.logs, log)
 	}
 	if first {
-		s.printf("FAIL %s\n\tlog:    %s\n\treplay: %s\n", g.sig, log, g.replay)
+		s.printf("FAIL %s\n\tlog:    %s\n\treplay: %s\n\tdebug:  %s\n", g.sig, log, g.replay, g.debug)
 	}
 	s.mu.Unlock()
 
 	if log != "" {
 		s.mu.Lock()
-		line := s.replayLine(r)
+		line := s.replayLine(r, false)
 		s.mu.Unlock()
 		data := append([]byte("# "+line+"\n"), r.output...)
 		if err := os.WriteFile(log, data, 0o666); err != nil {
@@ -698,8 +709,8 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 					s.vars = append(s.vars, v)
 				}
 			}
-			g.replay = s.replayLine(r)
-			s.printf("detsched: the replay of %q needs %s: %s\n", g.sig, strings.Join(vars, " "), g.replay)
+			g.replay, g.debug = s.replayLine(r, false), s.replayLine(r, true)
+			s.printf("detsched: the replay of %q needs %s:\n\treplay: %s\n\tdebug:  %s\n", g.sig, strings.Join(vars, " "), g.replay, g.debug)
 			s.mu.Unlock()
 			if log != "" {
 				if err := os.WriteFile(log, append([]byte("# "+g.replay+"\n"), r.output...), 0o666); err != nil {
@@ -841,7 +852,7 @@ func (s *search) summary(w io.Writer) {
 			more = fmt.Sprintf(" (and %d more in %s)", len(g.logs)-1, s.out)
 		}
 		fmt.Fprintf(w, "\tlog:    %s%s\n", g.logs[0], more)
-		fmt.Fprintf(w, "\treplay: %s\n", g.replay)
+		fmt.Fprintf(w, "\treplay: %s\n\tdebug:  %s\n", g.replay, g.debug)
 		fmt.Fprintf(w, "\tthe replay %s\n", verdict(g.status))
 	}
 }

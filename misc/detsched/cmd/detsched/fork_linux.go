@@ -39,12 +39,29 @@ func memory() (avail, total uint64) {
 			max, err1 := readUint("/sys/fs/cgroup" + dir + "/memory.max")
 			cur, err2 := readUint("/sys/fs/cgroup" + dir + "/memory.current")
 			if err1 == nil && err2 == nil {
+				// The page cache counts in memory.current, but the
+				// kernel reclaims it before it runs out, as
+				// MemAvailable assumes; shared memory it can't.
+				cache := statField(dir, "file") - min(statField(dir, "shmem"), statField(dir, "file"))
+				cur -= min(cache, cur)
 				total = min(total, max)
 				avail = min(avail, max-min(cur, max))
 			}
 		}
 	}
 	return avail, total
+}
+
+// statField returns a field of the cgroup's memory.stat, or 0.
+func statField(dir, key string) uint64 {
+	b, _ := os.ReadFile("/sys/fs/cgroup" + dir + "/memory.stat")
+	for line := range strings.Lines(string(b)) {
+		if v, ok := strings.CutPrefix(line, key+" "); ok {
+			n, _ := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+			return n
+		}
+	}
+	return 0
 }
 
 func readUint(file string) (uint64, error) {

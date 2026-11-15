@@ -783,11 +783,17 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 
 // waitMem waits while memory is low, closing idle stopped programs.
 func (s *search) waitMem(ctx context.Context) {
+	start := time.Now()
 	for ctx.Err() == nil {
 		s.mu.Lock()
 		if !s.memLow() {
 			s.mu.Unlock()
 			return
+		}
+		if time.Since(start) > 5*time.Second && time.Since(s.memWaited) > 30*time.Second {
+			s.memWaited = time.Now()
+			avail, total := memory()
+			s.printf("detsched: waiting to start runs until a quarter of the memory is available: %d of %d MB\n", avail>>20, total>>20)
 		}
 		idle := s.trim(0)
 		s.mu.Unlock()
