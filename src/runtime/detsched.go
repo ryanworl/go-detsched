@@ -909,7 +909,15 @@ func detStrictTimer(f func(any, uintptr, int64), arg any) {
 
 // detSyscallRetakeNS is how long a goroutine stays in one system call
 // before detWatchdog hands off its P. detWatchdog checks this often.
-const detSyscallRetakeNS = 10 * 1000 * 1000
+// During package init it waits detInitSyscallRetakeNS instead: init makes
+// system calls that never wait for another goroutine, such as getcwd in
+// package os and sysctl in package syscall on darwin, and on a loaded
+// machine one of them can take 10ms; a hand-off there would make the run
+// take another schedule before main.
+const (
+	detSyscallRetakeNS     = 10 * 1000 * 1000
+	detInitSyscallRetakeNS = 1000 * 1000 * 1000
+)
 
 // detWatchdog is the det-mode replacement for sysmon. It runs on its own
 // M without a P, and only hands off the P of a goroutine that stays in
@@ -952,12 +960,13 @@ func detRetakeSyscall(now int64) {
 	incidlelocked(-1)
 	thread, ok := setBlockOnExitSyscall(pp)
 	if ok {
-		if syst := pp.syscalltick; pd.syscalltick != syst {
-			// A different system call than last time: start timing it.
+		if syst := pp.syscalltick; pd.syscalltick != syst || pd.syscallwhen == 0 {
+			// A different system call than last time, or the first one
+			// seen, whose count may be the initial 0: start timing it.
 			pd.syscalltick = syst
 			pd.syscallwhen = now
 			thread.resume()
-		} else if now-pd.syscallwhen < detSyscallRetakeNS {
+		} else if d := now - pd.syscallwhen; d < detSyscallRetakeNS || d < detInitSyscallRetakeNS && !mainInitDone.Load() {
 			thread.resume()
 		} else {
 			// The goroutine is held in _Gsyscall and the P is ours, so

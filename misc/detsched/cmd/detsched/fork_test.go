@@ -32,62 +32,86 @@ func TestFork(t *testing.T) {
 		defer cleanup()
 		for _, godebug := range []string{"off", "walk", "pct"} {
 			env := []string{"GODETSEED=4", "GODETSEARCH=perturb=" + godebug}
-			s, err := startForkServer(command(bin, env...))
-			if err != nil {
-				t.Fatalf("%s %s: %v", pkg, godebug, err)
-			}
-			compared := 0
-			// At switch 2 the runtime's init runs with the P on another
-			// thread, so that stop waits for it to come back.
-			for _, n := range []uint64{1, 2, 7, 30} {
-				// The server stops first at switch 1, and a run to a
-				// switch at or before the current one runs to the end.
-				if n != s.at {
-					ok, err := s.run(n)
-					if err != nil {
-						t.Fatalf("%s %s: run to %d: %v", pkg, godebug, n, err)
-					}
-					if !ok {
-						break
-					}
+			// A run leaves the deterministic subset when a system call
+			// takes 10ms of real time, such as getcwd in package os's
+			// init on a loaded macOS machine, and then differs.
+			for try := 1; compareForks(t, pkg+" "+godebug, bin, env); try++ {
+				if try == 3 {
+					t.Errorf("%s %s: a run left the deterministic subset %d times", pkg, godebug, try)
+					break
 				}
-				// Seed 2 also sets PCT's horizon.
-				for _, seed := range []uint64{1, 2} {
-					steps := (seed - 1) * 5000
-					got, err := s.branchOutcome(seed, steps)
-					if _, ok := err.(errRefused); ok {
-						if n == 2 {
-							t.Errorf("%s %s: branch at %d (stopped at 2): %v", pkg, godebug, s.at, err)
-						}
-						// Such as with an M in a system call.
-						t.Logf("%s %s: branch at %d: %v", pkg, godebug, n, err)
-						break
-					}
-					if err != nil {
-						t.Fatalf("%s %s: branch at %d: %v", pkg, godebug, n, err)
-					}
-					// A stop waits for the P to be on the main thread, so
-					// it may be after n.
-					tape := fmt.Sprintf("GODETSEARCH=tape=%d:%d", s.at, seed)
-					if steps > 0 {
-						tape += fmt.Sprintf(":%d", steps)
-					}
-					want, _, err := runBin(bin, append(env, tape)...)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if got != want {
-						t.Errorf("%s %s %s: forked child differs from re-execution:\nforked: %+v\nre-run: %+v", pkg, godebug, tape, got, want)
-					}
-					compared++
-				}
-			}
-			s.close()
-			if compared == 0 {
-				t.Errorf("%s %s: no branch was compared", pkg, godebug)
+				t.Logf("%s %s: a run left the deterministic subset; trying again", pkg, godebug)
 			}
 		}
 	}
+}
+
+// compareForks runs bin with env under a fork server and compares children
+// forked at a few switches with re-executions, as TestFork describes. It
+// reports whether it stopped because a child or a re-execution left the
+// deterministic subset, which makes the runs differ by design.
+func compareForks(t *testing.T, name, bin string, env []string) (left bool) {
+	t.Helper()
+	s, err := startForkServer(command(bin, env...))
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	defer s.close()
+	compared := 0
+	// At switch 2 the runtime's init runs with the P on another thread,
+	// so that stop waits for it to come back.
+	for _, n := range []uint64{1, 2, 7, 30} {
+		// The server stops first at switch 1, and a run to a switch at
+		// or before the current one runs to the end.
+		if n != s.at {
+			ok, err := s.run(n)
+			if err != nil {
+				t.Fatalf("%s: run to %d: %v", name, n, err)
+			}
+			if !ok {
+				break
+			}
+		}
+		// Seed 2 also sets PCT's horizon.
+		for _, seed := range []uint64{1, 2} {
+			steps := (seed - 1) * 5000
+			got, err := s.branchOutcome(seed, steps)
+			if _, ok := err.(errRefused); ok {
+				if n == 2 {
+					t.Errorf("%s: branch at %d (stopped at 2): %v", name, s.at, err)
+				}
+				// Such as with an M in a system call.
+				t.Logf("%s: branch at %d: %v", name, n, err)
+				break
+			}
+			if err != nil {
+				t.Fatalf("%s: branch at %d: %v", name, n, err)
+			}
+			// A stop waits for the P to be on the main thread, so it may
+			// be after n.
+			tape := fmt.Sprintf("GODETSEARCH=tape=%d:%d", s.at, seed)
+			if steps > 0 {
+				tape += fmt.Sprintf(":%d", steps)
+			}
+			want, _, err := runBin(bin, append(env, tape)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				// A child also reports what the server did before the fork.
+				const leftLine = "left the deterministic subset"
+				if strings.Contains(got.stderr, leftLine) || strings.Contains(want.stderr, leftLine) {
+					return true
+				}
+				t.Errorf("%s %s: forked child differs from re-execution:\nforked: %+v\nre-run: %+v", name, tape, got, want)
+			}
+			compared++
+		}
+	}
+	if compared == 0 {
+		t.Errorf("%s: no branch was compared", name)
+	}
+	return false
 }
 
 // TestForkIdleM checks that a child forked while an M is parked idle
