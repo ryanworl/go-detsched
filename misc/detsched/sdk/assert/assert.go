@@ -9,8 +9,9 @@
 // With GOEXPERIMENT=detsched, the runtime reports every failure (an Always
 // that is false, an Unreachable that is reached) at exit, as a line
 // "detsched: assertion failed: MESSAGE DETAILS", by which detsched groups
-// failing runs, and makes a run that would exit with status 0 exit with
-// status 3. detsched's search also treats the first run that evaluates an
+// failing runs, fails a test during which one failed, so that package
+// testing prints its log, and makes a run that would exit with status 0
+// exit with status 3. detsched's search also treats the first run that evaluates an
 // assertion one way, such as the first Sometimes that is true, as a new
 // state to explore from. Without the experiment, failures are printed to
 // standard error and nothing else happens.

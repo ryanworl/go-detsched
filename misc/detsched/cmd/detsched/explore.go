@@ -915,7 +915,8 @@ func (s *search) guardMem(ctx context.Context) {
 
 // runSrv runs f, which waits for a reply from srv, within the run's
 // timeout from start, and stops process pid when it passes or ctx is
-// done.
+// done. It then clears the deadline, since srv may be kept and serve
+// other runs.
 func (s *search) runSrv(ctx context.Context, srv *forkServer, pid int, start time.Time, f func() (bool, error)) (bool, error) {
 	srv.conn.SetReadDeadline(start.Add(s.timeout))
 	stop := context.AfterFunc(ctx, func() { srv.conn.SetReadDeadline(time.Now()) })
@@ -924,6 +925,7 @@ func (s *search) runSrv(ctx context.Context, srv *forkServer, pid int, start tim
 		syscall.Kill(pid, syscall.SIGKILL)
 		return false, errCanceled
 	}
+	srv.conn.SetReadDeadline(time.Time{})
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		syscall.Kill(pid, syscall.SIGQUIT)
 		go func() {

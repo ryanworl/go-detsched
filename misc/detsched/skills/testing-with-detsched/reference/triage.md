@@ -39,6 +39,7 @@ Decide with evidence from the replay, not from the message alone. Assume the har
 ## Signatures that are usually not SUT bugs
 
 - `a goroutine waits for a mutex that a crashed node holds` or a stall after a crash: process-global state shared between nodes (a package variable of the SUT or a dependency), or a harness lock shared between nodes.
+- A run that times out after a crash with live goroutines in `chan send (durable)` or `chan receive (durable)` inside a lock, and a goroutine labeled `node N crashed` frozen in the same lock: a lock made of a channel, shared between nodes. A crashed node's goroutine runs on to release only a `sync.Mutex` or `RWMutex`, so replace the channel lock with a `sync.Mutex`, which under the experiment counts as durably blocked as upstream synctest's channel did.
 - A run that ends at the per-run timeout with little output: a nemesis callback (`Event`, `Restart`) waiting for a node, a harness lock held by a paused node, or an oracle that is too slow (profile it). Read the stacks in the log.
 - `concurrent map writes` in harness code: a harness map without a mutex.
 - Socket calls failing with `EPERM`: code running on a goroutine of no node.

@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched4
+v=go1.27.4-detsched5
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -71,7 +71,9 @@ Flags, all optional:
   checks the same N runs every time.
 - `-timeout d` (default 10m) stops a run that takes longer, with `SIGQUIT`,
   so that its log shows every goroutine, and counts it as a failure. The
-  summary prints the slowest passing and failing runs to choose it from.
+  summary prints the slowest passing and failing runs to choose it from,
+  and the progress line counts the runs going on for over 10 times as long
+  as the slowest passing run, which may hang, before `-timeout` stops them.
 - `-p n` (default: the number of CPUs) runs `n` programs at once. Lower it
   when each run takes enough memory that a run per CPU would make the
   machine swap.
@@ -162,10 +164,10 @@ goroutine switch, and diff their standard error.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched4:
+and release N's version is v0.N.0, so with go1.27.4-detsched5:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.4.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.5.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -175,9 +177,10 @@ build and pass with stock Go.
 - `assert`, after the Antithesis SDK: `Always`, `AlwaysOrUnreachable`,
   `Sometimes`, `Reachable`, and `Unreachable`, identified by their message.
   Under the experiment, every failure is reported at exit as
-  `detsched: assertion failed: MESSAGE DETAILS`, and a run that would exit
-  with status 0 exits with status 3. `assert.Failures` counts the failures
-  so far, so a test can print its history after one.
+  `detsched: assertion failed: MESSAGE DETAILS`, a test during which an
+  assertion failed fails too, so that its log is printed, and a run that
+  would exit with status 0 exits with status 3. `assert.Failures` counts
+  the failures so far, so a test can print its history after one.
 - `buggify`, after FoundationDB's BUGGIFY: `buggify.On("site")` marks a
   place to inject a fault. Each run enables a quarter of the sites, and an
   enabled site fires a quarter of the time. `Disable` turns sites off.
@@ -340,7 +343,13 @@ it, so the replay command a failure prints shows the timeline again.
   that holds a `sync.Mutex` or `RWMutex` a live node waits for runs on, as
   a zombie whose system calls fail with `EIO`, until it releases it. So a
   lock shared between nodes must not be held across a call into a node's
-  code, where a zombie may wait for its node's frozen goroutines.
+  code, where a zombie may wait for its node's frozen goroutines. Only
+  those two types are released this way: a lock made of a channel (a
+  `chan struct{}` of capacity 1, as code written for upstream synctest
+  often uses, since upstream never counts a goroutine waiting for a
+  `sync.Mutex` as durably blocked) that a crashed node held stays held,
+  and every live node that takes it waits forever. Under the experiment a
+  goroutine waiting for a `sync.Mutex` is durably blocked, so use one.
 - **Shared state.** The simulation gives each node its own disk,
   network stack, and process ID, but not its own memory: package
   variables are one per test process, not per node. A library's global

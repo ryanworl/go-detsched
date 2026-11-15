@@ -2193,13 +2193,29 @@ func tRunner(t *T, fn func(t *T)) {
 
 	t.start = highPrecisionTimeNow()
 	t.resetRaces()
+	asserts := 0
+	if goexperiment.DetSched {
+		asserts = detAssertFailures()
+	}
 	fn(t)
+	if goexperiment.DetSched && detAssertFailures() > asserts && !t.Failed() {
+		// Fail the test, so that its log is printed. The runtime prints
+		// the failed assertions at exit.
+		t.Fail()
+	}
 
 	// code beyond here will not be executed when FailNow is invoked
 	t.mu.Lock()
 	t.finished = true
 	t.mu.Unlock()
 }
+
+// detAssertFailures returns how many assertions of package
+// detsched/sdk/assert have failed, under GOEXPERIMENT=detsched. It is
+// provided by the runtime.
+//
+//go:linkname detAssertFailures
+func detAssertFailures() int
 
 // Run runs f as a subtest of t called name. It runs f in a separate goroutine
 // and blocks until f returns or calls t.Parallel to become a parallel test.

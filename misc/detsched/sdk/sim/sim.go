@@ -52,7 +52,13 @@
 // system calls fail with EIO, until it releases it, and then freezes
 // again. So a lock that harness code shares between nodes must not be
 // held across a call into a node's code: a zombie that waits there for
-// its node's frozen goroutines never releases it.
+// its node's frozen goroutines never releases it. Only those two types run
+// on as zombies: a lock made of a channel, such as a chan struct{} of
+// capacity 1, that a frozen goroutine holds stays held, and every live
+// node that takes it waits forever. Code written for upstream synctest
+// uses such locks because upstream never counts a goroutine waiting for a
+// sync.Mutex as durably blocked; under the experiment it does, so use a
+// sync.Mutex.
 //
 // All of the simulation's random choices come from the runtime's fault
 // stream, which GODETSEED seeds. Each World draws its network's timing,

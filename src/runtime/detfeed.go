@@ -641,6 +641,13 @@ func detAssertFailed(msg, details string) {
 	detSDK.failures++
 }
 
+// testing_detAssertFailures returns how many assertions have failed, so
+// that package testing can fail a test during which one failed, and so
+// print its log.
+//
+//go:linkname testing_detAssertFailures testing.detAssertFailures
+func testing_detAssertFailures() int { return detSDK.failures }
+
 // detSDKAssert records an assertion of kind with message msg evaluated to
 // cond. details describes a failing assertion; it is empty otherwise.
 //

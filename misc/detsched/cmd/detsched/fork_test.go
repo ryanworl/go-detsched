@@ -325,6 +325,25 @@ func TestSearchSetup(t *testing.T) {
 	}
 }
 
+// TestSearchTimeout checks that a search runs on past -timeout, forking
+// stopped programs it keeps from before then.
+func TestSearchTimeout(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	s, err := newSearch("../../testdata/bugrarelock", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.workers, s.timeout = 4, time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := s.run(ctx, 0); err != nil {
+		t.Fatalf("%v\n%s", err, searchReport(s))
+	}
+	if s.arms[armCell].launches == 0 {
+		t.Errorf("no runs from cells:\n%s", searchReport(s))
+	}
+}
+
 // TestSearchReports checks that the search prints where seed 1 leaves the
 // deterministic subset: here, by starting a subprocess.
 func TestSearchReports(t *testing.T) {

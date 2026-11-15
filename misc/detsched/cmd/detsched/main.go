@@ -778,10 +778,27 @@ func (s *search) printf(format string, args ...any) {
 	}
 }
 
-// status returns a line of counts. s.mu must be held.
+// status returns a line of counts, including the runs going on for over
+// 10 times as long as any run that passed, which may hang, so that they
+// show before -timeout stops them. s.mu must be held.
 func (s *search) status() string {
 	d := time.Since(s.start)
-	return fmt.Sprintf("%d runs, %d failed, %d signatures, %d features, %.1f runs/s, %v", s.runs, s.failed, len(s.groups), s.features, float64(s.runs)/d.Seconds(), d.Round(time.Second))
+	line := fmt.Sprintf("%d runs, %d failed, %d signatures, %d features, %.1f runs/s, %v", s.runs, s.failed, len(s.groups), s.features, float64(s.runs)/d.Seconds(), d.Round(time.Second))
+	limit, why := 10*s.slowPass, " (10 times the slowest pass)"
+	if limit < 10*time.Second {
+		limit, why = 10*time.Second, ""
+	}
+	slow, oldest := 0, time.Duration(0)
+	for l := range s.running {
+		if age := time.Since(l.start); !l.stopped && age > limit {
+			slow++
+			oldest = max(oldest, age)
+		}
+	}
+	if slow > 0 {
+		line += fmt.Sprintf("; %d runs going on for over %v%s, the oldest for %v; -timeout is %v", slow, limit.Round(time.Second), why, oldest.Round(time.Second), s.timeout)
+	}
+	return line
 }
 
 // report prints the status line every second on a terminal, else every

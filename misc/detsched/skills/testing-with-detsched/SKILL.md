@@ -28,7 +28,7 @@ The loop: write or change the harness, run `detsched ./pkg`, take each failure s
 
 ## Gotchas
 
-- `t.Logf` output and `-test.v` are not available for diagnosis: `-test.v` changes the schedule, and a run that fails only through an assertion may never print the log. Write what you need to know (the configuration a run drew, the history a check depends on) into the harness's own failure dump.
+- Don't add `-test.v` for diagnosis: it changes the schedule. A test during which an assertion failed fails too, so its `t.Logf` output is in the failure log, but a run that hangs or dies before its test returns prints none of it. Write what you need to know (the configuration a run drew, the history a check depends on) into the harness's own failure dump.
 - The fault timeline (`sim: 9.408758544 server: power failure`) is printed to stderr after a failing run's output. Its times are seconds since the World was created; read it before setting any breakpoint on a crash or disk fault.
 - A breakpoint that never stops is not evidence that the code never runs. If `dlv.out` has `detsched: running again without ASLR`, dlv was started without `--disable-aslr` (needed on macOS) and lost every breakpoint. Otherwise check the location dlv reports when it sets the breakpoint, and confirm with a tracepoint on the function's entry.
 - A hung run usually spins: some timer keeps moving the virtual clock. `detsched` stops it at its per-run timeout and the kept log holds every goroutine's stack; goroutines of crashed nodes are labeled `node N crashed` in their headers and are frozen, so read the live ones first.
