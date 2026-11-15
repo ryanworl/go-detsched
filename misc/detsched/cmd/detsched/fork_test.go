@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -306,7 +307,19 @@ func TestSearchSetup(t *testing.T) {
 func TestSearchCompose(t *testing.T) {
 	t.Setenv("SIMCOMPOSE_BUG", "1")
 	t.Setenv("SIMCOMPOSE_UNREAD", "1")
-	s := runSearch(t, "../../testdata/simcompose", 60)
+	t.Setenv("TMPDIR", t.TempDir())
+	s, err := newSearch("../../testdata/simcompose", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Plain runs of fresh seeds, so that the same seeds run every time:
+	// the default mix depends on timing and sometimes misses the bug in
+	// 60 runs. Seeds 2 to 60 fail 9 times on linux/amd64 and 10 times on
+	// darwin/arm64.
+	s.workers, s.only, s.noFork = 4, armFresh, true
+	if err := s.run(context.Background(), 60); err != nil {
+		t.Fatal(err)
+	}
 	if len(s.groups) == 0 {
 		t.Fatalf("no failure:\n%s", searchReport(s))
 	}

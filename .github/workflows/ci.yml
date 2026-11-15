@@ -33,3 +33,49 @@ jobs:
         run: GOROOT_BOOTSTRAP="$(go env GOROOT)" misc/release/build.bash
       - name: Gate
         run: misc/release/gate.bash
+
+  # A seed's schedule must not depend on the machine that runs it: the
+  # linux/arm64 binaries give the same traces under qemu on linux/amd64 and
+  # on a linux/arm64 machine.
+  traces-qemu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          cache: false
+      - name: Build the toolchain
+        run: GOROOT_BOOTSTRAP="$(go env GOROOT)" misc/release/build.bash
+      - name: Run the linux/arm64 binaries under qemu
+        run: |
+          sudo apt-get install -y -q qemu-user-static
+          export PATH=$PWD/bin:$PATH
+          GOARCH=arm64 misc/release/traces.bash -build traces
+          misc/release/traces.bash traces qemu-aarch64-static | tee traces/qemu.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: traces
+          path: traces
+          if-no-files-found: error
+
+  traces-arm64:
+    needs: traces-qemu
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: traces
+          path: traces
+      - name: Compare with the same binaries on linux/arm64
+        run: |
+          chmod +x traces/*.test
+          misc/release/traces.bash traces | tee native.txt
+          diff traces/qemu.txt native.txt

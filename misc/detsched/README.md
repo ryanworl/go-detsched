@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched1
+v=go1.27.4-detsched2
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -159,10 +159,10 @@ goroutine switch, and diff their standard error.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched1:
+and release N's version is v0.N.0, so with go1.27.4-detsched2:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.1.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.2.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`

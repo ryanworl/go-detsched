@@ -52,7 +52,11 @@ func detsimLibcCall(fn uintptr, args []uintptr, raw bool) (r1, r2, err uintptr, 
 		if raw && !detsimRawLibc(fn) || noNode && detsimLibcName(fn) != "socket" {
 			return
 		}
+		// On the system stack, where the caller's nosplit chain leaves
+		// room for them.
+		ticks, q, last := detsimEnter()
 		r1, r2, err, ok = detsim.handler(node, fn, a)
+		detsimExit(ticks, q, last)
 	})
 	if detG(gp).wait != 0 {
 		detsimWaitDevice(gp)

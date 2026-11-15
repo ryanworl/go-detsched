@@ -41,7 +41,9 @@ bin=$root/bin
 if [ "$goos/$goarch" != "$("$go" env GOHOSTOS)/$("$go" env GOHOSTARCH)" ]; then
 	bin=$root/bin/${goos}_$goarch
 fi
-(cd "$root/misc/detsched" && CGO_ENABLED=0 "$go" build -trimpath -o "$bin/" ./cmd/detsched)
+# -buildvcs=false: the same tree builds the same archive in the development
+# repository and in the published one, whose commits differ.
+(cd "$root/misc/detsched" && CGO_ENABLED=0 "$go" build -trimpath -buildvcs=false -o "$bin/" ./cmd/detsched)
 echo "Installed detsched in $bin"
 
 if ! $distpack; then

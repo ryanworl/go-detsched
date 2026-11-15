@@ -77,9 +77,11 @@ misc/release/publish.bash            # publish the tree
 misc/release/publish.bash -tag       # publish it as a release
 ```
 
-To release, push a commit to main that sets VERSION to the release, run
-the gate, publish with `publish.bash -m VERSION` and wait for CI to pass on
-GitHub, then run `publish.bash -tag`. When the public main already has the
+To release, push a commit to main that sets VERSION to the release (and
+the version in the install examples of `.github/README.md` and
+`misc/detsched/README.md`), run the gate, publish with
+`publish.bash -m VERSION` and wait for CI to pass on GitHub, then run
+`publish.bash -tag`. When the public main already has the
 tree it adds no commit; either way it tags the public commit with the
 version, which starts the release workflow, and with the SDK's
 `misc/detsched/v0.N.0`, and tags the development commit with the version.
