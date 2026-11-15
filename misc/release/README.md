@@ -87,10 +87,10 @@ Then push a commit that moves VERSION to N+1.
 
 The release workflow (`.github/workflows/release.yml`) checks that the tag
 is VERSION, builds the three archives on Linux, runs `smoke.bash` on
-linux/amd64, linux/arm64, and darwin/arm64 (macOS 14 and 15), and
+linux/amd64, linux/arm64, and darwin/arm64 (macOS 15 and 26), and
 publishes the archives and `SHA256SUMS` as the tag's GitHub release. CI
 (`.github/workflows/ci.yml`) runs `build.bash` and `gate.bash` for every
-push and pull request on Linux (amd64) and macOS 14 and 15 (arm64).
+push and pull request on Linux (amd64) and macOS 15 and 26 (arm64).
 
 `publish.bash -root` starts the public history over: its commit has no
 parent and replaces the public main branch.

@@ -54,8 +54,8 @@ jobs:
         include:
           - {target: linux-amd64, os: ubuntu-24.04}
           - {target: linux-arm64, os: ubuntu-24.04-arm}
-          - {target: darwin-arm64, os: macos-14}
           - {target: darwin-arm64, os: macos-15}
+          - {target: darwin-arm64, os: macos-26}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
