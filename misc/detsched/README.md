@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched3
+v=go1.27.4-detsched4
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -72,6 +72,9 @@ Flags, all optional:
 - `-timeout d` (default 10m) stops a run that takes longer, with `SIGQUIT`,
   so that its log shows every goroutine, and counts it as a failure. The
   summary prints the slowest passing and failing runs to choose it from.
+- `-p n` (default: the number of CPUs) runs `n` programs at once. Lower it
+  when each run takes enough memory that a run per CPU would make the
+  machine swap.
 
 detsched exits with status 1 if any run failed.
 
@@ -159,10 +162,10 @@ goroutine switch, and diff their standard error.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched3:
+and release N's version is v0.N.0, so with go1.27.4-detsched4:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.3.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.4.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -224,15 +227,20 @@ bubbles still use real time.
 The runtime reports, once per distinct stack, each place where a program
 leaves the deterministic subset: waiting for a file or network connection to
 become ready, staying in a system call long enough for the watchdog to hand
-off the P, a timer outside every bubble firing, and the bubble rule above
-acting where upstream would hang. It does not catch system calls that
-return data from the OS, such as the process ID or file contents.
+off the P, starting a subprocess, a timer outside every bubble firing, and
+the bubble rule above acting where upstream would hang. detsched prints the
+reports of the first run, seed 1, when the search starts. The runtime does
+not catch system calls that return data from the OS, such as the process ID
+or file contents.
 
 A forked run is identical to re-executing its tape. A program refuses to
-fork while it uses cgo, during package initialization, while a goroutine is
-in a system call or locked to its thread, while a file is registered with
-the network poller, and on macOS once it has used the system's certificate
-verifier; detsched then runs without forking. Real files open across a fork
+fork while `runtime.iscgo` is set, which detsched's `CGO_ENABLED=0` build
+leaves unset unless a package sets it, as
+`github.com/ebitengine/purego/internal/fakecgo` does; during package
+initialization; while a goroutine is in a system call or locked to its
+thread; while a file is registered with the network poller; and on macOS
+once it has used the system's certificate verifier. detsched then runs
+without forking. Real files open across a fork
 share their offsets, locks, and shared mappings between processes, and
 subprocesses started before it are not the children's children, so a
 program that forks should keep to simulated files and start no processes.

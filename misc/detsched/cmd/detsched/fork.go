@@ -44,15 +44,19 @@ const (
 	forkWithSeen     = 4
 )
 
+// forkCgo is the reason a program with runtime.iscgo set gives, for
+// every fork.
+const forkCgo = 1
+
 var forkReasons = map[uint64]string{
-	1: "cgo threads",
-	2: "the P is not on the main thread",
-	3: "an M that is locked to a goroutine, in a system call, or the template thread",
-	4: "descriptors registered with the network poller",
-	5: "already branched at this switch",
-	6: "bad descriptors",
-	7: "clone failed",
-	8: "the system's certificate verifier was used, and its connection to trustd does not survive fork",
+	forkCgo: "runtime.iscgo is set, though detsched builds without cgo; github.com/ebitengine/purego's internal/fakecgo sets it",
+	2:       "the P is not on the main thread",
+	3:       "an M that is locked to a goroutine, in a system call, or the template thread",
+	4:       "descriptors registered with the network poller",
+	5:       "already branched at this switch",
+	6:       "bad descriptors",
+	7:       "clone failed",
+	8:       "the system's certificate verifier was used, and its connection to trustd does not survive fork",
 }
 
 // errRefused is returned by branch when the program cannot fork.

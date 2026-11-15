@@ -666,6 +666,20 @@ var detOut struct {
 	onFailure  bool // write it only if the exit status is nonzero; see detsimBranch
 }
 
+// syscall_detStartProcess reports that the running goroutine starts the
+// program argv0, if the runtime reports (see detReporting): when the
+// subprocess's output and exit arrive depends on the OS.
+//
+//go:linkname syscall_detStartProcess syscall.detStartProcess
+func syscall_detStartProcess(argv0 string) {
+	if !detReporting() {
+		return
+	}
+	what := "starts a subprocess (" + argv0 + "), whose timing comes from the OS"
+	gp := getg()
+	systemstack(func() { detStrictOS(what, gp) })
+}
+
 // syscall_detWrite stores p as output to fd 1 or 2 and returns len(p)
 // (or what the real write returned, after detOutputFlush). Only the
 // goroutine holding the single P calls it, so acquirem is enough to

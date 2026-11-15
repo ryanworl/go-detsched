@@ -11,6 +11,7 @@ package syscall
 import (
 	errorspkg "errors"
 	"internal/bytealg"
+	"internal/goexperiment"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -152,6 +153,10 @@ func forkExec(argv0 string, argv []string, attr *ProcAttr) (pid int, err error) 
 	sys := attr.Sys
 	if sys == nil {
 		sys = &zeroSysProcAttr
+	}
+
+	if goexperiment.DetSched {
+		detStartProcess(argv0)
 	}
 
 	// Convert args to C form.

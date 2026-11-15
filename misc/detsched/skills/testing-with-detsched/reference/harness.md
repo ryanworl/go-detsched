@@ -53,6 +53,7 @@ func TestKV(t *testing.T) {
 - Join every goroutine the harness starts before the test body returns, or synctest reports a deadlock.
 - Package variables of the SUT and its dependencies are shared by every node and every restart: the README's "Shared state" bullet in "Simulating a cluster" lists the common ones and the fixes (an instance per node, global state registered once before starting nodes, per-process state keyed on `os.Getpid()`, which differs between nodes and between restarts of one node). A SUT that registers a global per server (one HTTP pool, one metrics registry) needs a small patch.
 - A package that captures `time.Now()` in a package variable at init, before the bubble, and later compares bubble time with it makes runs differ from each other. Nothing reports the read itself: it shows up only as `detsched`'s warning that seed 1 ran two different schedules, and as replays that don't reproduce. Take such values inside the bubble, or patch the SUT.
+- A dependency that starts a subprocess with `os/exec`, even at init, makes the schedule depend on how fast the OS runs it. The runtime reports the start with the goroutine's stack, and `detsched` prints the reports of seed 1 as `warning: seed 1 left the deterministic subset` when the search starts. Keep the tool off `PATH` or patch the call out.
 - A cleanup or finalizer that stops a timer created in the bubble kills the run (`stop of synctest timer from outside bubble`), as in stock synctest.
 
 ## Locks and callbacks

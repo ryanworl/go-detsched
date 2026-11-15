@@ -4,11 +4,14 @@
 
 // Sdk uses the assertion SDK: after its setup, two goroutines race to
 // increment a counter non-atomically, and an Always assertion checks the
-// total, so it fails for some schedules.
+// total, so it fails for some schedules. Each also calls os.Getwd, which
+// reads $PWD, so a replay runs the search's schedule only if both set PWD
+// alike.
 package main
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 
@@ -25,6 +28,9 @@ func main() {
 	var wg sync.WaitGroup
 	for range 2 {
 		wg.Go(func() {
+			for range 100 {
+				os.Getwd()
+			}
 			v := n
 			runtime.Gosched()
 			n = v + 1

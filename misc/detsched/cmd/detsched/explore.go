@@ -170,9 +170,25 @@ func (s *search) prepare(ctx context.Context) error {
 			return err
 		}
 		if !ok {
+			// The variables found are not enough, so the schedule depends
+			// on something else; keep them off replay lines.
 			s.printf("detsched: warning: seed 1 runs another schedule in a new shell, so replay lines may not reproduce failures there\n")
+		} else {
+			s.vars = vars
 		}
-		s.vars = vars
+	}
+	if reports := leftReport.FindAll(base.output, -1); len(reports) > 0 {
+		s.left = len(reports)
+		var b strings.Builder
+		b.WriteString("detsched: warning: seed 1 left the deterministic subset, so failures may not replay:\n")
+		for i, r := range reports {
+			if i == 5 {
+				fmt.Fprintf(&b, "\t(and %d more)\n", len(reports)-i)
+				break
+			}
+			b.WriteString("\t" + strings.ReplaceAll(strings.TrimSuffix(string(r), "\n"), "\n", "\n\t") + "\n")
+		}
+		s.printf("%s", b.String())
 	}
 	m := switchesField.FindStringSubmatch(trace)
 	total := atou(m[1])
@@ -402,8 +418,8 @@ func (s *search) forkLaunch(ctx context.Context, a int, c *cell, seed uint64) (f
 var errGone = errors.New("the program ended before the cell")
 
 // isRefused reports whether err is a refusal to fork. A setup root that
-// refuses 10 times before any fork succeeded makes the search stop
-// forking.
+// refuses 10 times before any fork succeeded, or a refusal for cgo, which
+// every later fork would get too, makes the search stop forking.
 func (s *search) isRefused(err error, root bool) bool {
 	var refused errRefused
 	if !errors.As(err, &refused) {
@@ -412,9 +428,10 @@ func (s *search) isRefused(err error, root bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refused++
-	if root && !s.forked && s.refused >= 10 && s.canFork {
+	if (root && !s.forked && s.refused >= 10 || refused.reason == forkCgo) && s.canFork {
 		s.canFork = false
-		s.printf("detsched: the program refused to fork (%v), so the search runs fresh seeds without forking\n", refused)
+		s.refusal = refused.Error()
+		s.printf("detsched: the program refused to fork (%s), so the search runs fresh seeds without forking\n", s.refusal)
 	}
 	return true
 }
@@ -918,10 +935,12 @@ func (s *search) runSrv(ctx context.Context, srv *forkServer, pid int, start tim
 }
 
 // plain returns a command that runs seed without fork mode, with env added.
+// It runs in the package's directory with PWD set to it, as the cd of a
+// replay line sets it, since os.Getwd reads PWD.
 func (s *search) plain(seed uint64, env ...string) *exec.Cmd {
 	cmd := exec.Command(s.bin, s.args...)
 	cmd.Dir = s.dir
-	cmd.Env = append(append(os.Environ(), s.env...), fmt.Sprintf("GODETSEED=%d", seed))
+	cmd.Env = append(append(os.Environ(), s.env...), "PWD="+s.dir, fmt.Sprintf("GODETSEED=%d", seed))
 	cmd.Env = append(cmd.Env, env...)
 	return cmd
 }

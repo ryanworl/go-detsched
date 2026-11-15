@@ -7,21 +7,22 @@
 //
 // Usage:
 //
-//	detsched [-run regexp] [-duration d] [-n seeds] [-timeout d] [package]
+//	detsched [-run regexp] [-duration d] [-n seeds] [-timeout d] [-p n] [package]
 //
 // Detsched builds the tests of the package (by default, the one in the
 // current directory) with GOEXPERIMENT=detsched, or the package itself if
-// it is a command without tests, and runs the binary on every core, once
-// per seed (GODETSEED=1, 2, ...), until it is interrupted, -duration
-// passes, or -n seeds have run. Each seed runs another schedule, and with
-// package detsched/sdk/sim, other faults. It groups the failing runs by
-// their first assertion failure, panic, or fatal error, else their first
-// failing test, keeps the output of the first few runs of each group, and
-// prints a command that replays the group's first run: the same binary,
-// directory, arguments, and seed, with GODETBRANCH naming the branch of a
-// detsched/sdk/compose timeline that failed. It runs that command to check
-// that the failure reproduces. To debug the failure, run the command with
-// dlv exec in front of the binary and -- before its arguments.
+// it is a command without tests, and runs the binary once per seed
+// (GODETSEED=1, 2, ...), one run per core at once (-p sets how many), until
+// it is interrupted, -duration passes, or -n seeds have run. Each seed runs
+// another schedule, and with package detsched/sdk/sim, other faults. It
+// groups the failing runs by their first assertion failure, panic, or fatal
+// error, else their first failing test, keeps the output of the first few
+// runs of each group, and prints a command that replays the group's first
+// run: the same binary, directory, arguments, and seed, with GODETBRANCH
+// naming the branch of a detsched/sdk/compose timeline that failed. It runs
+// that command to check that the failure reproduces. To debug the failure,
+// run the command with dlv exec in front of the binary and -- before its
+// arguments.
 //
 // A run that takes longer than -timeout (default 10m) is stopped with
 // SIGQUIT, which prints its goroutines, and counts as a failure.
@@ -56,6 +57,7 @@ var (
 	duration = flag.Duration("duration", 0, "stop after this much time (default: run until interrupted)")
 	seeds    = flag.Uint64("n", 0, "stop after this many seeds (default: run until interrupted)")
 	timeout  = flag.Duration("timeout", 10*time.Minute, "stop a run that takes longer than this, and count it as a failure")
+	procs    = flag.Int("p", runtime.NumCPU(), "run this many programs at once")
 )
 
 func main() {
@@ -78,6 +80,7 @@ func main() {
 		os.Exit(2)
 	}
 	s.timeout = *timeout
+	s.workers = max(*procs, 1)
 	// For measuring the search: run only fresh, cell, or directed
 	// launches, or plain runs of fresh seeds without forking.
 	if a := os.Getenv("DETSCHED_ONLY"); a != "" {
@@ -152,6 +155,7 @@ type search struct {
 	memWaited  time.Time    // when waitMem last reported waiting
 	baseTrace  string       // the trace line of the base run, seed 1
 	unstable   string       // how seed 1 ran two schedules, or ""
+	left       int          // places where seed 1 left the deterministic subset
 	only       int          // the only arm to run, for measuring, or -1
 	noFork     bool         // run fresh seeds without forking, for measuring
 	roots      map[int]bool // process groups of the fork servers
@@ -159,8 +163,9 @@ type search struct {
 	outOfMem   int // runs stopped because memory ran out, not counted as failures
 	features   int // new features recorded during the search
 	canFork    bool
-	forked     bool // a fork succeeded
-	refused    int  // forks the program refused
+	forked     bool   // a fork succeeded
+	refused    int    // forks the program refused
+	refusal    string // why the search stopped forking, or ""
 	yieldSites []string
 	predicted  []string // deadlocks the lock order predicts
 }
@@ -290,6 +295,7 @@ var (
 	setupLine     = regexp.MustCompile(`(?m)^detsched: setup complete at switch (\d+)$`)
 	deadlockLine  = regexp.MustCompile(`(?m)^detsched: potential deadlock: (.*)$`)
 	directiveLine = regexp.MustCompile(`(?m)^detsched: deadlock directive yield=(\S+)$`)
+	leftReport    = regexp.MustCompile(`(?m)^detsched: .*; the program no longer runs deterministically\n(?:.+\n)*`) // and its stack
 	failureLine   = regexp.MustCompile(`(?m)^(detsched: assertion failed: |panic: |fatal error: ).*`)
 	testFailure   = regexp.MustCompile(`(?m)^\s*--- FAIL: \S+`)
 	branchSet     = regexp.MustCompile(`GODETBRANCH=(\d+)`)
@@ -434,7 +440,7 @@ func (s *search) shellRun(vars []string) *exec.Cmd {
 	shell, _ := splitEnv()
 	cmd := exec.Command(s.bin, s.args...)
 	cmd.Dir = s.dir
-	cmd.Env = slices.Concat(shell, vars, s.env, []string{"GODETSEED=1"})
+	cmd.Env = slices.Concat(shell, vars, s.env, []string{"PWD=" + s.dir, "GODETSEED=1"})
 	return cmd
 }
 
@@ -820,6 +826,13 @@ func (s *search) summary(w io.Writer) {
 	if s.unstable != "" {
 		fmt.Fprintf(w, "detsched: warning: %s\n", s.unstable)
 	}
+	if s.left > 0 {
+		places := fmt.Sprintf("%d places", s.left)
+		if s.left == 1 {
+			places = "1 place"
+		}
+		fmt.Fprintf(w, "detsched: warning: seed 1 left the deterministic subset in %s, printed when the search started, so failures may not replay\n", places)
+	}
 	if s.runs == 0 {
 		return
 	}
@@ -832,8 +845,8 @@ func (s *search) summary(w io.Writer) {
 	if len(mix) > 0 {
 		fmt.Fprintf(w, "detsched: runs by start: %s; %d cells kept; new features: %s\n", strings.Join(mix, ", "), s.kept, s.novelty)
 	}
-	if !s.canFork {
-		fmt.Fprintf(w, "detsched: the program refused to fork, so the search ran fresh seeds only\n")
+	if s.refusal != "" {
+		fmt.Fprintf(w, "detsched: the program refused to fork (%s), so the search ran fresh seeds only\n", s.refusal)
 	}
 	for _, p := range s.predicted {
 		fmt.Fprintf(w, "detsched: predicted deadlock: %s\n", p)

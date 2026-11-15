@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -321,6 +322,24 @@ func TestSearchSetup(t *testing.T) {
 	g := findGroup(s, "detsched: assertion failed: no increment is lost")
 	if s.stop < 2 || g == nil || g.status != "reproduced" || g.runs == s.runs {
 		t.Errorf("want some but not all runs failing the assertion, replayed:\n%s", searchReport(s))
+	}
+}
+
+// TestSearchReports checks that the search prints where seed 1 leaves the
+// deterministic subset: here, by starting a subprocess.
+func TestSearchReports(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	s, err := newSearch("../../testdata/subprocess", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	s.progress = &b
+	if err := s.run(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if want := regexp.MustCompile(`warning: seed 1 left the deterministic subset.*\n\tdetsched: goroutine 1 starts a subprocess \(\S*/true\)`); s.left != 1 || !want.MatchString(b.String()) {
+		t.Errorf("%d reports, output:\n%s\nwant 1, matching %s", s.left, b.String(), want)
 	}
 }
 

@@ -203,6 +203,10 @@ func Read(fd int, p []byte) (n int, err error) {
 // output buffer under GOEXPERIMENT=detsched. It is provided by the runtime.
 func detWrite(fd int, p []byte) int
 
+// detStartProcess reports, under GOEXPERIMENT=detsched, that the program
+// starts the program argv0. It is provided by the runtime.
+func detStartProcess(argv0 string)
+
 func Write(fd int, p []byte) (n int, err error) {
 	if race.Enabled {
 		race.ReleaseMerge(unsafe.Pointer(&ioSync))
