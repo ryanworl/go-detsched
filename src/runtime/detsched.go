@@ -1142,7 +1142,13 @@ func detExpRand(pp *p, mean int32) int32 {
 // runnext (runqput clears next when there is no sysmon), and with one P
 // no other P touches pp's run queue.
 func detPickRunnable(pp *p) *g {
-	if !detPerturb.pct && !detChance(pp, detPerturb.pick) {
+	// Draw nothing when no goroutine is runnable: findRunnable comes back
+	// here each time the OS wakes it while the program waits in real
+	// time, and a draw per wake-up would shift every later choice.
+	lock(&sched.lock)
+	empty := pp.runqtail == atomic.LoadAcq(&pp.runqhead) && sched.runq.size == 0
+	unlock(&sched.lock)
+	if empty || !detPerturb.pct && !detChance(pp, detPerturb.pick) {
 		return nil
 	}
 	h := atomic.LoadAcq(&pp.runqhead)
