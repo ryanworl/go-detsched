@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched6
+v=go1.27.4-detsched7
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -77,6 +77,19 @@ Flags, all optional:
 - `-p n` (default: the number of CPUs) runs `n` programs at once. Lower it
   when each run takes enough memory that a run per CPU would make the
   machine swap.
+- `-seed-base n` adds `n` to every seed after seed 1, so that machines
+  splitting a search run disjoint seeds: with `-seed-base $((i << 32))`,
+  shard `i` runs seeds `i<<32+2`, `i<<32+3`, and so on. Replay lines print
+  the seed itself.
+- `-exec binary` runs a prebuilt binary in the current directory instead of
+  building a package, so that one job builds it and every shard runs the
+  same file, which replay lines then name. Build it as detsched does, from
+  the package's directory:
+
+  ```
+  GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o pkg.test
+  detsched -exec ./pkg.test
+  ```
 
 detsched exits with status 1 if any run failed.
 
@@ -164,10 +177,10 @@ goroutine switch, and diff their standard error.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched6:
+and release N's version is v0.N.0, so with go1.27.4-detsched7:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.6.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.7.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`

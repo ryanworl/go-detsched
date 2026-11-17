@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -329,7 +331,7 @@ func TestSearchSetup(t *testing.T) {
 // stopped programs it keeps from before then.
 func TestSearchTimeout(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch("../../testdata/bugrarelock", "")
+	s, err := newSearch("../../testdata/bugrarelock", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +350,7 @@ func TestSearchTimeout(t *testing.T) {
 // deterministic subset: here, by starting a subprocess.
 func TestSearchReports(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch("../../testdata/subprocess", "")
+	s, err := newSearch("../../testdata/subprocess", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +372,7 @@ func TestSearchCompose(t *testing.T) {
 	t.Setenv("SIMCOMPOSE_BUG", "1")
 	t.Setenv("SIMCOMPOSE_UNREAD", "1")
 	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch("../../testdata/simcompose", "")
+	s, err := newSearch("../../testdata/simcompose", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,6 +391,45 @@ func TestSearchCompose(t *testing.T) {
 		t.Errorf("replay lines set %q, want SIMCOMPOSE_BUG=1", s.vars)
 	}
 	for _, g := range s.groups {
+		if g.status != "reproduced" {
+			t.Errorf("%s: the replay %s", g.sig, g.status)
+		}
+	}
+}
+
+// TestSearchShard checks one shard of a search spread over machines: it
+// runs a prebuilt binary in the current directory, from fresh seeds past
+// -seed-base, and each failure's command replays it with that binary and
+// seed.
+func TestSearchShard(t *testing.T) {
+	t.Setenv("SIMCOMPOSE_BUG", "1")
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Chdir("../../testdata/simcompose")
+	bin := filepath.Join(t.TempDir(), "simcompose.test")
+	build := exec.Command(goCmd(), "test", "-c", "-o", bin)
+	build.Env = append(os.Environ(), "GOEXPERIMENT=detsched", "CGO_ENABLED=0")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	s, err := newSearch("", bin, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const base = 1 << 40
+	s.workers, s.only, s.noFork, s.seedBase = 4, armFresh, true, base
+	if err := s.run(context.Background(), 100); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.groups) == 0 {
+		t.Fatalf("no failure:\n%s", searchReport(s))
+	}
+	seed := regexp.MustCompile(`GODETSEED=(\d+) `)
+	for _, g := range s.groups {
+		m := seed.FindStringSubmatch(g.replay)
+		n, _ := strconv.ParseUint(m[1], 10, 64)
+		if n <= base+1 || n > base+100 || !strings.HasSuffix(g.replay, " "+bin) {
+			t.Errorf("%s: replay %s, want a seed from %d to %d and binary %s", g.sig, g.replay, base+2, base+100, bin)
+		}
 		if g.status != "reproduced" {
 			t.Errorf("%s: the replay %s", g.sig, g.status)
 		}

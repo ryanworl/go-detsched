@@ -277,7 +277,7 @@ func exploreSeeds(cfg config, pkg string, first uint64, n int, perturb string) (
 func runSearch(t *testing.T, pkg string, n uint64) *search {
 	t.Helper()
 	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch(pkg, "")
+	s, err := newSearch(pkg, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

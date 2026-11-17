@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	detsched [-run regexp] [-duration d] [-n seeds] [-timeout d] [-p n] [package]
+//	detsched [-run regexp] [-duration d] [-n seeds] [-seed-base n] [-timeout d] [-p n] [-exec binary | package]
 //
 // Detsched builds the tests of the package (by default, the one in the
 // current directory) with GOEXPERIMENT=detsched, or the package itself if
@@ -23,6 +23,13 @@
 // that command to check that the failure reproduces. To debug the failure,
 // run the command with dlv exec in front of the binary and -- before its
 // arguments.
+//
+// To spread a search over several machines, give each its own -seed-base:
+// fresh seeds after seed 1 then start from it, so with -seed-base i<<32,
+// shard i runs seeds i<<32+2, i<<32+3, and so on. To build the binary only
+// once for them, build it with GOEXPERIMENT=detsched and CGO_ENABLED=0, as
+// go test -c does, and pass it with -exec; detsched then runs it in the
+// current directory instead of building a package.
 //
 // A run that takes longer than -timeout (default 10m) is stopped with
 // SIGQUIT, which prints its goroutines, and counts as a failure.
@@ -58,27 +65,34 @@ var (
 	seeds    = flag.Uint64("n", 0, "stop after this many seeds (default: run until interrupted)")
 	timeout  = flag.Duration("timeout", 10*time.Minute, "stop a run that takes longer than this, and count it as a failure")
 	procs    = flag.Int("p", runtime.NumCPU(), "run this many programs at once")
+	seedBase = flag.Uint64("seed-base", 0, "add `n` to every seed after seed 1, so machines searching together run disjoint seeds")
+	execFlag = flag.String("exec", "", "run this prebuilt `binary` in the current directory instead of building a package")
 )
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: detsched [flags] [package]\n")
+		fmt.Fprintf(os.Stderr, "usage: detsched [flags] [-exec binary | package]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if flag.NArg() > 1 {
+	if flag.NArg() > 1 || flag.NArg() == 1 && *execFlag != "" {
 		flag.Usage()
+		os.Exit(2)
+	}
+	if *seedBase >= 1<<62 {
+		fmt.Fprintf(os.Stderr, "detsched: -seed-base must be below 2^62\n")
 		os.Exit(2)
 	}
 	pkg := "."
 	if flag.NArg() == 1 {
 		pkg = flag.Arg(0)
 	}
-	s, err := newSearch(pkg, *runFlag)
+	s, err := newSearch(pkg, *execFlag, *runFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "detsched: %v\n", err)
 		os.Exit(2)
 	}
+	s.seedBase = *seedBase
 	s.timeout = *timeout
 	s.workers = max(*procs, 1)
 	// For measuring the search: run only fresh, cell, or directed
@@ -114,15 +128,16 @@ func main() {
 
 // A search runs a test binary with one seed after another.
 type search struct {
-	pkg     string
-	dir     string   // the package's directory, where runs start
-	bin     string   // the binary
-	args    []string // its arguments
-	env     []string // variables every run adds to the environment
-	vars    []string // variables of our environment the schedule depends on, which replay lines set
-	out     string   // directory for the binary and the logs
-	timeout time.Duration
-	workers int
+	pkg      string
+	dir      string   // the package's directory, where runs start
+	bin      string   // the binary
+	args     []string // its arguments
+	env      []string // variables every run adds to the environment
+	vars     []string // variables of our environment the schedule depends on, which replay lines set
+	out      string   // directory for the binary and the logs
+	timeout  time.Duration
+	workers  int
+	seedBase uint64 // added to every seed after seed 1
 
 	progress io.Writer // where to report progress, or nil
 	live     bool      // progress is a terminal, where a status line updates in place
@@ -184,8 +199,9 @@ type group struct {
 // keepLogs is how many logs of each group a search keeps.
 const keepLogs = 10
 
-// newSearch builds pkg in a new directory.
-func newSearch(pkg, run string) (*search, error) {
+// newSearch builds pkg in a new directory, or if bin is set, runs that
+// prebuilt binary in the current directory.
+func newSearch(pkg, bin, run string) (*search, error) {
 	out, err := os.MkdirTemp("", "detsched-")
 	if err != nil {
 		return nil, err
@@ -202,7 +218,18 @@ func newSearch(pkg, run string) (*search, error) {
 		rng:     rand.New(rand.NewPCG(1, 2)),
 		only:    -1,
 	}
-	s.dir, s.bin, err = buildPackage(pkg, out)
+	if bin != "" {
+		s.pkg = bin
+		s.dir, err = os.Getwd()
+		if err == nil {
+			s.bin, err = filepath.Abs(bin)
+		}
+		if err == nil {
+			_, err = os.Stat(s.bin)
+		}
+	} else {
+		s.dir, s.bin, err = buildPackage(pkg, out)
+	}
 	if err != nil {
 		os.RemoveAll(out)
 		return nil, err
@@ -587,9 +614,9 @@ func (s *search) run(ctx context.Context, n uint64) error {
 	jobs := make(chan uint64)
 	go func() {
 		defer close(jobs)
-		for seed := uint64(2); n == 0 || seed <= n; seed++ {
+		for i := uint64(2); n == 0 || i <= n; i++ {
 			select {
-			case jobs <- seed:
+			case jobs <- s.seedBase + i:
 			case <-ctx.Done():
 				return
 			}

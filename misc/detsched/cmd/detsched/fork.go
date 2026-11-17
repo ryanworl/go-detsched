@@ -49,7 +49,7 @@ const (
 const forkCgo = 1
 
 var forkReasons = map[uint64]string{
-	forkCgo: "runtime.iscgo is set, though detsched builds without cgo; github.com/ebitengine/purego's internal/fakecgo sets it",
+	forkCgo: "runtime.iscgo is set: the binary was built with cgo, or github.com/ebitengine/purego's internal/fakecgo sets it",
 	2:       "the P is not on the main thread",
 	3:       "an M that is locked to a goroutine, in a system call, or the template thread",
 	4:       "descriptors registered with the network poller",

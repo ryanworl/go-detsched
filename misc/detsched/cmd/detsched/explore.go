@@ -158,7 +158,7 @@ func (s *search) prepare(ctx context.Context) error {
 	base.seed = 1
 	trace := base.trace()
 	if trace == "" {
-		return fmt.Errorf("%s printed no detsched trace line; is %s the detsched toolchain?\n%s", s.bin, goCmd(), truncate(string(base.output), 2000))
+		return fmt.Errorf("%s printed no detsched trace line; build it with a detsched toolchain and GOEXPERIMENT=detsched\n%s", s.bin, truncate(string(base.output), 2000))
 	}
 	s.baseTrace = trace
 	if runs[1].trace() != trace {
