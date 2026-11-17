@@ -85,6 +85,13 @@ func detNoASLR() {
 	if slide == 0 {
 		return
 	}
+	if issetugid() == 1 {
+		// The kernel would not mark the second run as set-ID, which
+		// keeps the privileges, so it would run outside secure mode
+		// (see secure).
+		detNoASLRFailed("the program is set-user-ID or set-group-ID", 0)
+		return
+	}
 	if executablePath == "" {
 		detNoASLRFailed("the executable's path is unknown", 0)
 		return

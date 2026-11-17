@@ -529,7 +529,9 @@ differences.
   change the addresses that hash and order maps, and so the schedule. A
   det-mode program that finds itself moved runs itself again in its place
   with ASLR off (`posix_spawn` with `_POSIX_SPAWN_DISABLE_ASLR`), before it
-  does anything else, so its process ID is that of the first run.
+  does anything else, so its process ID is that of the first run. A
+  set-user-ID or set-group-ID program doesn't, because the second run
+  would lose secure mode, so its schedule may depend on where it is loaded.
 - **Fork mode.** macOS supports `fork` without `exec` only in part. The
   child gets new threads for the runtime's other Ms, which first
   reinitialize their pthread mutexes and condition variables, and a new
