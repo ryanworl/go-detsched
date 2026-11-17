@@ -158,12 +158,86 @@ In Delve, `print runtime.curg.bubble.now` gives the current goroutine's
 virtual time in nanoseconds. A synctest bubble starts at 2000-01-01 UTC,
 which is 946684800000000000, and harnesses create the `World` as the
 bubble starts, so 9.408758544 in the timeline is 946684809408758544 in
-Delve. Use that to stop only in a window of the timeline:
+Delve. To look only at a window of the timeline, don't put that in a
+breakpoint's condition: stop the run at the window's ends instead, as the
+next section shows.
+
+## Stop at a point of the run
+
+Every hit of a breakpoint stops the process and switches to Delve, also
+when its condition is false: about 1ms a hit on Linux, more on macOS.
+On testdata/simcompose, a tracepoint on `time.Now` turns a 0.04s run into
+37s, and the same tracepoint with a condition that is never true still
+takes 29s. A condition on `runtime.curg.bubble.now` also fails with
+`curg has no member bubble` at the first hit on a system stack, which
+stops the script. Instead, let the run stop where you want to start
+looking, and set breakpoints only then.
+
+`GODETSTOP` lists points, separated by commas, at which the program
+stops:
+
+- `t9.4`: 9.4 seconds of virtual time, as the fault timeline counts them
+  (since the bubble of the goroutine about to run started);
+- `s12345`: switch 12345, as `GODEBUG=dettrace=2` numbers them;
+- `k812345678`: tick 812345678. Ticks are the run's finest clock: the
+  compiler counts one at every function entry and loop back edge in your
+  code, so every hit of a breakpoint there has its own tick.
+
+The program stops at the first tick, in a goroutine's own code, at or
+after each point. It prints the position there, and calls
+`runtime.detStop`, where Delve can break:
 
 ```
-break w github.com/hashicorp/raft.(*Raft).runCandidate
-cond w runtime.curg.bubble.now > 946684809000000000 && runtime.curg.bubble.now < 946684810000000000
+detsched: stop 1 at t10.025092087 s1822 k90267 goroutine 10
 ```
+
+Then it runs on as if it had not stopped: `GODETSTOP` does not change the
+run, and costs nothing without a debugger. Put it among the replay
+line's variables, after the `cd`:
+
+```
+cd /home/me/kv && GODETSTOP=t9.4,t10.2 GODETSEED=7 GODETBRANCH=10 dlv exec --disable-aslr /tmp/detsched-1234/kv.test --init window.dlv ...
+```
+
+with a script that sets its breakpoints at the first stop and clears them
+at the second:
+
+```
+break stop runtime.detStop
+continue
+trace cand github.com/hashicorp/raft.(*Raft).runCandidate
+on cand print runtime.detTickEnd-int64(runtime.detTicks)
+continue
+clearall
+continue
+```
+
+The first `continue` runs to 9.4s without a trap, the second traces the
+hits until 10.2s, and the third runs to the end without breakpoints. On
+testdata/simcompose, tracing `time.Now` from 10s to 12s this way, 645
+hits, takes 2.7s, and the two stops alone 0.15s. Use `clearall`, not
+`clear cand`: a tracepoint also sets breakpoints on the function's
+returns, which `clear` leaves behind.
+
+At a stop, `stack` shows `runtime.detStop`, `runtime.detStopFire`, and
+`runtime.detPreempt` on top of the code of the goroutine the stop line
+names.
+
+### Go back
+
+The run is the same every time, so going back is running it again to an
+earlier point. `print runtime.detTickEnd-int64(runtime.detTicks)` at a
+breakpoint gives the tick of the hit, as the `on` line above records for
+every hit. Run again with `GODETSTOP=k` and that tick, break on the
+function at the stop, and the next `continue` stops at that same hit.
+Running again costs a replay up to the point, which runs at native speed.
+
+### Look without a debugger
+
+With `:dump` after a point, as in `GODETSTOP=t9.4:dump`, the program
+prints the stack of every goroutine at the stop, as `kill -QUIT` would,
+with each goroutine's node and state, and runs on. Several points answer
+"what was everyone doing then" in one run, without Delve.
 
 ## What changes the schedule
 
@@ -174,6 +248,7 @@ These leave the run unchanged (its trace line stays the same):
 - attaching Delve to a running process, and detaching;
 - environment variables the program does not read;
 - `GODEBUG=dettrace=2`;
+- `GODETSTOP`, with or without `:dump`;
 - `GOTRACEBACK`;
 - copying the binary elsewhere.
 
@@ -269,8 +344,10 @@ function's returns.
   variable) stops at every hit with `error evaluating expression`. Fix the
   expression before relying on what the breakpoint shows.
 - `breakpoints` lists each breakpoint with its hit count.
-- Conditions on a function that runs millions of times make a replay
-  slow. Narrow by location first, or use a hit count.
+- Each hit costs about a millisecond, also with a false condition, so a
+  breakpoint on a function that runs millions of times makes a replay
+  take hours. Set it only between two stops (see
+  [Stop at a point of the run](#stop-at-a-point-of-the-run)).
 
 ## Where two runs diverge
 
@@ -328,16 +405,17 @@ different amounts before that point: busy time charges simulated time for
 the work a node does, so the clock moved by different amounts before any
 switch differed.
 
-To stop at switch N in Delve, break where the runtime records a switch,
-which happens just before the switch's counter goes up:
+To stop at switch N in Delve, run with `GODETSTOP=sN` and break on
+`runtime.detStop`:
 
 ```
-break sw runtime.detTraceSwitch
-cond sw pp.det[0].switches == 12345
+break stop runtime.detStop
 continue
-print gp.goid
-goroutine 391 stack 20
+stack 20
 ```
+
+The stop line names the goroutine that runs, and the stack shows where
+it is.
 
 ## Attach to a spinning or hung run
 

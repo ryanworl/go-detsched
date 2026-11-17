@@ -7,6 +7,7 @@ Run dlv non-interactively from a command file and read its saved output. The hum
 - Run a replay under dlv
 - Stop at the failure
 - Breakpoints and expressions that work on the optimized binary
+- Stop at a point of the run, and go back
 - Trace many hits
 - Find where two runs diverge
 - Attach to a hung run
@@ -48,18 +49,36 @@ goroutines -t 30
 - A condition dlv can't evaluate stops at every hit with `error evaluating expression`. Fix it before trusting the stops.
 - `runtime.curg.goid` is the current goroutine's ID, the same in every replay. `runtime.curg.bubble.now` is virtual time in nanoseconds; subtract 946684800000000000 to get the timeline's seconds.
 
+## Stop at a point of the run, and go back
+
+Every breakpoint hit costs about 1ms, also when its condition is false, so a breakpoint on a hot function can make a replay take hours, and a condition on `runtime.curg.bubble.now` fails (`curg has no member bubble`) at the first hit on a system stack. Let the run stop where you want to look instead: `GODETSTOP` lists points, comma-separated, `tD` (D seconds of virtual time, as the fault timeline counts them), `sN` (switch N, as `dettrace=2` numbers them), or `kN` (tick N; one tick per function entry and loop back edge in user code, so each hit there has its own). At the first tick at or after each point, in a goroutine's own code, the program prints `detsched: stop I at tD sN kN goroutine G` and calls `runtime.detStop`. It doesn't change the run. Put it after the replay line's `cd`, among its variables.
+
+Arm breakpoints only between two stops:
+
+```
+break stop runtime.detStop
+continue
+trace st github.com/org/kv/server.(*Store).apply
+on st print runtime.detTickEnd-int64(runtime.detTicks)
+on st print s.lastIndex
+continue
+clearall
+continue
+```
+
+with `GODETSTOP=t9.4,t10.2`. The first `continue` reaches 9.4s with no trap, the second traces until 10.2s, the third runs to the end. Use `clearall`: `clear` leaves the breakpoints a tracepoint sets on the function's returns. To go back to a hit, run again with `GODETSTOP=k` and the tick the `on` line printed for it; at that stop, break on the function and `continue`. Without dlv, `GODETSTOP=t9.4:dump` prints every goroutine's stack, with its node and state, at 9.4s and runs on.
+
 ## Trace many hits
 
 ```
 trace st github.com/org/kv/server.(*Store).apply
-cond st runtime.curg.bubble.now > 946684809000000000
 on st print runtime.curg.goid
 on st print s.lastIndex
 on st stack 6
 continue
 ```
 
-One `on` per expression. Use `cond -hitcount NAME == 361` to stop at the 361st hit once a trace showed which hit matters, and `cond NAME runtime.curg.goid == G` once a trace showed which goroutine.
+One `on` per expression. Between stops (above) when the function runs often. Use `cond -hitcount NAME == 361` to stop at the 361st hit once a trace showed which hit matters, and `cond NAME runtime.curg.goid == G` once a trace showed which goroutine.
 
 ## Find where two runs diverge
 
@@ -69,7 +88,7 @@ One `on` per expression. Use `cond -hitcount NAME == 361` to stop at the 361st h
 cmp a.trace b.trace; diff a.trace b.trace | head
 ```
 
-`dettrace=2` doesn't change the run. Export it: the replay line starts with `cd`, so a variable written in front of it reaches only `cd`. The first differing `switch N to goroutine G at FUNC+OFF` line is where the schedules part; a differing `bubble ... time` line first means the runs computed different amounts before it. To stop there: `break sw runtime.detTraceSwitch`, `cond sw pp.det[0].switches == N-1`, then `print gp.goid` and `goroutine G stack 20`.
+`dettrace=2` doesn't change the run. Export it: the replay line starts with `cd`, so a variable written in front of it reaches only `cd`. The first differing `switch N to goroutine G at FUNC+OFF` line is where the schedules part; a differing `bubble ... time` line first means the runs computed different amounts before it. To stop there, run with `GODETSTOP=sN`, `break stop runtime.detStop`, `continue`, `stack 20`.
 
 ## Attach to a hung run
 

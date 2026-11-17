@@ -409,6 +409,68 @@ func TestSimClients(t *testing.T) {
 	}
 }
 
+// TestStops checks GODETSTOP on testdata/simcompose: the run stops at or
+// after each point, at a tick point exactly when it falls in a
+// goroutine's own code, ":dump" prints every goroutine, and the schedule
+// stays as it was without stops.
+func TestStops(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/simcompose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	stop := regexp.MustCompile(`(?m)^detsched: stop (\d) at t(-|\d+)(?:\.\d{9})? s(\d+) k(\d+) goroutine \d+$`)
+	for _, seed := range []string{"1", "2", "3"} {
+		env := []string{"GODETSEED=" + seed, "GODETBRANCH=0", "SIMCOMPOSE_BUG=1"}
+		base, _, err := runBin(bin, env...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Stop 2's tick is where stop 1 stopped.
+		first, _, err := runBin(bin, append(env, "GODETSTOP=t5")...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := stop.FindStringSubmatch(first.stderr)
+		if m == nil {
+			t.Fatalf("GODETSEED=%s GODETSTOP=t5: no stop:\n%s", seed, first.stderr)
+		}
+		k := m[4]
+		points := []string{"t5", "k" + k, "s500:dump", "k1"}
+		o, _, err := runBin(bin, append(env, "GODETSTOP="+strings.Join(points, ","))...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o.trace != base.trace || o.exitCode != base.exitCode {
+			t.Errorf("GODETSEED=%s: with stops, trace %q and exit status %d; without, %q and %d", seed, o.trace, o.exitCode, base.trace, base.exitCode)
+		}
+		fired := map[string]bool{}
+		for _, m := range stop.FindAllStringSubmatch(o.stderr, -1) {
+			fired[m[1]] = true
+			switch m[1] {
+			case "1":
+				if n, _ := strconv.Atoi(m[2]); n < 5 {
+					t.Errorf("GODETSEED=%s: stop t5 at %s", seed, m[0])
+				}
+			case "2":
+				if m[4] != k {
+					t.Errorf("GODETSEED=%s: stop k%s at %s", seed, k, m[0])
+				}
+			case "3":
+				if n, _ := strconv.Atoi(m[3]); n < 500 {
+					t.Errorf("GODETSEED=%s: stop s500 at %s", seed, m[0])
+				}
+			}
+		}
+		if len(fired) != len(points) {
+			t.Errorf("GODETSEED=%s: stops %v fired, want all of %v:\n%s", seed, fired, points, o.stderr)
+		}
+		if n := strings.Count(o.stderr, "\ngoroutine "); n < 5 {
+			t.Errorf("GODETSEED=%s: s500:dump printed %d goroutines:\n%s", seed, n, o.stderr)
+		}
+	}
+}
+
 // TestSimBranchInline checks that GODETBRANCH=N runs the Nth terminal
 // branch of a composer timeline in the process itself, as a debugger
 // needs: the composer's output for the failing forked branch of

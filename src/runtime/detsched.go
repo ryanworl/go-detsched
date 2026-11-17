@@ -222,12 +222,15 @@ func detExecute(pp *p, gp *g, inheritTime bool) {
 	case detPerturb.pct:
 		detPCTExecute(pp, gp)
 	case detPerturb.quantum > 0:
-		detTicks = detExpRand(pp, detPerturb.quantum)
+		detPutTicks(detExpRand(pp, detPerturb.quantum))
 	default:
-		detTicks = detQuantum
+		detPutTicks(detQuantum)
 	}
 	if detBusy.on {
 		detBusyClamp(gp)
+	}
+	if len(detStops.points) > 0 {
+		detStopsCheck(pp, gp)
 	}
 }
 
@@ -288,8 +291,11 @@ func detTraceSwitch(pp *p, gp *g) {
 }
 
 // detTicks is the number of ticks the running goroutine has left before
-// it is preempted. Compiled code decrements it; see the comment at the
+// it is preempted, or before a stop when detTickExtra holds back the rest
+// (see detstop.go). Compiled code decrements it; see the comment at the
 // top of this file. Only the goroutine holding the single P touches it.
+// The runtime sets it only through detPutTicks, and reads the goroutine's
+// budget as detTicksReal.
 var detTicks int32
 
 // detPreempt is called by compiled code when detTicks runs out. It yields
@@ -299,6 +305,19 @@ var detTicks int32
 //go:nosplit
 func detPreempt() {
 	gp := getg()
+	if detTicks <= 0 && detTickNow() >= detStops.next {
+		// A stop is due (see detstop.go). On a system stack it waits
+		// for the next tick, keeping the goroutine's budget. A call
+		// from detSync, with ticks left, yields as it would have.
+		if gp != gp.m.g0 && gp != gp.m.gsignal {
+			detStopFire(gp, sys.GetCallerPC(), sys.GetCallerSP())
+		} else if detTickExtra > 0 {
+			detPutTicks(detTicksReal())
+		}
+		if detTicks > 0 {
+			return
+		}
+	}
 	if gp == gp.m.g0 || gp == gp.m.gsignal {
 		detSetTicks(1)
 		return
@@ -481,6 +500,7 @@ func detRandInit(pp *p) {
 			detPerturbStrategy = 0
 		}
 		detSearchInit()
+		detStopInit()
 		detPerturbInit(pp, 0, 0)
 	}
 }
@@ -1370,11 +1390,11 @@ func detPCTState(pp *p, gp *g) *detGState {
 // the rest of its own.
 func detPCTExecute(pp *p, gp *g) {
 	if last := detPCT.last; last != nil && detG(last).goid == last.goid {
-		detG(last).used += max(detPCT.lastQ-detTicks, 0)
+		detG(last).used += max(detPCT.lastQ-detTicksReal(), 0)
 	}
 	s := detPCTState(pp, gp)
-	detTicks = max(detQuantum-s.used, 1)
-	detPCT.last, detPCT.lastQ, detPCT.keep = gp, detTicks, false
+	detPutTicks(max(detQuantum-s.used, 1))
+	detPCT.last, detPCT.lastQ, detPCT.keep = gp, detTicksReal(), false
 }
 
 // detPCTPreempt is called when gp is preempted by its ticks. Unless a
@@ -1397,7 +1417,7 @@ func detPCTWake(pp *p, gp *g) {
 		return
 	}
 	if detPCT.last == cur {
-		detG(cur).used += max(detPCT.lastQ-detTicks, 0)
+		detG(cur).used += max(detPCT.lastQ-detTicksReal(), 0)
 	}
 	detSetTicks(1)
 	detPCT.lastQ, detPCT.keep = 1, true

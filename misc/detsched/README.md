@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched9
+v=go1.27.4-detsched10
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -173,14 +173,22 @@ follow, and with 0 runs the timeline without forking at all. To find where
 two runs diverge, run both with `GODEBUG=dettrace=2`, which prints every
 goroutine switch, and diff their standard error.
 
+`GODETSTOP` stops a replay at points in virtual time (`t9.4`), at a
+switch (`s12345`), or at a tick (`k812345678`, one per function entry and
+loop back edge), so that a debugger's breakpoints can be armed only
+between two points instead of trapping on every hit before them, and
+going back is replaying to an earlier tick; `:dump` prints every
+goroutine's stack there instead. It does not change the run.
+[delve.md](delve.md#stop-at-a-point-of-the-run) shows how.
+
 ## The SDK
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched9:
+and release N's version is v0.N.0, so with go1.27.4-detsched10:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.9.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.10.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`

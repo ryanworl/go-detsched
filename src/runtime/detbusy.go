@@ -53,7 +53,7 @@ const detBusyQuantumPs = 1e9 // 1ms
 var detBusy struct {
 	on   bool
 	last *g    // the goroutine whose ticks run down detTicks
-	q    int32 // detTicks when last's ticks were last counted
+	q    int32 // detTicksReal() when last's ticks were last counted
 
 	cpus []detBusyCPU // by node handle
 
@@ -101,14 +101,15 @@ func detBusyOf(gp *g) *detBusyState {
 //
 //go:nosplit
 func detBusyCount() {
-	if gp := detBusy.last; gp != nil && detBusy.q > detTicks {
+	ticks := detTicksReal()
+	if gp := detBusy.last; gp != nil && detBusy.q > ticks {
 		if detG(gp).node != 0 {
-			n := int64(detBusy.q - detTicks)
+			n := int64(detBusy.q - ticks)
 			detBusyOf(gp).debt += n * detBusyPsPerTick
 			detBusy.ticks += uint64(n)
 		}
 	}
-	detBusy.q = detTicks
+	detBusy.q = ticks
 }
 
 // detSetTicks sets detTicks, after counting the ticks run so far.
@@ -118,7 +119,8 @@ func detSetTicks(n int32) {
 	if detBusy.on {
 		detBusyCount()
 	}
-	detTicks, detBusy.q = n, n
+	detPutTicks(n)
+	detBusy.q = n
 }
 
 // detBusyClamp makes the running goroutine stop at the tick where its
@@ -136,13 +138,13 @@ func detBusyClamp(gp *g) {
 			detBusy.carry[node] = 0
 		}
 		left := (detBusyQuantumPs - s.debt + detBusyPsPerTick - 1) / detBusyPsPerTick
-		if int64(detTicks) > max(left, 1) {
-			detTicks = int32(max(left, 1))
+		if int64(detTicksReal()) > max(left, 1) {
+			detPutTicks(int32(max(left, 1)))
 		}
 	}
-	detBusy.q = detTicks
+	detBusy.q = detTicksReal()
 	if detPCT.last == gp {
-		detPCT.lastQ = detTicks
+		detPCT.lastQ = detBusy.q
 	}
 }
 
@@ -234,8 +236,9 @@ func detBusyExit(gp *g) {
 //
 //go:nosplit
 func detsimEnter() (ticks, q int32, last *g) {
-	ticks, q, last = detTicks, detBusy.q, detBusy.last
-	detTicks, detBusy.q, detBusy.last = 1<<31-1, 1<<31-1, nil
+	ticks, q, last = detTicksReal(), detBusy.q, detBusy.last
+	detPutTicks(1<<31 - 1)
+	detBusy.q, detBusy.last = 1<<31-1, nil
 	return
 }
 
@@ -245,8 +248,9 @@ func detsimEnter() (ticks, q int32, last *g) {
 //
 //go:nosplit
 func detsimExit(ticks, q int32, last *g) {
-	n := min(ticks, detTicks)
-	detTicks, detBusy.q, detBusy.last = n, q-(ticks-n), last
+	n := min(ticks, detTicksReal())
+	detPutTicks(n)
+	detBusy.q, detBusy.last = q-(ticks-n), last
 	if detBusy.on && last != nil && last == getg().m.curg {
 		detBusyClamp(last)
 	}
@@ -255,7 +259,7 @@ func detsimExit(ticks, q int32, last *g) {
 // detsimBusyOn turns busy time on or off.
 func detsimBusyOn(on bool) {
 	detBusy.on = on
-	detBusy.last, detBusy.q = getg().m.curg, detTicks
+	detBusy.last, detBusy.q = getg().m.curg, detTicksReal()
 	if detBusy.on {
 		detBusy.ticks, detBusy.parks, detBusy.paidNs, detBusy.streakNs, detBusy.streakNode = 0, 0, 0, 0, 0
 	}
