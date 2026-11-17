@@ -390,6 +390,25 @@ func TestSimCompose(t *testing.T) {
 	}
 }
 
+// TestSimClients checks that a composer with several client nodes runs
+// commands on each and that a partition can put two of them on different
+// sides (testdata/simclients), deterministically.
+func TestSimClients(t *testing.T) {
+	for _, seed := range []string{"1", "2"} {
+		t.Setenv("GODETSEED", seed)
+		r, err := check(config{runs: 2, parallel: 2}, "../../testdata/simclients")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !r.deterministic() {
+			t.Fatalf("simclients with GODETSEED=%s is not deterministic:\n%s", seed, r.details())
+		}
+		if o := r.outcomes[0]; o.exitCode != 0 || !strings.Contains(o.stdout, "clients that ran commands: 3, two on different sides of a partition: true\n") {
+			t.Errorf("simclients with GODETSEED=%s: exit status %d, stdout:\n%s", seed, o.exitCode, o.stdout)
+		}
+	}
+}
+
 // TestSimBranchInline checks that GODETBRANCH=N runs the Nth terminal
 // branch of a composer timeline in the process itself, as a debugger
 // needs: the composer's output for the failing forked branch of

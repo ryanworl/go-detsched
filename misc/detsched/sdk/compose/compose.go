@@ -37,8 +37,8 @@
 //     reports comes first in the output, with the GODETBRANCH setting
 //     that replays the branch in one process, as a debugger needs. For an
 //     Eventually command, the composer cancels the drivers' context,
-//     waits a second, and then kills the client node they run on, freezing
-//     whatever is still running: a goroutine of the client node may be
+//     waits a second, and then kills the client nodes they run on, freezing
+//     whatever is still running: a goroutine of a client node may be
 //     frozen before it ever saw the context done, so a check reads
 //     Ctx.Context().Err() rather than wait for such a goroutine. For a
 //     Finally command, it lets the drivers return on their own, up to a
@@ -52,12 +52,18 @@
 //
 // Commands run on a client node the composer adds to the world, named
 // "client", so their system calls go to the simulation, and dialing a
-// cluster node crosses the simulated network. The nemesis never kills,
-// pauses, or throttles the client, but its network faults reach it: a
-// partition can leave it with some cluster nodes and not others. A command that calls into a cluster node's code directly,
-// such as through sim.Node.Go, runs that code on the cluster node, where
-// killing the client does not stop it; such commands must return once
-// Ctx.Context is done.
+// cluster node crosses the simulated network. With Config.Clients set
+// above 1, the composer adds that many, named "client1", "client2", and
+// so on, and runs each command on one of them at random, which Ctx.Node
+// reports. The nemesis never kills, pauses, or throttles a client, but
+// its network faults reach each one on its own: a partition can leave a
+// client with some cluster nodes and not others, and two clients on
+// different sides. A connection or other state a command creates belongs
+// to its client node, so commands that may run on different clients
+// must not share it. A command that calls into a cluster node's code
+// directly, such as through sim.Node.Go, runs that code on the cluster
+// node, where killing the client does not stop it; such commands must
+// return once Ctx.Context is done.
 //
 // Drivers should do a bounded amount of work and return, such as a few
 // writes or one membership change, rather than loop until told to stop:
@@ -89,18 +95,22 @@ import (
 // Config configures a Composer. Zero fields take defaults.
 type Config struct {
 	// Faults configures the nemesis that runs during the drive phase.
-	// The composer adds its client node to Faults.Exclude, which keeps
-	// node faults off it but not network faults, and calls Faults.Event
+	// The composer adds its client nodes to Faults.Exclude, which keeps
+	// node faults off them but not network faults, and calls Faults.Event
 	// too.
 	Faults sim.NemesisConfig
+	// Clients is how many client nodes run the commands (default 1), so
+	// that, with more, clients can be on different sides of a network
+	// fault, as a stale read from a deposed leader needs.
+	Clients int
 	// Budget is the longest the drive phase may last, in simulated time
 	// (default 2 minutes, at least 20 seconds).
 	Budget time.Duration
 }
 
 const (
-	drainTimeout = time.Minute      // how long a Finally command waits for the drivers
-	clientIP     = "10.255.255.254" // the client node's address
+	drainTimeout = time.Minute     // how long a Finally command waits for the drivers
+	clientIP     = "10.255.255.%d" // the client nodes' addresses, from .254 down
 )
 
 // Option modifies a command.
@@ -158,7 +168,7 @@ type Composer struct {
 	cmds []*command
 
 	t       *testing.T
-	client  *sim.Node
+	clients []*sim.Node
 	nm      *sim.Nemesis
 	stopped bool // the nemesis was stopped
 	fin     chan *run
@@ -180,6 +190,7 @@ func New(w *sim.World, cfg Config) *Composer {
 	if cfg.Budget <= 0 {
 		cfg.Budget = 2 * time.Minute
 	}
+	cfg.Clients = max(cfg.Clients, 1)
 	return &Composer{w: w, cfg: cfg, counts: map[string]int{}}
 }
 
@@ -234,9 +245,10 @@ func (c *Composer) Finally(name string, f func(*Ctx) error, opts ...Option) {
 
 // Ctx is what a command gets from the composer.
 type Ctx struct {
-	c   *Composer
-	cmd *command
-	ctx context.Context
+	c    *Composer
+	cmd  *command
+	ctx  context.Context
+	node *sim.Node
 }
 
 // Context is done when the composer ends the drive phase for an
@@ -244,7 +256,7 @@ type Ctx struct {
 func (x *Ctx) Context() context.Context { return x.ctx }
 
 // Node returns the client node the command runs on.
-func (x *Ctx) Node() *sim.Node { return x.c.client }
+func (x *Ctx) Node() *sim.Node { return x.node }
 
 // Quiesce starts a calm that lasts at least d, or extends the current one,
 // as ANTITHESIS_STOP_FAULTS does: every fault ends and nodes taken down
@@ -314,6 +326,9 @@ func (c *Composer) check() {
 	if c.cfg.Budget < 20*time.Second {
 		t.Fatalf("compose: Budget %v leaves no room for storms and calms; use at least 20s", c.cfg.Budget)
 	}
+	if c.cfg.Clients > 200 {
+		t.Fatalf("compose: %d clients; use at most 200", c.cfg.Clients)
+	}
 }
 
 // Run runs one timeline. Call it inside the synctest bubble of w, from the
@@ -324,7 +339,7 @@ func (c *Composer) Run(t *testing.T) {
 	c.fin = make(chan *run, 64)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	defer func() {
-		// After kill, a goroutine frozen with the client node may
+		// After kill, a goroutine frozen with a client node may
 		// hold the context's lock, as when it froze removing a child
 		// context, so cancel only a context that is not yet canceled,
 		// which Err reports without the lock.
@@ -332,8 +347,15 @@ func (c *Composer) Run(t *testing.T) {
 			c.cancel()
 		}
 	}()
-	c.client = c.w.AddNode("client", clientIP)
-	c.client.Start(func() {})
+	for i := range c.cfg.Clients {
+		name := "client"
+		if c.cfg.Clients > 1 {
+			name = fmt.Sprintf("client%d", i+1)
+		}
+		n := c.w.AddNode(name, fmt.Sprintf(clientIP, 254-i))
+		n.Start(func() {})
+		c.clients = append(c.clients, n)
+	}
 
 	// Setup, without faults.
 	c.w.SetCalm(true)
@@ -349,7 +371,7 @@ func (c *Composer) Run(t *testing.T) {
 
 	// Drive.
 	cfg := c.cfg.Faults
-	cfg.Exclude = append(slices.Clone(cfg.Exclude), c.client)
+	cfg.Exclude = append(slices.Clone(cfg.Exclude), c.clients...)
 	cfg.Event = func(ev sim.Event) {
 		c.observe(ev)
 		if c.cfg.Faults.Event != nil {
@@ -408,20 +430,24 @@ func (c *Composer) feedback() {
 	guide.State("compose", cmds<<16|faults)
 }
 
-// start runs cmd on the client node in a new goroutine, which sends its
-// run to c.fin when the command returns.
+// start runs cmd on a client node in a new goroutine, which sends its run
+// to c.fin when the command returns.
 func (c *Composer) start(cmd *command, ctx context.Context) *run {
 	r := &run{cmd: cmd}
 	c.counts[cmd.name]++
 	c.running = append(c.running, r)
-	c.client.Go(func() {
+	node := c.clients[0]
+	if len(c.clients) > 1 {
+		node = c.clients[sim.Intn(len(c.clients))]
+	}
+	node.Go(func() {
 		defer func() {
 			if p := recover(); p != nil {
 				r.panic, r.stack = p, debug.Stack()
 			}
 			c.fin <- r
 		}()
-		r.err = cmd.f(&Ctx{c: c, cmd: cmd, ctx: ctx})
+		r.err = cmd.f(&Ctx{c: c, cmd: cmd, ctx: ctx, node: node})
 	})
 	c.feedback()
 	return r
@@ -611,8 +637,8 @@ func (c *Composer) drain() bool {
 }
 
 // kill cancels the drivers' context, waits a second for them to return,
-// and then kills the client node, freezing what still runs on it, and
-// starts it again.
+// and then kills the client nodes, freezing what still runs on them, and
+// starts them again.
 func (c *Composer) kill() {
 	c.cancel()
 	grace := time.After(time.Second)
@@ -629,8 +655,10 @@ func (c *Composer) kill() {
 		assert.Reachable("compose: a driver is killed", nil)
 	}
 	c.running = nil
-	c.client.KillProcess()
-	c.client.Start(func() {})
+	for _, n := range c.clients {
+		n.KillProcess()
+		n.Start(func() {})
+	}
 }
 
 func (c *Composer) stopFaults() {

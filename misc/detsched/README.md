@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched8
+v=go1.27.4-detsched9
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -177,10 +177,10 @@ goroutine switch, and diff their standard error.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched8:
+and release N's version is v0.N.0, so with go1.27.4-detsched9:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.8.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.9.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -475,8 +475,10 @@ it, so the replay command a failure prints shows the timeline again.
   restarts the drive phase after a branch of the search, and reports
   which commands overlap which faults to the search. Commands run on a
   client node that the nemesis never kills, though partitions put it on
-  either side, with some servers and not others. `testdata/simcompose` is an
-  example.
+  either side, with some servers and not others. With `Config.Clients`
+  above 1, each command runs on one of that many client nodes, so two
+  clients can be on different sides of a partition, as a stale read from
+  a deposed leader needs. `testdata/simcompose` is an example.
 
 The search's forks work with simulated sockets, which they refuse for
 real ones: the simulation's state is all in memory. `testdata/simkv` exercises the
