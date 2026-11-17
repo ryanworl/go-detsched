@@ -7,6 +7,7 @@
 package os
 
 import (
+	"internal/goexperiment"
 	"internal/poll"
 	"internal/syscall/unix"
 	"io/fs"
@@ -95,7 +96,20 @@ func newFileFromNewFile(fd uintptr, name string) *File {
 	if err != nil {
 		flags = 0
 	}
-	f := newFile(fdi, name, kindNewFile, unix.HasNonblockFlag(flags))
+	nonBlocking := unix.HasNonblockFlag(flags)
+	if goexperiment.DetSched && fdi <= 2 {
+		// Whoever starts the program decides whether its standard
+		// descriptors are nonblocking: a debugger's terminal is not, a
+		// pipe from some tools is. A nonblocking one would go to the
+		// poller, whose setup runs code that counts synchronization
+		// points, and would keep det mode from forking, so the schedule
+		// would depend on how the program was started. Det mode buffers
+		// standard output and error, so treat all three as blocking; a
+		// read from a nonblocking standard input with nothing to read
+		// fails with EAGAIN.
+		nonBlocking = false
+	}
+	f := newFile(fdi, name, kindNewFile, nonBlocking)
 	f.appendMode = flags&syscall.O_APPEND != 0
 	return f
 }

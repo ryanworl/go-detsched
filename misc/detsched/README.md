@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched10
+v=go1.27.4-detsched11
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -185,10 +185,10 @@ goroutine's stack there instead. It does not change the run.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched10:
+and release N's version is v0.N.0, so with go1.27.4-detsched11:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.10.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.11.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -238,7 +238,11 @@ Writes to standard output and error through package `syscall` go to an
 in-memory buffer, written at exit, so no goroutine waits on the OS to accept
 output. The runtime's own messages, such as panics, are written directly. A
 child process built with the experiment also buffers its output until it
-exits, so a parent can't talk to it interactively over pipes.
+exits, so a parent can't talk to it interactively over pipes. `os.Stdin`,
+`os.Stdout` and `os.Stderr` never use the network poller, even when they
+are nonblocking, so that how the program was started doesn't change the
+schedule; a read from a nonblocking standard input with nothing to read
+fails with `EAGAIN`.
 
 synctest bubbles never wait in real time. When no goroutine anywhere can
 run, and none is in a system call or waiting on the network, the blocked
@@ -533,6 +537,8 @@ differences.
   `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`, which stays in its
   environment, so that a child can verify certificates with the system's
   verifier (crypto/x509 reaches Objective-C through Security.framework).
+  The program sees the variable only if it was set already, so it sees
+  the same environment as when a debugger starts it without ASLR.
   A process that has used the verifier cannot fork, because
   Security.framework's connection to `trustd` does not survive fork; it
   refuses to, and detsched runs without forking. macOS has no

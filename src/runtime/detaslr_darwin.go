@@ -30,7 +30,9 @@ import (
 // +initialize is in progress on them; the run without ASLR starts with the
 // variable set, and keeps it, as libobjc reads it when it is first used. A child cannot use the verifier if the parent
 // used it before forking, though: Security.framework's connection to
-// trustd does not survive fork.
+// trustd does not survive fork. The program does not see the variable
+// unless it was set already (see detEnvHidden), so that it sees the same
+// environment as when it is started without ASLR, by a debugger say.
 
 //go:cgo_import_dynamic libc_posix_spawn posix_spawn "/usr/lib/libSystem.B.dylib"
 //go:cgo_import_dynamic libc_posix_spawnattr_init posix_spawnattr_init "/usr/lib/libSystem.B.dylib"
@@ -44,11 +46,13 @@ func detaslr_dyld_get_image_vmaddr_slide_trampoline()
 func detaslr_getpid_trampoline()
 
 // The variables the second run starts with, with C's NUL. The marker
-// tells it that it is the second run; it removes the marker from its
-// environment before anything reads it.
+// tells it that it is the second run, and, with value 2, that the first
+// run added detObjCForkSafety right after it; it removes the marker from
+// its environment before anything reads it.
 const (
-	detNoASLRMarker   = "GODETNOASLR=1\x00"
-	detObjCForkSafety = "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES\x00"
+	detNoASLRMarker     = "GODETNOASLR=1\x00"
+	detNoASLRMarkerObjC = "GODETNOASLR=2\x00"
+	detObjCForkSafety   = "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES\x00"
 )
 
 // detNoASLR runs the program again without ASLR, and without Objective-C's
@@ -63,8 +67,15 @@ func detNoASLR() {
 		n++
 	}
 	for i := 0; i < n; i++ {
-		if gostringnocopy(envp[i]) == detNoASLRMarker[:len(detNoASLRMarker)-1] {
+		switch gostringnocopy(envp[i]) {
+		case detNoASLRMarker[:len(detNoASLRMarker)-1]:
 			copy(envp[i:n], envp[i+1:n+1])
+			return
+		case detNoASLRMarkerObjC[:len(detNoASLRMarkerObjC)-1]:
+			copy(envp[i:n], envp[i+1:n+1])
+			if i+1 < n && gostringnocopy(envp[i]) == detObjCForkSafety[:len(detObjCForkSafety)-1] {
+				detEnvHidden = envp[i]
+			}
 			return
 		}
 	}
@@ -92,6 +103,7 @@ func detNoASLR() {
 	copy(env, envp[:n])
 	env[n] = unsafe.StringData(detNoASLRMarker)
 	if v, _ := getenvEarly("OBJC_DISABLE_INITIALIZE_FORK_SAFETY"); v == "" {
+		env[n] = unsafe.StringData(detNoASLRMarkerObjC)
 		env[n+1] = unsafe.StringData(detObjCForkSafety)
 	}
 	if detTraced() {

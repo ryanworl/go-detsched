@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -907,6 +908,80 @@ func TestEnvironment(t *testing.T) {
 	}
 	if outs[0] != outs[1] || outs[0] != outs[2] {
 		t.Errorf("gcstress: outcomes differ with extra environment variables:\n%+v\n%+v\n%+v", outs[0], outs[1], outs[2])
+	}
+}
+
+// TestNonblockingStdio checks that whether the standard descriptors a
+// program inherits are nonblocking, as a pipe from some tools is and a
+// debugger's terminal is not, does not change the schedule.
+func TestNonblockingStdio(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	for seed := 1; seed <= 5; seed++ {
+		env := "GODETSEED=" + strconv.Itoa(seed)
+		want, _, err := runBin(bin, env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var in, out [2]int
+		if err := syscall.Pipe(in[:]); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Pipe(out[:]); err != nil {
+			t.Fatal(err)
+		}
+		syscall.SetNonblock(in[0], true)
+		syscall.SetNonblock(out[1], true)
+		inR, inW := os.NewFile(uintptr(in[0]), "stdin"), os.NewFile(uintptr(in[1]), "stdin writer")
+		outR, outW := os.NewFile(uintptr(out[0]), "stdout reader"), os.NewFile(uintptr(out[1]), "stdout")
+		cmd := command(bin, env)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = inR, outW, outW
+		err = cmd.Start()
+		inR.Close()
+		outW.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(outR)
+		outR.Close()
+		cmd.Wait()
+		inW.Close()
+		if got := newOutcome("", string(b), cmd.ProcessState.ExitCode()); got.trace != want.trace {
+			t.Errorf("%s: nonblocking standard descriptors: %s, blocking: %s", env, got.trace, want.trace)
+		}
+	}
+}
+
+// TestNoASLREnvironment checks that a program that runs itself again
+// without ASLR, as one does on macOS, sees the environment it was started
+// with, as one started without ASLR does: not the variables the runtime
+// adds for the second run, unless they were set already.
+func TestNoASLREnvironment(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("only macOS runs a program again without ASLR")
+	}
+	bin, cleanup, err := build(config{}, "../../testdata/environ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	const objc = "OBJC_DISABLE_INITIALIZE_FORK_SAFETY"
+	for _, set := range []bool{false, true} {
+		cmd := command(bin, "GODETSEED=1")
+		cmd.Env = slices.DeleteFunc(cmd.Env, func(e string) bool { return strings.HasPrefix(e, objc+"=") })
+		if set {
+			cmd.Env = append(cmd.Env, objc+"=YES")
+		}
+		o, _, err := run(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(o.stdout, objc+"="); got != set || strings.Contains(o.stdout, "GODETNOASLR") {
+			t.Errorf("%s set: %t; the program sees:\n%s", objc, set, o.stdout)
+		}
 	}
 }
 

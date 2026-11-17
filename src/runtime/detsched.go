@@ -1643,22 +1643,33 @@ const (
 	detEnvBytes = 64 << 10 // bytes of variables
 )
 
+// detEnvHidden is the environment variable that the runtime added to its
+// own environment, if any, which the program does not see (see detNoASLR).
+var detEnvHidden *byte
+
 // detGoenvs is goenvs_unix in det mode: it copies the n environment
-// variables into allocations of a fixed size.
+// variables, but detEnvHidden, into allocations of a fixed size.
 func detGoenvs(n int32) {
-	total := 0
+	total, m := 0, 0
 	for i := int32(0); i < n; i++ {
-		total += findnull(argv_index(argv, argc+1+i))
+		if p := argv_index(argv, argc+1+i); p != detEnvHidden {
+			total += findnull(p)
+			m++
+		}
 	}
-	envs = make([]string, n, max(int(n), detEnvCap))
+	envs = make([]string, m, max(m, detEnvCap))
 	buf := make([]byte, max(total, detEnvBytes))
-	off := 0
+	off, j := 0, 0
 	for i := int32(0); i < n; i++ {
 		p := argv_index(argv, argc+1+i)
+		if p == detEnvHidden {
+			continue
+		}
 		l := findnull(p)
 		copy(buf[off:], unsafe.Slice(p, l))
-		envs[i] = unsafe.String(&buf[off], l)
+		envs[j] = unsafe.String(&buf[off], l)
 		off += l
+		j++
 	}
 }
 
