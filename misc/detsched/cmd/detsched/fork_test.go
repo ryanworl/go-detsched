@@ -378,8 +378,7 @@ func TestSearchCompose(t *testing.T) {
 	}
 	// Plain runs of fresh seeds, so that the same seeds run every time:
 	// the default mix depends on timing and sometimes misses the bug in
-	// 60 runs. Seeds 2 to 60 fail 9 times on linux/amd64 and 10 times on
-	// darwin/arm64.
+	// 60 runs. Seeds 2 to 60 fail 7 times on linux/amd64.
 	s.workers, s.only, s.noFork = 4, armFresh, true
 	if err := s.run(context.Background(), 60); err != nil {
 		t.Fatal(err)

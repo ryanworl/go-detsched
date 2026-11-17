@@ -1302,3 +1302,56 @@ func TestNetlink(t *testing.T) {
 		<-done
 	})
 }
+
+// TestExclude checks that the nemesis never hits a node in
+// NemesisConfig.Exclude with a node fault, while its network faults reach
+// it: a partition can put it with some servers and not others, and it can
+// be clogged or be an end of a faulty link.
+func TestExclude(t *testing.T) {
+	if !sim.Supported() {
+		t.Skip("needs GOEXPERIMENT=detsched")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		w := sim.NewWorld(sim.Config{})
+		defer w.Close()
+		servers := []*sim.Node{w.AddNode("s1", "10.0.0.1"), w.AddNode("s2", "10.0.0.2"), w.AddNode("s3", "10.0.0.3")}
+		c := w.AddNode("c", "10.0.0.4")
+		for _, n := range append(servers, c) {
+			n.Start(func() {})
+		}
+		var hitC, hitServers, split, link, clog bool
+		cfg := sim.NemesisConfig{
+			Exclude: []*sim.Node{c},
+			Restart: func(n *sim.Node) { n.Start(func() {}) },
+			Event: func(ev sim.Event) {
+				if !ev.Start {
+					return
+				}
+				switch ev.Kind {
+				case sim.FaultPartition:
+					// Some server shares c's group, which no fault
+					// covers in either direction, and some does not.
+					apart := func(s *sim.Node) bool { return ev.Net.Covers(c, s) || ev.Net.Covers(s, c) }
+					together := func(s *sim.Node) bool { return !apart(s) }
+					split = split || slices.ContainsFunc(servers, apart) && slices.ContainsFunc(servers, together)
+				case sim.FaultLink:
+					link = link || slices.ContainsFunc(servers, func(s *sim.Node) bool { return ev.Net.Covers(c, s) || ev.Net.Covers(s, c) })
+				case sim.FaultClog:
+					clog = clog || ev.Node == c
+				default:
+					hitC = hitC || ev.Node == c
+					hitServers = hitServers || slices.Contains(servers, ev.Node)
+				}
+			},
+		}
+		// Each nemesis draws a run's shape, and some runs have no
+		// faults, or storms without network faults.
+		for i := 0; i < 10 && !(hitServers && split && link && clog); i++ {
+			nm := w.NewNemesis(cfg)
+			nm.Start()
+			time.Sleep(time.Hour)
+			nm.Stop()
+		}
+		logf("an excluded node: node faults hit it: %v, hit servers: %v, partitioned with some servers and not others: %v, an end of a faulty link: %v, clogged: %v", hitC, hitServers, split, link, clog)
+	})
+}

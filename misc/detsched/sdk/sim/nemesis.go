@@ -122,8 +122,12 @@ type NemesisConfig struct {
 	// Nodes are the nodes to fault (default: the world's nodes at the
 	// time of each fault, without removed ones).
 	Nodes []*Node
-	// Exclude lists nodes never to fault, such as the clients of a
-	// workload.
+	// Exclude lists nodes the nemesis never kills, stops, pauses,
+	// throttles, or slows the disk of, such as the clients of a workload
+	// or a coordinator that cannot restart. Network faults still reach
+	// them: a partition puts each in a random group, and clogs and links
+	// pick them like the other nodes, so that a client can reach some
+	// servers but not others.
 	Exclude []*Node
 	// Restart starts a node again after a kill or stop. It is called from
 	// the nemesis's goroutine, which belongs to no node. Without it, the
@@ -322,7 +326,7 @@ func (nm *Nemesis) startStorm(now time.Time) {
 	nm.gap = logUniform(gapMin, gapMax)
 	nm.dur = logUniform(durMin, durMax)
 	nm.focus = nil
-	if t := nm.targets(); len(t) > 0 && Intn(3) == 0 {
+	if t := nm.nodeTargets(); len(t) > 0 && Intn(3) == 0 {
 		nm.focus = t[Intn(len(t))]
 	}
 	nm.swarm()
@@ -377,13 +381,19 @@ func logUniform(lo, hi time.Duration) time.Duration {
 	return time.Duration(float64(lo) * math.Exp(u*math.Log(float64(hi)/float64(lo))))
 }
 
-// targets returns the nodes the nemesis may fault now.
-func (nm *Nemesis) targets() []*Node {
+// netTargets returns the nodes the nemesis's network faults may reach
+// now.
+func (nm *Nemesis) netTargets() []*Node {
 	nodes := nm.cfg.Nodes
 	if nodes == nil {
 		nodes = nm.w.nodes
 	}
-	return slices.DeleteFunc(slices.Clone(nodes), func(n *Node) bool { return n.removed || slices.Contains(nm.cfg.Exclude, n) })
+	return slices.DeleteFunc(slices.Clone(nodes), func(n *Node) bool { return n.removed })
+}
+
+// nodeTargets returns the nodes the nemesis's node faults may hit now.
+func (nm *Nemesis) nodeTargets() []*Node {
+	return slices.DeleteFunc(nm.netTargets(), func(n *Node) bool { return slices.Contains(nm.cfg.Exclude, n) })
 }
 
 // swarm picks the fault kinds and modes of a storm.
@@ -459,20 +469,16 @@ func (nm *Nemesis) inject() {
 		return
 	}
 	w := nm.w
-	nodes := nm.targets()
-	// aim returns the node a fault on one of nodes hits.
-	focus := -1
-	if nm.focus != nil {
-		focus = slices.Index(nodes, nm.focus)
-	}
-	aim := func() int {
-		if focus >= 0 {
-			return focus
+	net, nodes := nm.netTargets(), nm.nodeTargets()
+	// aim returns the index of the node in ns that a fault hits.
+	aim := func(ns []*Node) int {
+		if i := slices.Index(ns, nm.focus); i >= 0 {
+			return i
 		}
-		return Intn(len(nodes))
+		return Intn(len(ns))
 	}
 	maxDown := max(1, (len(nodes)-1)/2) // a minority
-	if len(nodes) == 0 {
+	if len(net) == 0 {
 		return
 	}
 	kind := nm.pickKind()
@@ -481,16 +487,16 @@ func (nm *Nemesis) inject() {
 	var undo func()
 	switch kind {
 	case FaultPartition:
-		if len(nodes) < 2 {
+		if len(net) < 2 {
 			return
 		}
 		// Split into 2 groups, or 3 with 3 nodes or more.
 		k := 2
-		if len(nodes) >= 3 && Intn(3) == 0 {
+		if len(net) >= 3 && Intn(3) == 0 {
 			k = 3
 		}
 		groups := make([][]*Node, k)
-		perm := make([]int, len(nodes))
+		perm := make([]int, len(net))
 		for i := range perm {
 			perm[i] = i
 		}
@@ -503,14 +509,14 @@ func (nm *Nemesis) inject() {
 			if i >= k {
 				g = Intn(k)
 			}
-			groups[g] = append(groups[g], nodes[p])
+			groups[g] = append(groups[g], net[p])
 		}
 		f := w.PartitionGroups(nm.effect(), Intn(3) == 0, groups...)
 		ev.Net, ev.Desc = f, f.String()
 		undo = f.Heal
 		assert.Reachable("nemesis: partition "+f.eff.Mode.String(), nil)
 	case FaultClog:
-		n := nodes[aim()]
+		n := net[aim(net)]
 		in, out := true, true
 		switch Intn(3) {
 		case 1:
@@ -523,12 +529,12 @@ func (nm *Nemesis) inject() {
 		undo = f.Heal
 		assert.Reachable("nemesis: clog "+f.eff.Mode.String(), nil)
 	case FaultLink:
-		if len(nodes) < 2 {
+		if len(net) < 2 {
 			return
 		}
-		i := aim()
-		j := (i + 1 + Intn(len(nodes)-1)) % len(nodes)
-		a, b := nodes[i], nodes[j]
+		i := aim(net)
+		j := (i + 1 + Intn(len(net)-1)) % len(net)
+		a, b := net[i], net[j]
 		eff := nm.effect()
 		var f *NetFault
 		if Intn(3) == 0 {
@@ -552,9 +558,10 @@ func (nm *Nemesis) inject() {
 		if len(nm.down) >= maxDown {
 			return
 		}
+		focused := slices.Contains(nodes, nm.focus)
 		var up []*Node
 		for _, n := range nodes {
-			if n.Up() && !n.Paused() && !n.Throttled() && !nm.down[n] && (focus < 0 || n == nm.focus) {
+			if n.Up() && !n.Paused() && !n.Throttled() && !nm.down[n] && (!focused || n == nm.focus) {
 				up = append(up, n)
 			}
 		}
@@ -595,7 +602,10 @@ func (nm *Nemesis) inject() {
 		}
 		assert.Reachable("nemesis: "+kind, nil)
 	case FaultDisk:
-		n := nodes[aim()]
+		if len(nodes) == 0 {
+			return
+		}
+		n := nodes[aim(nodes)]
 		d := n.disk
 		if d.slow > 1 || d.stallUntil > now() {
 			return

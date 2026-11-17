@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched7
+v=go1.27.4-detsched8
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -177,10 +177,10 @@ goroutine switch, and diff their standard error.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched7:
+and release N's version is v0.N.0, so with go1.27.4-detsched8:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.7.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.8.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -436,7 +436,9 @@ it, so the replay command a failure prints shows the timeline again.
   the nodes down), a random subset of the kinds and modes (swarm testing),
   and, one time in three, a node to aim at; each calm draws its length
   (from 1s), and one run in 16 has no faults. `NemesisConfig` says which
-  nodes to fault (`Nodes`, `Exclude`), how to restart one (`Restart`),
+  nodes to fault (`Nodes`; `Exclude` keeps node faults off a node, such
+  as a client or a coordinator, while network faults still reach it),
+  how to restart one (`Restart`),
   which kinds never to inject (`Disable`; `FaultClockSkipBack` keeps the
   clock from stepping back), and what to call on each fault (`Event`).
   `StopFaults(d)` starts a calm of at least `d`, like
@@ -472,7 +474,8 @@ it, so the replay command a failure prints shows the timeline again.
   runs when and alongside what, runs the nemesis during the drive phase,
   restarts the drive phase after a branch of the search, and reports
   which commands overlap which faults to the search. Commands run on a
-  client node that the nemesis leaves alone. `testdata/simcompose` is an
+  client node that the nemesis never kills, though partitions put it on
+  either side, with some servers and not others. `testdata/simcompose` is an
   example.
 
 The search's forks work with simulated sockets, which they refuse for

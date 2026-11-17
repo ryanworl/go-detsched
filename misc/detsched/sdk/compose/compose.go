@@ -52,8 +52,9 @@
 //
 // Commands run on a client node the composer adds to the world, named
 // "client", so their system calls go to the simulation, and dialing a
-// cluster node crosses the simulated network. The nemesis never faults
-// the client. A command that calls into a cluster node's code directly,
+// cluster node crosses the simulated network. The nemesis never kills,
+// pauses, or throttles the client, but its network faults reach it: a
+// partition can leave it with some cluster nodes and not others. A command that calls into a cluster node's code directly,
 // such as through sim.Node.Go, runs that code on the cluster node, where
 // killing the client does not stop it; such commands must return once
 // Ctx.Context is done.
@@ -88,8 +89,9 @@ import (
 // Config configures a Composer. Zero fields take defaults.
 type Config struct {
 	// Faults configures the nemesis that runs during the drive phase.
-	// The composer adds its client node to Faults.Exclude and calls
-	// Faults.Event too.
+	// The composer adds its client node to Faults.Exclude, which keeps
+	// node faults off it but not network faults, and calls Faults.Event
+	// too.
 	Faults sim.NemesisConfig
 	// Budget is the longest the drive phase may last, in simulated time
 	// (default 2 minutes, at least 20 seconds).

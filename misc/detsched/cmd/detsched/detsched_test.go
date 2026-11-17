@@ -632,6 +632,7 @@ func TestSimFaults(t *testing.T) {
 			"sim.disk.slowsync stalls an fsync for 10ms or more: true, while the node's other goroutines run: true",
 			"disk stalls: true, their fsyncs return when the stall ends: true, while a's other goroutines and b run: true",
 			"fsyncs on a slowed disk take 5 times as long or more: true",
+			"an excluded node: node faults hit it: false, hit servers: true, partitioned with some servers and not others: true, an end of a faulty link: true, clogged: true",
 			`after a power failure: "synced "`,
 			"fsync of a redirtied page: ok",
 			"fsync of an exempt file with a failing disk: ok",
