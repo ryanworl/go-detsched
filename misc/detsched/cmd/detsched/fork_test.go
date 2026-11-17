@@ -347,7 +347,8 @@ func TestSearchTimeout(t *testing.T) {
 }
 
 // TestSearchReports checks that the search prints where seed 1 leaves the
-// deterministic subset: here, by starting a subprocess.
+// deterministic subset: here, by starting a subprocess, at a switch and
+// tick of the run.
 func TestSearchReports(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	s, err := newSearch("../../testdata/subprocess", "", "")
@@ -359,7 +360,7 @@ func TestSearchReports(t *testing.T) {
 	if err := s.run(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	if want := regexp.MustCompile(`warning: seed 1 left the deterministic subset.*\n\tdetsched: goroutine 1 starts a subprocess \(\S*/true\)`); s.left != 1 || !want.MatchString(b.String()) {
+	if want := regexp.MustCompile(`warning: seed 1 left the deterministic subset.*\n\tdetsched: goroutine 1 starts a subprocess \(\S*/true\), whose timing comes from the OS, at s\d+ k\d+; the program no longer runs deterministically\n`); s.left != 1 || !want.MatchString(b.String()) {
 		t.Errorf("%d reports, output:\n%s\nwant 1, matching %s", s.left, b.String(), want)
 	}
 }

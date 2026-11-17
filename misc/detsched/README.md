@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched11
+v=go1.27.4-detsched12
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -185,10 +185,10 @@ goroutine's stack there instead. It does not change the run.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched11:
+and release N's version is v0.N.0, so with go1.27.4-detsched12:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.11.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.12.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -256,8 +256,11 @@ The runtime reports, once per distinct stack, each place where a program
 leaves the deterministic subset: waiting for a file or network connection to
 become ready, staying in a system call long enough for the watchdog to hand
 off the P, starting a subprocess, a timer outside every bubble firing, and
-the bubble rule above acting where upstream would hang. detsched prints the
-reports of the first run, seed 1, when the search starts. The runtime does
+the bubble rule above acting where upstream would hang. Each report says
+where in the run it happened, as `at sN kN`, the switch and tick that
+`GODETSTOP` takes, and with `GODEBUG=dettrace=2` it is made every time,
+among the switches. detsched prints the reports of the first run, seed 1,
+when the search starts. The runtime does
 not catch system calls that return data from the OS, such as the process ID
 or file contents.
 

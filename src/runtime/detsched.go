@@ -904,7 +904,8 @@ func detStrictFirst(key uint64) bool {
 // detStrictOS reports that goroutine gp (the running goroutine, or one
 // being woken) makes the program depend on the OS or on real time, as what
 // describes, and prints gp's stack, if the runtime reports (see
-// detReporting). Must run on the system stack.
+// detReporting). Each report is made once, or each time under dettrace=2,
+// which prints every switch. Must run on the system stack.
 func detStrictOS(what string, gp *g) {
 	if !detReporting() {
 		return
@@ -915,17 +916,19 @@ func detStrictOS(what string, gp *g) {
 	for _, pc := range pcs[:n] {
 		key = detMix(key, uint64(pc))
 	}
-	if !detStrictFirst(key) {
+	if !detStrictFirst(key) && debug.dettrace < 2 {
 		return
 	}
-	print("detsched: goroutine ", gp.goid, " ", what, "; the program no longer runs deterministically\n")
+	print("detsched: goroutine ", gp.goid, " ", what)
+	detStrictAt()
+	print("; the program no longer runs deterministically\n")
 	traceback(^uintptr(0), ^uintptr(0), 0, gp)
 	print("\n")
 }
 
 // detStrictTimer reports that a timer outside every synctest bubble is
-// about to call f(arg), if the runtime reports (see detReporting). Called
-// by (*timer).unlockAndRun, on the system stack.
+// about to call f(arg), if the runtime reports (see detReporting), as
+// detStrictOS does. Called by (*timer).unlockAndRun, on the system stack.
 func detStrictTimer(f func(any, uintptr, int64), arg any) {
 	if !detReporting() {
 		return
@@ -935,10 +938,21 @@ func detStrictTimer(f func(any, uintptr, int64), arg any) {
 		detStrictOS("wakes from a sleep outside any synctest bubble, after real time passed", arg.(*g))
 		return
 	}
-	if !detStrictFirst(detMix(1, uint64(fpc))) {
+	if !detStrictFirst(detMix(1, uint64(fpc))) && debug.dettrace < 2 {
 		return
 	}
-	print("detsched: a timer outside any synctest bubble fired after real time passed and calls ", funcname(findfunc(fpc)), "; the program no longer runs deterministically\n\n")
+	print("detsched: a timer outside any synctest bubble fired after real time passed and calls ", funcname(findfunc(fpc)))
+	detStrictAt()
+	print("; the program no longer runs deterministically\n\n")
+}
+
+// detStrictAt prints where in the run a report is made, as GODETSTOP's
+// points count it: the switch and the tick. A report from the same seed
+// at another point means real time decided where the runs part.
+func detStrictAt() {
+	if pp := getg().m.p.ptr(); pp != nil {
+		print(", at s", detP(pp).switches, " k", detTickNow())
+	}
 }
 
 // detSyscallRetakeNS is how long a goroutine stays in one system call
