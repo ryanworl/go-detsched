@@ -1167,7 +1167,7 @@ func TestForwardSkips(t *testing.T) {
 		w.AddNode("a", "10.0.0.1")
 		var skips int
 		var last time.Duration
-		nm := w.NewNemesis(sim.NemesisConfig{
+		cfg := sim.NemesisConfig{
 			Disable: []string{sim.FaultPartition, sim.FaultClog, sim.FaultLink, sim.FaultRestore, sim.FaultPause, sim.FaultThrottle, sim.FaultClockSkipBack},
 			Event: func(ev sim.Event) {
 				if ev.Kind != sim.FaultClockSkip {
@@ -1180,12 +1180,17 @@ func TestForwardSkips(t *testing.T) {
 					last = s
 				}
 			},
-		})
-		nm.Start()
-		time.Sleep(time.Hour)
-		nm.Stop()
+		}
+		// Each nemesis draws a run's shape, and some runs have no
+		// faults, or storms without clock skips.
+		for i := 0; i < 10 && skips < 10; i++ {
+			nm := w.NewNemesis(cfg)
+			nm.Start()
+			time.Sleep(time.Hour)
+			nm.Stop()
+		}
 		if skips < 10 {
-			t.Errorf("%d clock skips in an hour, want at least 10", skips)
+			t.Errorf("%d clock skips in 10 nemesis runs of an hour, want at least 10", skips)
 		}
 	})
 }
@@ -1230,7 +1235,7 @@ func TestDiskFaults(t *testing.T) {
 			}
 		})
 		b.Start(tick(&ticksB))
-		nm := w.NewNemesis(sim.NemesisConfig{
+		cfg := sim.NemesisConfig{
 			Nodes:   []*sim.Node{a},
 			Disable: []string{sim.FaultPartition, sim.FaultClog, sim.FaultLink, sim.FaultRestore, sim.FaultKill, sim.FaultKillProcess, sim.FaultStop, sim.FaultPause, sim.FaultThrottle, sim.FaultClockSkip},
 			Event: func(ev sim.Event) {
@@ -1242,10 +1247,17 @@ func TestDiskFaults(t *testing.T) {
 					faults[len(faults)-1].end = time.Now()
 				}
 			},
-		})
-		nm.Start()
-		time.Sleep(5 * time.Minute)
-		nm.Stop()
+		}
+		// Each nemesis draws a run's shape, and some runs have no
+		// faults, or few disk faults.
+		long := func(f span) bool { return f.stall && f.end.Sub(f.start) > 20*time.Millisecond }
+		slowed := func(f span) bool { return !f.stall }
+		for i := 0; i < 10 && !(slices.ContainsFunc(faults, long) && slices.ContainsFunc(faults, slowed)); i++ {
+			nm := w.NewNemesis(cfg)
+			nm.Start()
+			time.Sleep(5 * time.Minute)
+			nm.Stop()
+		}
 		in := func(ts []time.Time, f span) bool {
 			return slices.ContainsFunc(ts, func(t time.Time) bool { return t.After(f.start) && t.Before(f.end) })
 		}
@@ -1264,7 +1276,7 @@ func TestDiskFaults(t *testing.T) {
 			}
 		}
 		for _, f := range faults {
-			if f.stall && f.end.Sub(f.start) > 20*time.Millisecond {
+			if long(f) {
 				stalls++
 				ran = ran && in(ticksA, f) && in(ticksB, f)
 			}
