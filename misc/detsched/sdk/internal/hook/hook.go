@@ -10,3 +10,7 @@ package hook
 // assertion. sim sets it while a World exists, to put failures in the
 // fault timeline.
 var AssertFailed func(msg string)
+
+// SetupComplete, if set, is called by lifecycle.SetupComplete. sim sets
+// it, to start the simulation's faults once setup is done.
+var SetupComplete func()

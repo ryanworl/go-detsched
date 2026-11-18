@@ -9,14 +9,14 @@ package main
 import (
 	"fmt"
 
-	"github.com/tidewater-io/strata"
+	"github.com/acme/widgets"
 )
 
 func main() {
-	s := &strata.Set{}
+	s := &widgets.Set{}
 	for id := 1; id <= 2; id++ {
 		s.Free(id)
 	}
 	s.Drop(3)
-	fmt.Println(strata.Visit(3))
+	fmt.Println(widgets.Visit(3))
 }

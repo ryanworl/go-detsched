@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -102,16 +103,17 @@ func (c *cell) weight() float64 { return (c.found + 1) / (c.secs + 1) }
 // A proc is a program stopped by its fork server, which launches fork:
 // a setup root or a cell's program.
 type proc struct {
-	mu     sync.Mutex // serializes commands to srv
-	srv    *forkServer
-	pid    int
-	tape   string    // the branch points the stopped program applied
-	parent *proc     // the server that forked it, or nil
-	ready  chan bool // closed once srv is stopped, or failed with err
-	err    error
-	busy   int       // launches forking it
-	used   time.Time // the last launch it served
-	closed bool
+	mu          sync.Mutex // serializes commands to srv
+	srv         *forkServer
+	pid         int
+	tape        string    // the branch points the stopped program applied
+	parent      *proc     // the server that forked it, or nil
+	ready       chan bool // closed once srv is stopped, or failed with err
+	err         error
+	busy        int       // launches forking it
+	maxSwitches uint64    // the maxswitches it runs with
+	used        time.Time // the last launch it served
+	closed      bool
 }
 
 // feedbackKinds are the runtime's feedback feature kinds, in its order
@@ -157,14 +159,27 @@ func (s *search) prepare(ctx context.Context) error {
 	}
 	base := runs[0]
 	base.seed = 1
+	for _, r := range runs {
+		if r.outOfMem {
+			r.seed = 1
+			s.mu.Lock()
+			line := s.replayLine(r, false)
+			s.mu.Unlock()
+			return fmt.Errorf("seed 1 was stopped because memory ran out, holding %d MB; bound what the program keeps, or replay it, with its memory capped on Linux:\n%s", r.memAtStop>>20, line)
+		}
+	}
 	trace := base.trace()
 	if trace == "" {
 		return fmt.Errorf("%s printed no detsched trace line; build it with a detsched toolchain and GOEXPERIMENT=detsched\n%s", s.bin, truncate(string(base.output), 2000))
 	}
 	s.baseTrace, s.baseOutput = trace, base.output
+	if s.built {
+		s.debugDone = make(chan bool)
+		go s.buildDebug(ctx)
+	}
 	if runs[1].trace() != trace {
-		s.unstable = fmt.Sprintf("seed 1 ran two different schedules (%q, then %q), so failures may not replay; the program depends on something besides its seed, such as real time or the OS", trace, runs[1].trace())
-		s.printf("detsched: warning: %s\n", s.unstable)
+		s.unstable = fmt.Sprintf("seed 1 ran two different schedules in two runs started at once: %q, then %q", strings.TrimPrefix(trace, "detsched: "), strings.TrimPrefix(runs[1].trace(), "detsched: "))
+		s.notice(s.unstable)
 	} else if runs[2].trace() != trace {
 		vars, ok, err := s.findVars(ctx, s.shellRun, trace)
 		if err != nil {
@@ -173,31 +188,27 @@ func (s *search) prepare(ctx context.Context) error {
 		if !ok {
 			// The variables found are not enough, so the schedule depends
 			// on something else; keep them off replay lines.
-			s.printf("detsched: warning: seed 1 runs another schedule in a new shell, so replay lines may not reproduce failures there\n")
+			s.newShell = true
+			s.notice("seed 1 runs another schedule in a new shell")
 		} else {
 			s.vars = vars
 		}
 	}
+	// Where seed 1 left the deterministic subset, with the stacks in its
+	// log.
 	if reports := leftReport.FindAll(base.output, -1); len(reports) > 0 {
-		s.left = len(reports)
-		var b strings.Builder
-		b.WriteString("detsched: warning: seed 1 left the deterministic subset, so failures may not replay:\n")
-		for i, r := range reports {
-			if i == 5 {
-				fmt.Fprintf(&b, "\t(and %d more)\n", len(reports)-i)
-				break
-			}
-			b.WriteString("\t" + strings.ReplaceAll(strings.TrimSuffix(string(r), "\n"), "\n", "\n\t") + "\n")
+		for _, r := range reports {
+			first, _, _ := bytes.Cut(r, []byte("\n"))
+			s.left = append(s.left, strings.TrimSuffix(strings.TrimPrefix(string(first), "detsched: "), "; the program no longer runs deterministically"))
 		}
-		s.printf("%s", b.String())
+		if err := os.WriteFile(s.temp("seed-1.log"), base.output, 0o666); err != nil {
+			return err
+		}
+		s.notice(fmt.Sprintf("seed 1 left the deterministic subset: %s", s.left[0]))
 	}
-	// A run that makes 1000 times the switches of seed 1 spins, and is
-	// stopped. Seed 1 measures a whole run only if it passed: one that
-	// failed early would stop runs that are only longer, so then -timeout
-	// alone stops them.
-	if !base.failed() {
-		m := switchesField.FindStringSubmatch(trace)
-		s.maxSwitches = 1000 * max(atou(m[1]), 1000)
+	if m := noASLRLine.FindSubmatch(base.output); m != nil {
+		s.aslr = string(m[1])
+		s.notice("seed 1 could not run itself again without ASLR")
 	}
 	if m := setupLine.FindSubmatch(base.output); m != nil {
 		s.setup, s.stop = true, atou(string(m[1]))+1
@@ -216,7 +227,7 @@ func (s *search) prepare(ctx context.Context) error {
 		for _, k := range []string{"park", "select", "lockorder", "recover", "max"} {
 			counted[k] = true
 		}
-		s.novelty = "the runtime's features, as the program reports no guide states (see the README's \"The search\")"
+		s.novelty = "the runtime's features (the program reports no guide states)"
 	}
 	f, err := os.Create(s.temp("seen"))
 	if err != nil {
@@ -239,7 +250,10 @@ func (s *search) prepare(ctx context.Context) error {
 	return s.record(ctx, base, armFresh)
 }
 
-var addrs = regexp.MustCompile(`0x[0-9a-f]+`)
+var (
+	addrs      = regexp.MustCompile(`0x[0-9a-f]+`)
+	noASLRLine = regexp.MustCompile(`(?m)^detsched: cannot run again without ASLR: (.*)$`)
+)
 
 // predict adds the deadlock directives in a run's output to the sites
 // directed launches yield at.
@@ -435,10 +449,11 @@ func (s *search) isRefused(err error, root bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refused++
+	s.refusals[refused.reason]++
 	if (root && !s.forked && s.refused >= 10 || refused.reason == forkCgo || refused.reason == forkFiles) && s.canFork {
 		s.canFork = false
-		s.refusal = refused.Error()
-		s.printf("detsched: the program refused to fork (%s), so the search runs fresh seeds without forking\n", s.refusal)
+		s.refusal = refused.reason
+		s.notice(refused.Error())
 	}
 	return true
 }
@@ -595,7 +610,10 @@ func (s *search) materialize(ctx context.Context, c *cell) (*proc, error) {
 // stopCell starts c's program under a fork server and stops it at c's
 // state, in p.
 func (s *search) stopCell(ctx context.Context, c *cell, p *proc) error {
-	fields := append(yieldField(c.yield), "feedback=1", fmt.Sprintf("maxswitches=%d", s.maxSwitches))
+	s.mu.Lock()
+	p.maxSwitches = s.maxSwitches
+	s.mu.Unlock()
+	fields := append(yieldField(c.yield), "feedback=1", fmt.Sprintf("maxswitches=%d", p.maxSwitches))
 	if c.tape != "" {
 		fields = append(fields, "tape="+c.tape)
 	}
@@ -773,8 +791,9 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 	}
 	s.mu.Lock()
 	s.forked = true
+	s.forks++
 	s.mu.Unlock()
-	untrack := s.track(start, pid, func() { syscall.Kill(pid, syscall.SIGKILL) })
+	untrack := s.track(start, pid, func(sig syscall.Signal) { syscall.Kill(pid, sig) })
 	defer untrack()
 	tape := fmt.Sprintf("%d:%d", at, bseed)
 	if p.tape != "" {
@@ -795,7 +814,7 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 	}
 	hits, _ := os.ReadFile(fb.Name())
 	output, size := readOutput(out.Name())
-	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, hung: hung, wall: time.Since(start)}
+	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, hung: hung, wall: time.Since(start), maxSwitches: p.maxSwitches}
 	r.outOfMem, r.memAtStop = untrack()
 	var novelAt uint64
 	if len(hits) == len(s.seen)+32 {
@@ -815,17 +834,27 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 
 // waitMem waits while memory is low, closing idle stopped programs.
 func (s *search) waitMem(ctx context.Context) {
-	start := time.Now()
+	waiting := false
+	defer func() {
+		if waiting {
+			s.mu.Lock()
+			if s.memWaiting--; s.memWaiting == 0 {
+				s.memWait += time.Since(s.memWaitFrom)
+			}
+			s.mu.Unlock()
+		}
+	}()
 	for ctx.Err() == nil {
 		s.mu.Lock()
 		if !s.memLow() {
 			s.mu.Unlock()
 			return
 		}
-		if time.Since(start) > 5*time.Second && time.Since(s.memWaited) > 30*time.Second {
-			s.memWaited = time.Now()
-			avail, total := memory()
-			s.printf("detsched: waiting to start runs until a quarter of the memory is available: %d of %d MB\n", avail>>20, total>>20)
+		if !waiting {
+			waiting = true
+			if s.memWaiting++; s.memWaiting == 1 {
+				s.memWaitFrom = time.Now()
+			}
 		}
 		idle := s.trim(0)
 		s.mu.Unlock()
@@ -872,25 +901,26 @@ func (s *search) memLow() bool {
 		s.lowMem = true
 		var self runtime.MemStats
 		runtime.ReadMemStats(&self)
-		s.printf("detsched: memory is low (%d of %d MB available, under a quarter; detsched itself holds %d MB, and the runs' output is up to %d MB each), so the search keeps fewer stopped programs and starts fewer runs\n", avail>>20, total>>20, self.Sys>>20, s.bigOutput>>20)
+		s.notice(fmt.Sprintf("memory is low: %d of %d MB available, under a quarter (detsched itself holds %d MB), so the search keeps fewer stopped programs and waits to start runs", avail>>20, total>>20, self.Sys>>20))
 	}
 	return low
 }
 
-// A liveRun is a running program, process pid, which guardMem may stop.
+// A liveRun is a running program, process pid, which guardMem may stop
+// by sending it signals.
 type liveRun struct {
 	start   time.Time
 	pid     int
-	kill    func()
+	signal  func(syscall.Signal)
 	stopped bool
 	mem     uint64 // the private memory it held when guardMem stopped it
 }
 
-// track records a running program, process pid, that kill stops, until
+// track records a running program, process pid, that signal signals, until
 // the returned function is called, which reports whether guardMem stopped
 // it and how much private memory it held then.
-func (s *search) track(start time.Time, pid int, kill func()) (untrack func() (bool, uint64)) {
-	l := &liveRun{start: start, pid: pid, kill: kill}
+func (s *search) track(start time.Time, pid int, signal func(syscall.Signal)) (untrack func() (bool, uint64)) {
+	l := &liveRun{start: start, pid: pid, signal: signal}
 	s.mu.Lock()
 	s.running[l] = true
 	s.mu.Unlock()
@@ -935,7 +965,16 @@ func (s *search) guardMem(ctx context.Context) {
 		}
 		if pick != nil {
 			pick.stopped, pick.mem = true, pickMem
-			pick.kill()
+			// SIGQUIT, for its stacks, which say where it was.
+			pick.signal(syscall.SIGQUIT)
+			go func(l *liveRun) {
+				time.Sleep(5 * time.Second)
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				if s.running[l] {
+					l.signal(syscall.SIGKILL)
+				}
+			}(pick)
 		}
 		s.mu.Unlock()
 	}

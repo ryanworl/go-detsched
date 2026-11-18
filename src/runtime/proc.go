@@ -395,6 +395,11 @@ func forcegchelper() {
 		forcegc.idle.Store(true)
 		goparkunlock(&forcegc.lock, waitReasonForceGCIdle, traceBlockSystemGoroutine, 1)
 		// this goroutine is explicitly resumed by sysmon
+		if goexperiment.DetSched {
+			// or, in det mode, by detGCIdleEpoch, for an epoch.
+			GC()
+			continue
+		}
 		if debug.gctrace > 0 {
 			println("GC forced")
 		}

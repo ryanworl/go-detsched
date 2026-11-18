@@ -13,35 +13,27 @@ import (
 	"cmd/compile/internal/ssa"
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
-	"cmd/internal/objabi"
+	"cmd/internal/src"
 )
 
-// detPreempt reports whether fn counts ticks and synchronization points
-// under GOEXPERIMENT=detsched, so that it is preempted deterministically.
-// The runtime and the packages it imports are not counted: they may run
-// where preemption is not allowed, and they are deterministic, so leaving
-// them out only delays a preemption. Neither are the packages that wrap
-// system calls:
-//
-//   - A goroutine that writes to standard error holds the write lock of
-//     os.Stderr's poll.FD, and preempted there, a simulated node that
-//     crashes would keep it from every other node for good. Without
-//     ticks, nothing preempts the write, which det mode buffers.
-//   - Their loops retry system calls interrupted by signals (EINTR),
-//     which a debugger causes, so ticks there would make a run under a
-//     debugger take another schedule.
-//   - The length of the environment, which syscall copies, does not move
-//     preemptions.
-func detPreempt(fn *ir.Func, nosplit bool) bool {
-	if !buildcfg.Experiment.DetSched || nosplit || fn.Linksym().ABIWrapper() {
+// detCounts reports whether code at pos counts ticks and synchronization
+// points: whether the source function it belongs to does, which for
+// inlined code is the inlined function (see ir.DetFuncCounts). Nothing
+// counts in a function that cannot call the scheduler.
+func (s *state) detCounts(pos src.XPos) bool {
+	if !buildcfg.Experiment.DetSched || base.Flag.CompilingRuntime || s.f.NoSplit || s.curfn.ABIWrapper() {
 		return false
 	}
-	switch path := base.Ctxt.Pkgpath; path {
-	case "os", "syscall", "internal/poll", "internal/syscall/unix":
-		return false
-	default:
-		return !objabi.LookupPkgSpecial(path).Runtime
+	if i := base.Ctxt.PosTable.Pos(pos).Base().InliningIndex(); i >= 0 {
+		return ir.DetInlCounts[i]
 	}
+	return s.detFunc
+}
+
+// detInlCounts reports whether the inlined call with inline tree index i
+// counts the tick of its callee's entry.
+func (s *state) detInlCounts(i int64) bool {
+	return buildcfg.Experiment.DetSched && !base.Flag.CompilingRuntime && !s.f.NoSplit && !s.curfn.ABIWrapper() && ir.DetInlCounts[i]
 }
 
 // detTick emits a function-entry tick for GOEXPERIMENT=detsched:
@@ -50,7 +42,9 @@ func detPreempt(fn *ir.Func, nosplit bool) bool {
 //		runtime.detPreempt()
 //	}
 //
-// ssa.insertLoopReschedChecks emits the same check on loop backedges.
+// It is emitted at the entry of a function that counts and is not a leaf
+// (ir.DetLeaf), at the start of each inlined body of one, at the end of each iteration of a for loop in
+// code that counts, and before each backward goto there.
 func (s *state) detTick() {
 	s.detCheck(ir.Syms.DetTicks, ir.Syms.DetPreempt)
 }
@@ -118,7 +112,9 @@ func detSyncCall(n *ir.CallExpr, isGo bool) bool {
 }
 
 // detSyncFunc reports whether a call to sym, which may be intrinsified,
-// is an atomic operation.
+// is an atomic operation: an exported function of the atomic packages,
+// not a helper such as sync/atomic's b32, which an optimized build
+// inlines.
 func detSyncFunc(sym *types.Sym) bool {
-	return sym != nil && sym.Pkg != nil && (sym.Pkg.Path == "sync/atomic" || sym.Pkg.Path == "internal/runtime/atomic")
+	return sym != nil && sym.Pkg != nil && (sym.Pkg.Path == "sync/atomic" || sym.Pkg.Path == "internal/runtime/atomic") && types.IsExported(sym.Name)
 }

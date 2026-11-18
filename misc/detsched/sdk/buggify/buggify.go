@@ -5,7 +5,7 @@
 // Package buggify marks places in a program where a GOEXPERIMENT=detsched
 // run may inject a fault, after FoundationDB's BUGGIFY macro.
 //
-//	if buggify.On("raft.slow-fsync") {
+//	if buggify.On("wal.slow-fsync") {
 //		time.Sleep(time.Second)
 //	}
 //

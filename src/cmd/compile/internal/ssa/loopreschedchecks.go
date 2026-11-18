@@ -7,7 +7,6 @@ package ssa
 import (
 	"cmd/compile/internal/types"
 	"fmt"
-	"internal/buildcfg"
 )
 
 // an edgeMem records a backedge, together with the memory
@@ -63,9 +62,6 @@ func insertLoopReschedChecks(f *Func) {
 	//    definitions for mem.
 
 	if f.NoSplit { // nosplit functions don't reschedule.
-		return
-	}
-	if buildcfg.Experiment.DetSched && !f.DetPreempt {
 		return
 	}
 
@@ -232,9 +228,6 @@ func insertLoopReschedChecks(f *Func) {
 		lim := test.NewValue2(bb.Pos, OpLoad, pt, limaddr, mem0)
 		cmp := test.NewValue2(bb.Pos, cmpOp, cfgtypes.Bool, sp, lim)
 		test.SetControl(cmp)
-		if f.DetPreempt {
-			mem0 = detTickCheck(test, mem0) // replaces the control; see detsched.go
-		}
 
 		// if true, goto sched
 		test.AddEdgeTo(sched)
@@ -252,9 +245,6 @@ func insertLoopReschedChecks(f *Func) {
 		//    mem1 := call resched (mem0)
 		//    goto header
 		resched := f.fe.Syslook("goschedguarded")
-		if f.DetPreempt {
-			resched = f.fe.Syslook("detPreempt")
-		}
 		call := sched.NewValue1A(bb.Pos, OpStaticCall, types.TypeResultMem, StaticAuxCall(resched, bb.Func.ABIDefault.ABIAnalyzeTypes(nil, nil)), mem0)
 		mem1 := sched.NewValue1I(bb.Pos, OpSelectN, types.TypeMem, 0, call)
 		sched.AddEdgeTo(h)

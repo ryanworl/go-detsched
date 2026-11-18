@@ -21,7 +21,11 @@ package assert
 
 import (
 	"fmt"
+	"slices"
+	"strconv"
+	"strings"
 	"sync/atomic"
+	"unicode"
 
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/internal/hook"
 )
@@ -81,7 +85,34 @@ func report(kind int, cond bool, message string, details map[string]any) {
 	}
 	d := ""
 	if failed && len(details) > 0 {
-		d = fmt.Sprint(details) // fmt prints maps sorted by key
+		d = formatDetails(details)
 	}
 	emit(kind, cond, failed, message, d)
+}
+
+// formatDetails formats details as fmt prints a map, map[k1:v1 k2:v2],
+// sorted by key, but quotes a value whose text has a space or a character
+// that is not printable, so that where each value ends is plain: the
+// detsched command groups failures whose only detail is "err" by that
+// error, and must tell map[err:x got:y] from an error that reads "x got:y".
+func formatDetails(details map[string]any) string {
+	keys := make([]string, 0, len(details))
+	for k := range details {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	var b strings.Builder
+	b.WriteString("map[")
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		v := fmt.Sprint(details[k])
+		if strings.ContainsFunc(v, func(r rune) bool { return r == ' ' || r == '"' || !unicode.IsPrint(r) }) {
+			v = strconv.Quote(v)
+		}
+		b.WriteString(k + ":" + v)
+	}
+	b.WriteByte(']')
+	return b.String()
 }

@@ -248,6 +248,7 @@ const (
 	funcOpenCodedDeferDisallowed             // can't do open-coded defers
 	funcClosureResultsLost                   // closure is called indirectly and we lost track of its results; used by escape analysis
 	funcPackageInit                          // compiler emitted .init func for package
+	funcDetLeaf                              // its source body has no calls, loops, or labels; see DetLeaf
 )
 
 type SymAndPos struct {
@@ -257,6 +258,7 @@ type SymAndPos struct {
 
 func (f *Func) Dupok() bool                    { return f.flags&funcDupok != 0 }
 func (f *Func) Wrapper() bool                  { return f.flags&funcWrapper != 0 }
+func (f *Func) DetLeaf() bool                  { return f.flags&funcDetLeaf != 0 }
 func (f *Func) ABIWrapper() bool               { return f.flags&funcABIWrapper != 0 }
 func (f *Func) Needctxt() bool                 { return f.flags&funcNeedctxt != 0 }
 func (f *Func) HasDefer() bool                 { return f.flags&funcHasDefer != 0 }
@@ -269,6 +271,7 @@ func (f *Func) IsPackageInit() bool            { return f.flags&funcPackageInit 
 
 func (f *Func) SetDupok(b bool)                    { f.flags.set(funcDupok, b) }
 func (f *Func) SetWrapper(b bool)                  { f.flags.set(funcWrapper, b) }
+func (f *Func) SetDetLeaf(b bool)                  { f.flags.set(funcDetLeaf, b) }
 func (f *Func) SetABIWrapper(b bool)               { f.flags.set(funcABIWrapper, b) }
 func (f *Func) SetNeedctxt(b bool)                 { f.flags.set(funcNeedctxt, b) }
 func (f *Func) SetHasDefer(b bool)                 { f.flags.set(funcHasDefer, b) }
@@ -480,6 +483,14 @@ func closureName(outerfn *Func, pos src.XPos, why Op, gen int) *types.Sym {
 		inlHash = base64.StdEncoding.EncodeToString(h.Sum(nil)[:8])
 
 		outer = base.Ctxt.InlTree.InlinedFuncName(inlIndex)
+		if why == OCLOSURE && inlIndex < len(DetInlLit) {
+			// Name it as the inlined function names it, so that
+			// a build with -l names it the same (see DetInlAdd).
+			suffix = "."
+			if !DetInlLit[inlIndex] {
+				suffix = ".func"
+			}
+		}
 		if pkgPath := base.Ctxt.InlTree.InlinedFuncPkg(inlIndex); pkgPath != "" {
 			pkg = types.NewPkg(pkgPath, "")
 		}

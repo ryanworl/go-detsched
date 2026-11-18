@@ -5,11 +5,11 @@ so a file of a package built from a directory whose path does not end
 in the package's import path, such as a module that go.mod replaces
 with a local directory, could not be named by its import path:
 
-	trace x github.com/tidewater-io/strata/collection.go:218
+	trace x github.com/acme/widgets/widgets.go:218
 
 said "not found" when go.mod had
 
-	replace github.com/tidewater-io/strata => ../strata
+	replace github.com/acme/widgets => ../widgets
 
 and only a suffix of the path on disk worked, so command files differed
 between checkouts. BinaryInfo.PackageFileAliases lists each file of a Go

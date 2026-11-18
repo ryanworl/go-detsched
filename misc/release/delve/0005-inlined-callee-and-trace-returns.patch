@@ -2,14 +2,14 @@ pkg/proc, pkg/terminal: name the inlined function in hits; returns follow the co
 
 A breakpoint on a function inlined into another, such as a method
 promoted through an embedded struct and inlined into the compiler's
-wrappers ((*shared).AddReadonlyTXID in (*array).AddReadonlyTXID), stops
+wrappers ((*base).Record in (*list).Record), stops
 in the caller's code, and every hit line named the caller: a tracepoint
-on (*shared).AddReadonlyTXID printed "(*array).AddReadonlyTXID(...)",
+on (*base).Record printed "(*list).Record(...)",
 which reads as a hit of another function. api.Thread.Inlined now carries
 the function inlined where the thread stopped, and hit and stop lines
 name it, followed by the function it was inlined into:
 
-	> goroutine(1): [a] main.(*shared).AddReadonlyTXID(...) (inlined in main.(*hashMap).AddReadonlyTXID)
+	> goroutine(1): [a] main.(*base).Record(...) (inlined in main.(*index).Record)
 
 In the JSON output, "func" is the inlined function and "inlined_in" the
 caller.

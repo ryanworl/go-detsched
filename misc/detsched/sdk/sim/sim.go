@@ -83,6 +83,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -98,13 +99,16 @@ type Config struct {
 	// cluster; so do fatal errors the runtime raises for user code, such
 	// as unlocking an unlocked mutex or a fault on unmapped memory
 	// ("fatal error: unexpected fault address 0x…"), and os.Exit, as
-	// log.Fatal calls it, with the message "os.Exit(<code>)". The panic is printed to
-	// standard error and reported as assert.Reachable("node panicked:
-	// <first line of the message>"), with its numbers written N so that
-	// one kind of panic is one assertion, and then OnPanic is called with the
-	// node, the message, and the goroutine's stack, so that a harness can
-	// tell a crash its system meant, which it ignores, from a bug, such as
-	// a nil pointer dereference, which it fails. The goroutine's deferred
+	// log.Fatal calls it, with the message "os.Exit(<code>)". The panic
+	// and the whole stack are printed to standard error, which the run's
+	// log holds, and reported as assert.Reachable("node panicked: " +
+	// PanicKind(msg, stack)), so that one kind of panic is one assertion,
+	// and then OnPanic is called with the node, the message, and the
+	// goroutine's stack, so that a harness can tell a crash its system
+	// meant, which it ignores, from a bug, such as a nil pointer
+	// dereference, which it fails, as with assert.Unreachable("node
+	// panicked: "+sim.PanicKind(msg, stack), ...), a group per kind of
+	// panic. The goroutine's deferred
 	// calls have run by then. Panics on goroutines of no node still end
 	// the program, and so does every panic without OnPanic, and every
 	// fatal error the runtime cannot attribute to user code, such as
@@ -133,12 +137,13 @@ type World struct {
 	incs   map[int32]*incarnation // by node handle
 	failed map[string]bool        // assertions that failed, which the timeline shows
 	quiet  int64                  // no buggify faults before then (calm)
+	setup  bool                   // true until setup completes (see calm)
 
 	fds map[int]*fdesc
 
 	events   map[uint64]func()
 	nextConn uint64
-	allConns map[*conn]bool
+	allConns map[uint64]*conn // by ID: a map keyed by pointers would iterate in an order that depends on heap addresses
 	maps     []mapping
 
 	links     map[[2]int]Link // baselines of directed links, by node index
@@ -191,7 +196,12 @@ type incarnation struct {
 	// stopping is set once Stop ran the OnStop functions.
 	stopping bool
 	down     chan struct{} // closed when the incarnation ends
+	ended    chan struct{} // closed when the start function returns or the incarnation ends
+	endOnce  sync.Once
 }
+
+// end closes inc.ended, once.
+func (inc *incarnation) end() { inc.endOnce.Do(func() { close(inc.ended) }) }
 
 // closedChan is Down's channel for a node that is down.
 var closedChan = func() chan struct{} {
@@ -230,9 +240,10 @@ func NewWorld(cfg Config) *World {
 		incs:     make(map[int32]*incarnation),
 		fds:      make(map[int]*fdesc),
 		events:   make(map[uint64]func()),
-		allConns: make(map[*conn]bool),
+		allConns: make(map[uint64]*conn),
 		links:    make(map[[2]int]Link),
 		failed:   make(map[string]bool),
+		setup:    !setupDone,
 	}
 	// Handling a message takes no simulated time, so without rounding
 	// two events almost never fall at the same instant, where the
@@ -250,11 +261,53 @@ func NewWorld(cfg Config) *World {
 	runtime_onPanic(onPanic)
 	runtime_busyOn(true)
 	hook.AssertFailed = w.assertFailed
+	hook.SetupComplete = func() {
+		setupDone = true
+		w.endSetup()
+	}
 	w.logEvent("world", "new")
 	return w
 }
 
-// assertFailed puts the first failure of each assertion in the fault
+// setupDone records that the program called lifecycle.SetupComplete, so
+// that a World created later injects faults from its start.
+var setupDone bool
+
+// endSetup ends the world's setup, after which the simulation injects its
+// faults (see calm), and says so in the fault timeline.
+func (w *World) endSetup() {
+	if !w.setup {
+		return
+	}
+	runtime_call(func() { w.setup = false })
+	w.logEvent("world", "setup complete: faults on")
+}
+
+// PanicKind describes a panic that Config.OnPanic gets, by the first line
+// of its message, with numbers masked, and the innermost function outside
+// the runtime that panicked, such as "index out of range [N] with length
+// N in example.com/kv.(*log).at": an assertion message per kind of panic,
+// which the detsched command makes a group of.
+func PanicKind(msg string, stack []byte) string {
+	first, _, _ := strings.Cut(msg, "\n")
+	kind := maskNumbers(first)
+	lines := strings.Split(string(stack), "\n")
+	for i, l := range lines {
+		if !strings.HasPrefix(l, "panic(") {
+			continue
+		}
+		for _, f := range lines[i+1:] {
+			if f != "" && !strings.HasPrefix(f, "\t") && !strings.HasPrefix(f, "runtime.") {
+				if k := strings.LastIndex(f, "("); k > 0 {
+					f = f[:k]
+				}
+				return kind + " in " + f
+			}
+		}
+	}
+	return kind
+}
+
 // maskNumbers writes each number in s, decimal or 0x hexadecimal, as N.
 func maskNumbers(s string) string {
 	var b strings.Builder
@@ -282,6 +335,7 @@ func maskNumbers(s string) string {
 	return b.String()
 }
 
+// assertFailed puts the first failure of each assertion in the fault
 // timeline, under the node whose goroutine failed it.
 func (w *World) assertFailed(msg string) {
 	name, first := "world", false
@@ -318,6 +372,9 @@ func (w *World) Close() {
 	runtime_onPanic(nil)
 	runtime_busyOn(false)
 	hook.AssertFailed = nil
+	hook.SetupComplete = nil
+	// The detsched command warns when no run got this far.
+	assert.Sometimes(!w.setup, "sim: setup completed, so the simulation injected faults", nil)
 }
 
 // onPanic crashes the node of a goroutine that panicked, if the world's
@@ -339,11 +396,11 @@ func onPanic(node int32, v any) {
 	}
 	first, _, _ := strings.Cut(msg, "\n")
 	stack := debug.Stack()
-	// Not through os.Stderr: a goroutine of a crashed node may have
-	// frozen holding its lock.
+	// The whole stack, in the run's log. Not through os.Stderr: a
+	// goroutine of a crashed node may have frozen holding its lock.
 	syscall.Write(2, fmt.Appendf(nil, "sim: node %s panicked: %s\n\n%s\n", inc.node.name, msg, stack))
 	w.logEvent(inc.node.name, "panicked:", first)
-	assert.Reachable("node panicked: "+maskNumbers(first), map[string]any{"panic": first})
+	assert.Reachable("node panicked: "+PanicKind(msg, stack), map[string]any{"panic": first})
 	w.cfg.OnPanic(inc.node, msg, stack)
 	inc.node.crash(true)
 }
@@ -470,8 +527,13 @@ func (n *Node) WipeDisk() {
 }
 
 // Start powers the node on and runs f in a new goroutine that belongs to
-// it. The node's disk holds what survived its last crash or stop.
-func (n *Node) Start(f func()) {
+// it. The node's disk holds what survived its last crash or stop. It
+// returns a channel that is closed when f returns or the node's run ends,
+// whichever comes first: a harness that runs a store on a node and crashes
+// it waits on that channel, since a crashed node's f never returns. The
+// node stays up after f returns, with the goroutines f started, until it
+// is killed or stopped.
+func (n *Node) Start(f func()) <-chan struct{} {
 	if n.inc != nil {
 		panic("sim: node " + n.name + " is already up")
 	}
@@ -489,6 +551,7 @@ func (n *Node) Start(f func()) {
 		nextHandle++
 		inc = &incarnation{
 			down:   down,
+			ended:  make(chan struct{}),
 			node:   n,
 			handle: nextHandle,
 			alive:  true,
@@ -506,14 +569,18 @@ func (n *Node) Start(f func()) {
 	runtime_nodeName(inc.handle, n.name+" (start "+strconv.Itoa(n.starts)+")")
 	n.applyCPU()
 	n.w.logEvent(n.name, "start")
-	goAs(inc, f)
+	goAs(inc, func() {
+		f()
+		inc.end()
+	})
+	return inc.ended
 }
 
 // Down returns a channel that is closed when the node's current run ends,
 // however it ends: Kill, KillProcess, Stop, or a panic that Config.OnPanic
-// caught. While the node is down, the channel is closed already. A harness
-// that waits for a node it started to finish waits on it, since a crashed
-// node's goroutines never return.
+// caught. While the node is down, the channel is closed already. The run
+// does not end when the start function returns; to wait for that too,
+// wait on the channel Start returns.
 func (n *Node) Down() <-chan struct{} {
 	if inc := n.inc; inc != nil {
 		return inc.down
@@ -789,7 +856,14 @@ func (n *Node) crashAs(process bool, ev string) {
 	}
 	self := runtime_node() == inc.handle
 	n.w.logEvent(n.name, ev)
+	crashed := false
 	runtime_call(func() {
+		// Another goroutine may have crashed it meanwhile, such as a
+		// second Stop, while this one yielded.
+		if n.inc != inc {
+			return
+		}
+		crashed = true
 		n.w.crash(inc, process)
 		n.inc = nil
 		n.paused = false
@@ -797,7 +871,11 @@ func (n *Node) crashAs(process bool, ev string) {
 		n.throttlePaused = false
 		runtime_crash(inc.handle)
 	})
+	if !crashed {
+		return
+	}
 	close(inc.down)
+	inc.end()
 	if self {
 		runtime_halt()
 	}
@@ -941,17 +1019,24 @@ func wallNow() int64 {
 	return t
 }
 
-// calm reports whether a nemesis has stopped faults for now
-// (Nemesis.StopFaults or Stop), during which the simulation's own buggify
-// faults, such as retransmission delays and disk errors, stay off too.
-func calm() bool { return world != nil && now() < world.quiet }
+// calm reports whether the simulation's own buggify faults, such as
+// retransmission delays and disk errors, are off: while the world sets
+// up, as Antithesis injects no fault before setup completes, and while a
+// nemesis has stopped faults (Nemesis.StopFaults or Stop) or SetCalm keeps
+// them off. Setup completes at the first of lifecycle.SetupComplete,
+// SetCalm(false) (which package compose calls when its First commands
+// end), Nemesis.Start, and the first fsync of a file on any node, which
+// ends a store's first open: before it, the store has nothing to recover.
+func calm() bool { return world != nil && (world.setup || now() < world.quiet) }
 
 // SetCalm keeps the simulation's buggify faults, such as disk errors and
 // retransmission delays, off while on is true, as a nemesis's calm does,
-// and turns them back on with false. package compose keeps them off
-// while a test sets up, as Antithesis injects no fault before setup
-// completes.
+// and turns them on with false, which also ends the world's setup (see
+// calm). Package compose keeps them off during its First commands.
 func (w *World) SetCalm(on bool) {
+	if !on {
+		w.endSetup()
+	}
 	runtime_call(func() {
 		if on {
 			w.quiet = 1<<63 - 1

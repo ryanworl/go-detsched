@@ -40,11 +40,11 @@ package runtime
 // timers, which this rate covers on average. It was calibrated with
 // go1.27.4-detsched on one core of an Intel Xeon @ 2.60GHz, with GC off
 // (with a harness that is not published), as the
-// geometric mean of two workloads: Pebble writing 200k keys, flushing
-// and compacting on an in-memory file system, 634ms of CPU time and
-// 75,496,820 ticks (8,400ps a tick); and a 3-node hashicorp/raft cluster
-// applying 20,000 entries over in-memory transports, 264ms and 11,617,195
-// ticks (22,700ps a tick).
+// geometric mean of two workloads: an LSM key-value store writing 200k
+// keys, flushing and compacting on an in-memory file system, 634ms of CPU
+// time and 75,496,820 ticks (8,400ps a tick); and a 3-node consensus
+// cluster applying 20,000 entries over in-memory transports, 264ms and
+// 11,617,195 ticks (22,700ps a tick).
 const detBusyPsPerTick = 13800
 
 // detBusyQuantumPs is how much CPU time a goroutine owes before it pays.

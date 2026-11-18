@@ -647,6 +647,11 @@ func (s *Schedule) staticAssignInlinedCall(l *ir.Name, loff int64, call *ir.Inli
 	if len(init) != 2 || init[0].Op() != ir.OAS2 || init[1].Op() != ir.OINLMARK {
 		return false
 	}
+	if i := init[1].(*ir.InlineMarkStmt).Index; int(i) < len(ir.DetInlCounts) && ir.DetInlCounts[i] {
+		// Under GOEXPERIMENT=detsched, the call counts its callee's
+		// entry tick, as it does with -l.
+		return false
+	}
 	as2init := init[0].(*ir.AssignListStmt)
 
 	if len(call.Body) != 2 || call.Body[0].Op() != ir.OBLOCK || call.Body[1].Op() != ir.OLABEL {

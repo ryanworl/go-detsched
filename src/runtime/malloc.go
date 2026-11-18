@@ -2269,7 +2269,9 @@ func fastexprand(mean int) int32 {
 	// x = -log_e(q) * mean
 	// x = log_2(q) * (-log_e(2)) * mean    ; Using log_2 for efficiency
 	const randomBitCount = 26
-	q := cheaprandn(1<<randomBitCount) + 1
+	// mcheaprandn: in det mode, how often a program samples depends on
+	// how much it allocates, which depends on how it was compiled.
+	q := mcheaprandn(1<<randomBitCount) + 1
 	qlog := fastlog2(float64(q)) - randomBitCount
 	if qlog > 0 {
 		qlog = 0

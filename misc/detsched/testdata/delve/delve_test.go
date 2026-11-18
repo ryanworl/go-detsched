@@ -14,10 +14,13 @@
 // On a small program of its own, promoted, they check that the hits of a
 // method inlined into compiler-generated wrappers name the method, and
 // that a conditional tracepoint's returns follow its condition and carry
-// its name. On replaced, a program using a module replaced by a local
-// directory, they check locations: a file by its import path, a closure
-// in a closure, a method inlined at an address another tracepoint has,
-// and the frames of goroutines -t in JSON.
+// its name. On returns, they check that the results at a tracepoint's
+// returns read in optimized code as in a build without optimizations, and
+// that strings print whole. On replaced, a program using a module
+// replaced by a local directory, they check locations: a file by its
+// import path, a closure in a closure, a method inlined at an address
+// another tracepoint has, the frames of goroutines -t in JSON, and that
+// a breakpoint's frames have the stack record's shape.
 //
 // $DLV names the dlv to test; the default is dlv next to go. gate.bash
 // runs them when the tree has bin/dlv:
@@ -295,8 +298,10 @@ exit
 			stops = append(stops, r)
 		}
 	}
-	if len(stops) < 3 {
-		t.Fatalf("got %d stops at serve, want 3:\n%v", len(stops), recs)
+	// The third continue stops at serve again only in a run with three
+	// starts of the server; it ends the run in others.
+	if len(stops) < 2 {
+		t.Fatalf("got %d stops at serve, want at least 2:\n%v", len(stops), recs)
 	}
 	for _, s := range stops {
 		if !strings.HasPrefix(s.pos().str("node"), "server (start ") || s.pos().str("t") == "" {
@@ -350,6 +355,58 @@ exit
 	}
 }
 
+// restart to a position at the last tick of its goroutine's quantum, after
+// which the goroutine yields, stops where GODETSTOP does: it stays in the
+// runtime and names the goroutine's frame, as leaving the runtime for the
+// goroutine's code would reach it only at a later switch. With quantum=1
+// every tick is the last of a quantum.
+func TestRestartWhereGoroutineYields(t *testing.T) {
+	f := *findFailure(t)
+	search := regexp.MustCompile(`GODETSEARCH='[^']*'`)
+	f.replay = search.ReplaceAllString(f.replay, "GODETSEARCH='perturb=off quantum=1'")
+	f.debug = search.ReplaceAllString(f.debug, "GODETSEARCH='perturb=off quantum=1'")
+	run, _ := exec.Command("/bin/sh", "-c", f.replay).CombinedOutput()
+	m := regexp.MustCompile(`(?m)^detsched: trace=\S+ switches=(\d+) `).FindSubmatch(run)
+	if m == nil {
+		t.Fatalf("the run with quantum=1 printed no trace line:\n%s", run)
+	}
+	switches, _ := strconv.Atoi(string(m[1]))
+	s := fmt.Sprintf("s%d", switches/2)
+	want := map[string]string{s: runtimeStop(t, &f, s)}
+	k := "k" + regexp.MustCompile(` k(\d+) `).FindStringSubmatch(want[s])[1]
+	want[k] = runtimeStop(t, &f, k)
+
+	out := runDlv(t, &f, "restart "+s+"\nrestart "+k+"\nexit -k\n", "--json")
+	defer func() {
+		if t.Failed() {
+			t.Logf("the debug line: %s\ndlv's output:\n%s", f.debug, out)
+		}
+	}()
+	byCmd := map[string][]record{}
+	for _, r := range parseJSON(t, out) {
+		byCmd[r.str("cmd")] = append(byCmd[r.str("cmd")], r)
+	}
+	for _, point := range []string{s, k} {
+		var at, fn, note string
+		for _, r := range byCmd["restart "+point] {
+			switch r.str("event") {
+			case "stop":
+				p := r.pos()
+				at = fmt.Sprintf("at t%s s%d k%d goroutine %d", p.str("t"), p.num("s"), p.num("k"), r.num("goroutine"))
+				fn = r.str("func")
+			case "output":
+				note = r.str("text")
+			}
+		}
+		if at != want[point] {
+			t.Errorf("restart %s stopped %q, the runtime's GODETSTOP=%s %q", point, at, point, want[point])
+		}
+		if fn != "runtime.detDebugStop" || !strings.Contains(note, " yields here") || !strings.Contains(note, "frame ") {
+			t.Errorf("restart %s stopped in %s with the note %q, want runtime.detDebugStop and a note naming the goroutine's frame", point, fn, note)
+		}
+	}
+}
+
 // A hit count on a hot function, counted by the runtime, stops at the
 // same hit as stock Delve's counting, which a condition forces, and the
 // trace line stays the replay's in both.
@@ -371,7 +428,14 @@ func TestRuntimeCountedHits(t *testing.T) {
 		for _, r := range recs {
 			switch r.str("cmd") {
 			case "breakpoints":
-				ok = strings.Contains(r.str("text"), "hits counted by the runtime") == counted
+				// Who counts the hits, and why not the runtime.
+				bps, _ := r["breakpoints"].([]any)
+				for _, b := range bps {
+					if b := record(b.(map[string]any)); b.str("name") == "n" {
+						ok = counted && b.str("counted_by") == "runtime" ||
+							!counted && b.str("counted_by") == "delve" && b.str("not_runtime_counted") == "it has a condition besides the hit count"
+					}
+				}
 			case "continue":
 				if r.str("event") == "break" {
 					hits = r.num("hits") == n
@@ -410,7 +474,7 @@ func TestInlinedAndReturns(t *testing.T) {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 	script := filepath.Join(dir, "script.dlv")
-	if err := os.WriteFile(script, []byte(`trace a main.(*shared).AddReadonlyTXID
+	if err := os.WriteFile(script, []byte(`trace a main.(*base).Record
 trace w main.work
 cond w i == 3
 trace d main.depth
@@ -430,9 +494,9 @@ exit
 	}
 
 	out := run()
-	inl := regexp.MustCompile(`(?m)^> goroutine\(\d+\): \[a\] main\.\(\*shared\)\.AddReadonlyTXID\(.*, \d\) \(inlined in main\.\(\*(array|hashMap)\)\.AddReadonlyTXID\)$`)
+	inl := regexp.MustCompile(`(?m)^> goroutine\(\d+\): \[a\] main\.\(\*base\)\.Record\(.*, \d\) \(inlined in main\.\(\*(list|index)\)\.Record\)$`)
 	if n := len(inl.FindAllString(out, -1)); n != 4 {
-		t.Errorf("got %d hit lines naming (*shared).AddReadonlyTXID and its wrapper, want 4:\n%s", n, out)
+		t.Errorf("got %d hit lines naming (*base).Record and its wrapper, want 4:\n%s", n, out)
 	}
 	for _, f := range []struct{ name, entry string }{{"work", `\[w\] main\.work\(3\)`}, {"depth", `\[d\] main\.depth\(2\)`}} {
 		entries := regexp.MustCompile(`(?m)^> goroutine\((\d+)\): `+f.entry+`$`).FindAllStringSubmatch(out, -1)
@@ -446,7 +510,7 @@ exit
 	for _, r := range parseJSON(t, run("--json")) {
 		switch r.str("event") {
 		case "trace":
-			if r.str("bp") == "a" && (r.str("func") != "main.(*shared).AddReadonlyTXID" || !strings.HasSuffix(r.str("inlined_in"), ").AddReadonlyTXID")) {
+			if r.str("bp") == "a" && (r.str("func") != "main.(*base).Record" || !strings.HasSuffix(r.str("inlined_in"), ").Record")) {
 				t.Errorf("JSON hit of a: %v", r)
 			} else if r.str("bp") == "a" {
 				inlined++
@@ -490,17 +554,17 @@ func TestLocations(t *testing.T) {
 	// in a closure, in a module path with dots; Free, into which release
 	// is inlined at Free's first statement, and then release, which Drop
 	// also calls.
-	script := `trace p github.com/tidewater-io/strata/collection.go:13
-trace c github.com/tidewater-io/strata.Visit.func1.1
-trace f strata.(*Set).Free
-trace r strata.(*Set).release
+	script := `trace p github.com/acme/widgets/widgets.go:13
+trace c github.com/acme/widgets.Visit.func1.1
+trace f widgets.(*Set).Free
+trace r widgets.(*Set).release
 continue
 exit
 `
 	out := run(script)
 	for _, want := range []string{
-		`(?m)^Tracepoint p set at .* for github\.com/tidewater-io/strata\.Put\(\) `,
-		`(?m)^Tracepoint c set at .* for github\.com/tidewater-io/strata\.Visit\.func1\.1\(\) `,
+		`(?m)^Tracepoint p set at .* for github\.com/acme/widgets\.Put\(\) `,
+		`(?m)^Tracepoint c set at .* for github\.com/acme/widgets\.Visit\.func1\.1\(\) `,
 		`(?m)^\ttracepoint r does not stop at 0x[0-9a-f]+, which tracepoint f has: `,
 	} {
 		if !regexp.MustCompile(want).MatchString(out) {
@@ -511,10 +575,10 @@ exit
 		re string
 		n  int
 	}{
-		{`\[p\] github\.com/tidewater-io/strata\.Put\(\d\)`, 3},
-		{`\[c\] github\.com/tidewater-io/strata\.Visit\.func1\.1\(\d\)`, 3},
-		{`\[f\] github\.com/tidewater-io/strata\.\(\*Set\)\.Free\(.*\) \(inlined in main\.main\)`, 2},
-		{`\[r\] github\.com/tidewater-io/strata\.\(\*Set\)\.release\(.*\) \(inlined in main\.main\)`, 1},
+		{`\[p\] github\.com/acme/widgets\.Put\(\d\)`, 3},
+		{`\[c\] github\.com/acme/widgets\.Visit\.func1\.1\(\d\)`, 3},
+		{`\[f\] github\.com/acme/widgets\.\(\*Set\)\.Free\(.*\) \(inlined in main\.main\)`, 2},
+		{`\[r\] github\.com/acme/widgets\.\(\*Set\)\.release\(.*\) \(inlined in main\.main\)`, 1},
 	} {
 		if n := len(regexp.MustCompile(`(?m)^> goroutine\(1\): `+c.re+`$`).FindAllString(out, -1)); n != c.n {
 			t.Errorf("got %d lines matching %s, want %d:\n%s", n, c.re, c.n, out)
@@ -527,37 +591,121 @@ exit
 			hits[e+" "+r.str("bp")+" "+r.str("func")]++
 		}
 	}
-	const strata = "github.com/tidewater-io/strata."
+	const widgets = "github.com/acme/widgets."
 	want := map[string]int{
-		"trace p " + strata + "Put":            3,
-		"trace c " + strata + "Visit.func1.1":  3,
-		"return c " + strata + "Visit.func1.1": 3,
-		"trace f " + strata + "(*Set).Free":    2,
-		"trace r " + strata + "(*Set).release": 1,
+		"trace p " + widgets + "Put":            3,
+		"trace c " + widgets + "Visit.func1.1":  3,
+		"return c " + widgets + "Visit.func1.1": 3,
+		"trace f " + widgets + "(*Set).Free":    2,
+		"trace r " + widgets + "(*Set).release": 1,
 	}
 	if fmt.Sprint(hits) != fmt.Sprint(want) {
 		t.Errorf("dlv --json: got hits %v, want %v", hits, want)
 	}
 
-	// goroutines -t: each goroutine's frames.
+	// goroutines -t: each goroutine's frames; and frames have one shape,
+	// in a breakpoint's record (on b stack) and the stack command's.
 	var gs []any
-	for _, r := range parseJSON(t, run("break strata.Put\ncontinue\ngoroutines -t 3\nexit -k\n", "--json")) {
-		if r.str("event") == "goroutines" {
+	frames := map[string]string{}
+	for _, r := range parseJSON(t, run("break b widgets.Put\non b stack 2\ncontinue\nstack 2\ngoroutines -t 3\nexit -k\n", "--json")) {
+		switch e := r.str("event"); e {
+		case "goroutines":
 			gs, _ = r["goroutines"].([]any)
+		case "break", "stack":
+			b, _ := json.Marshal(r["frames"])
+			frames[e] = string(b)
+			if _, ok := r["stack"]; ok {
+				t.Errorf("a %s record with a stack field: %v", e, r)
+			}
 		}
+	}
+	if !strings.Contains(frames["break"], `"func":"`+widgets+`Put"`) || frames["break"] != frames["stack"] {
+		t.Errorf("frames of the break record %s, of the stack record %s; want the same, from Put", frames["break"], frames["stack"])
 	}
 	found := false
 	for _, g := range gs {
-		frames, _ := g.(map[string]any)["frames"].([]any)
-		if len(frames) == 0 {
+		fs, _ := g.(map[string]any)["frames"].([]any)
+		if len(fs) == 0 {
 			t.Errorf("goroutine without frames: %v", g)
 			continue
 		}
-		if f, _ := frames[min(1, len(frames)-1)].(map[string]any); f["func"] == strata+"Visit.func1.1" {
+		if f, _ := fs[min(1, len(fs)-1)].(map[string]any); f["func"] == widgets+"Visit.func1.1" {
 			found = true
 		}
 	}
 	if !found {
 		t.Errorf("goroutines -t 3 --json: no goroutine called Put from Visit.func1.1: %v", gs)
+	}
+}
+
+// The results at a tracepoint's returns, which optimized code's debug
+// information does not locate and Delve reads from the registers of the
+// ABI, are the ones a build without optimizations shows, and the ones
+// the source returns; and print and on ... print show a string of 300
+// bytes whole. returns is a plain program.
+func TestReturnValues(t *testing.T) {
+	dlv := dlvPath(t)
+	dir := t.TempDir()
+	run := func(bin, script string) []record {
+		path := filepath.Join(dir, "script.dlv")
+		if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		args := []string{"exec", bin, "-r", "stdout:" + filepath.Join(dir, "prog.out"), "--init", path, "--allow-non-terminal-interactive=true", "--json"}
+		out, err := exec.Command(dlv, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("dlv %q: %v\n%s", args, err, out)
+		}
+		return parseJSON(t, string(out))
+	}
+	want := []string{
+		`l "k1-value" | error nil`,
+		`l "" | error(*errors.errorString) *{s: "empty key"}`,
+		`c 21 | error nil`,
+		`f *main.node {id: 4} | true`,
+		`m main.pair {small: 5, big: 5497558138880}`,
+		`r 0.75`,
+		`s [2]int [9,10]`,
+	}
+	for _, gcflags := range []string{"", "all=-N -l"} {
+		bin := filepath.Join(dir, "returns")
+		if out, err := exec.Command("go", "build", "-gcflags="+gcflags, "-o", bin, "./returns").CombinedOutput(); err != nil {
+			t.Fatalf("go build: %v\n%s", err, out)
+		}
+		var got []string
+		for _, r := range run(bin, "trace l main.lookup\ntrace c main.count\ntrace f main.find\ntrace m main.mix\ntrace r main.ratio\ntrace s main.span\ncontinue\nexit\n") {
+			if r.str("event") != "return" {
+				continue
+			}
+			var vals []string
+			ret, _ := r["ret"].([]any)
+			for _, v := range ret {
+				vals = append(vals, record(v.(map[string]any)).str("value"))
+			}
+			got = append(got, r.str("bp")+" "+strings.Join(vals, " | "))
+		}
+		if strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Errorf("-gcflags=%q: returns\n%s\nwant\n%s", gcflags, strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
+		if gcflags != "" {
+			continue
+		}
+		banner := strconv.Quote(strings.Repeat("0123456789", 30))
+		n := 0
+		for _, r := range run(bin, "break l main.lookup\non l print main.banner\ncontinue\nprint main.banner\nexit -k\n") {
+			v := r.str("value")
+			if vars, _ := r["vars"].([]any); len(vars) == 1 {
+				v = record(vars[0].(map[string]any)).str("value")
+			}
+			if strings.HasPrefix(v, `"0123`) {
+				n++
+				if v != banner {
+					t.Errorf("%s printed a string of %d bytes, want %d", r.str("cmd"), len(v)-2, len(banner)-2)
+				}
+			}
+		}
+		if n != 2 {
+			t.Errorf("got %d prints of main.banner, want 2", n)
+		}
 	}
 }

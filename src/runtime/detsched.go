@@ -17,10 +17,13 @@
 //
 //	detsched: trace=0x... switches=N syncs=N
 //
-// Each switch to a goroutine folds that goroutine's ID and the code
-// offset it resumes at into the hash, so two runs print the same line
-// only if they switched between the same goroutines at the same points.
-// The hash is only meaningful with a single P.
+// Each switch to a goroutine folds that goroutine's ID and the source
+// position it resumes at into the hash, so two runs
+// print the same line only if they switched between the same goroutines
+// at the same points. None of these depends on how the program was
+// compiled, so a build with -gcflags=all=-N -l prints the same line as an
+// optimized one (see detgc.go for the garbage collector's part). The hash
+// is only meaningful with a single P.
 //
 // GODEBUG=dettrace=1 prints it without GODETSEED, and dettrace=2 also
 // prints every switch as it happens, so the logs of two runs can be diffed
@@ -45,11 +48,12 @@
 //
 // Goroutines are preempted after a fixed amount of work instead of a
 // fixed amount of time. The compiler counts a tick at the entry of every
-// function and on every loop backedge, outside the runtime and the
-// packages it imports and outside os, syscall, and internal/poll (see
-// ssagen.detPreempt), by decrementing detTicks (see ssagen's detTick and
-// ssa.insertLoopReschedChecks). When detTicks reaches zero it calls
-// detPreempt. Without perturbation, execute gives each goroutine
+// function, at every inlined call of one, and on every iteration of a
+// loop, outside the runtime and the packages it imports and outside os,
+// syscall, and internal/poll, as the source defines them, so that -N and
+// -l count the same ticks (see the compiler's ir.DetFuncCounts), by
+// decrementing detTicks (see ssagen's detTick). When detTicks reaches
+// zero it calls detPreempt. Without perturbation, execute gives each goroutine
 // detQuantum ticks when it starts running. The compiler also emits a
 // synchronization point before every channel operation, select, go
 // statement, and atomic operation, which decrements detSyncs and calls
@@ -67,7 +71,11 @@
 // The rule acts on one bubble at a time: first one with a pending Wait or a
 // timer already due, then the one whose next timer is earliest, then the
 // oldest, which deadlocks (see detSynctestIdle). Each clock jump is also
-// folded into the schedule hash.
+// folded into the schedule hash. Before a bubble deadlocks this way, and
+// where no bubble's rule applies and the P would idle or the program
+// report that all goroutines are asleep, a GC epoch may run first, which
+// may run finalizers and cleanups that unblock goroutines (see
+// detGCIdleEpoch).
 //
 // The runtime also reports where a program leaves the deterministic
 // subset, by depending on the OS or on real time:
@@ -273,19 +281,21 @@ func detPanic() {
 	detOut.late.write()
 }
 
-// detTraceSwitch records in pp's schedule hash that gp is about to run.
+// detTraceSwitch records in pp's schedule hash that gp is about to run:
+// its ID and where in the source it resumes (detSite). Neither depends on
+// how the program was compiled, so a build with -gcflags=all=-N -l, which
+// counts the same ticks (see the compiler's ir.DetFuncCounts), prints the
+// same trace line.
 func detTraceSwitch(pp *p, gp *g) {
-	pc := gp.sched.pc
-	if pc >= firstmoduledata.text && pc < firstmoduledata.etext {
-		pc -= firstmoduledata.text // independent of where the text is loaded
-	}
-	detP(pp).trace = detMix(detMix(detP(pp).trace, gp.goid), uint64(pc))
+	detP(pp).trace = detMix(detMix(detP(pp).trace, gp.goid), detSite(gp.sched.pc))
 	detP(pp).switches++
+	if gp != forcegc.g {
+		detGC.ran = true // see detGCIdleEpoch
+	}
 	if debug.dettrace >= 2 {
-		f := findfunc(gp.sched.pc)
 		print("detsched: switch ", detP(pp).switches, " to goroutine ", gp.goid, " at ")
-		if f.valid() {
-			print(funcname(f), "+", hex(gp.sched.pc-f.entry()), "\n")
+		if name, file, line := detSitePos(gp.sched.pc); name != "" {
+			print(name, " ", file, ":", line, "\n")
 		} else {
 			print(hex(gp.sched.pc), "\n")
 		}
@@ -315,6 +325,9 @@ func detPreempt() {
 		// for the next tick, keeping the goroutine's budget. A call
 		// from detSync, with ticks left, yields as it would have.
 		if gp != gp.m.g0 && gp != gp.m.gsignal {
+			if detTickNow() >= detGC.next {
+				detGCEpochDue(gp)
+			}
 			detStopFire(gp, sys.GetCallerPC(), sys.GetCallerSP())
 		} else if detTickExtra > 0 {
 			detPutTicks(detTicksReal())
@@ -644,6 +657,49 @@ func detStartlockedm(mp *m) {
 	mPark()
 	acquirep(gp.m.nextp.ptr())
 	gp.m.nextp = 0
+}
+
+// detSites caches detSite by PC; goroutines resume at few places.
+var detSites [256]struct {
+	pc uintptr
+	h  uint64
+}
+
+// detSite returns a hash of the source position of pc, a goroutine's
+// resume PC: the name of the innermost function, inlined or not, and the
+// line of the call that pc returns to, or of the function's entry.
+func detSite(pc uintptr) uint64 {
+	c := &detSites[(pc>>2)%uintptr(len(detSites))]
+	if c.pc == pc && pc != 0 {
+		return c.h
+	}
+	h := uint64(pc)
+	if name, _, line := detSitePos(pc); name != "" {
+		h = detMix(0, uint64(line))
+		for i := 0; i < len(name); i++ {
+			h = detMix(h, uint64(name[i]))
+		}
+	}
+	c.pc, c.h = pc, h
+	return h
+}
+
+// detSitePos returns the source position detSite hashes: the innermost
+// function at pc, inlined or not, and the file and line of the call that
+// pc returns to, or of the function's entry. name is "" if pc is not in
+// a function.
+func detSitePos(pc uintptr) (name, file string, line int) {
+	f := findfunc(pc)
+	if !f.valid() {
+		return "", "", 0
+	}
+	at := pc
+	if at != f.entry() {
+		at-- // the call
+	}
+	u, uf := newInlineUnwinder(f, at)
+	file, line = u.fileLine(uf)
+	return u.srcFunc(uf).name(), file, line
 }
 
 // detMix folds v into the hash h. It must not depend on any per-process
@@ -1021,9 +1077,10 @@ func detBubblesRemove(bubble *synctestBubble) {
 // findRunnable calls it, holding the P, when it found nothing to run.
 // It returns a goroutine it made runnable for findRunnable to run (the
 // bubble's root goroutine, or its goroutine blocked in synctest.Wait), or
-// nil if the rule does not apply.
+// nil if the rule does not apply. Where the rule does not apply, or would
+// report a deadlock, it first lets a GC epoch run (detGCIdleEpoch).
 func detSynctestIdle() *g {
-	if detBubbles == nil || netpollinited() && netpollAnyWaiters() && detsimRealPollWaiters() {
+	if netpollinited() && netpollAnyWaiters() && detsimRealPollWaiters() {
 		return nil
 	}
 	for mp := (*m)(atomic.Loadp(unsafe.Pointer(&allm))); mp != nil; mp = mp.alllink {
@@ -1056,6 +1113,11 @@ func detSynctestIdle() *g {
 			}
 		}
 		unlock(&b.mu)
+	}
+	if best == nil || bestRank == 2 {
+		if gp := detGCIdleEpoch(); gp != nil {
+			return gp
+		}
 	}
 	if best == nil {
 		return nil

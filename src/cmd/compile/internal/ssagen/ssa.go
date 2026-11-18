@@ -366,7 +366,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	if fn.Pragma&ir.Nosplit != 0 {
 		s.f.NoSplit = true
 	}
-	s.f.DetPreempt = detPreempt(fn, s.f.NoSplit)
+	s.detFunc = ir.DetFuncCounts(fn) && !s.f.NoSplit
 	s.f.ABI0 = ssaConfig.ABI0
 	s.f.ABI1 = ssaConfig.ABI1
 	s.f.ABIDefault = abiForFunc(nil, ssaConfig.ABI0, ssaConfig.ABI1)
@@ -575,7 +575,7 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	}
 	s.zeroResults()
 	s.paramsToHeap()
-	if s.f.DetPreempt {
+	if s.detFunc && !fn.DetLeaf() {
 		// After zeroResults: the tick may park the goroutine, and with a
 		// defer the results are live at every call.
 		s.detTick()
@@ -1036,6 +1036,10 @@ type state struct {
 	// Node for function
 	curfn *ir.Func
 
+	// detFunc is set if GOEXPERIMENT=detsched counts ticks and
+	// synchronization points in curfn; see ir.DetFuncCounts.
+	detFunc bool
+
 	// labels in f
 	labels map[string]*ssaLabel
 
@@ -1140,6 +1144,7 @@ type ssaLabel struct {
 	target         *ssa.Block // block identified by this label
 	breakTarget    *ssa.Block // block to break to in control flow node identified by this label
 	continueTarget *ssa.Block // block to continue to in control flow node identified by this label
+	defined        bool       // the label statement has been seen, so a goto to it jumps back
 }
 
 // label returns the label associated with sym, creating it if necessary.
@@ -1800,6 +1805,7 @@ func (s *state) stmt(n ir.Node) {
 		if lab.target == nil {
 			lab.target = s.f.NewBlock(ssa.BlockPlain)
 		}
+		lab.defined = true
 
 		// Go to that label.
 		// (We pretend "label:" is preceded by "goto label", unless the predecessor is unreachable.)
@@ -1816,6 +1822,9 @@ func (s *state) stmt(n ir.Node) {
 		lab := s.label(sym)
 		if lab.target == nil {
 			lab.target = s.f.NewBlock(ssa.BlockPlain)
+		}
+		if lab.defined && s.detCounts(n.Pos()) {
+			s.detTick() // a backward goto makes a loop
 		}
 
 		b := s.endBlock()
@@ -2107,6 +2116,9 @@ func (s *state) stmt(n ir.Node) {
 		if n.Post != nil {
 			s.stmt(n.Post)
 		}
+		if s.detCounts(n.Pos()) {
+			s.detTick() // the loop's backedge
+		}
 		if b := s.endBlock(); b != nil {
 			b.AddEdgeTo(bCond)
 			// It can happen that bIncr ends in a block containing only VARKILL,
@@ -2357,6 +2369,9 @@ func (s *state) stmt(n ir.Node) {
 	case ir.OINLMARK:
 		n := n.(*ir.InlineMarkStmt)
 		s.newValue1I(ssa.OpInlMark, types.TypeVoid, n.Index, s.mem())
+		if s.detInlCounts(n.Index) && !ir.DetInlLeaf[n.Index] {
+			s.detTick() // the inlined callee's entry
+		}
 
 	default:
 		s.Fatalf("unhandled stmt %v", n.Op())
@@ -4783,7 +4798,7 @@ func (s *state) split(v *ssa.Value) (*ssa.Value, *ssa.Value) {
 
 // intrinsicCall converts a call to a recognized intrinsic function into the intrinsic SSA operation.
 func (s *state) intrinsicCall(n *ir.CallExpr) *ssa.Value {
-	if s.f.DetPreempt && detSyncFunc(n.Fun.Sym()) {
+	if detSyncFunc(n.Fun.Sym()) && s.detCounts(n.Pos()) {
 		s.detSync()
 	}
 	v := findIntrinsic(n.Fun.Sym())(s, n, s.intrinsicArgs(n))
@@ -4979,7 +4994,7 @@ func (s *state) callAddr(n *ir.CallExpr, k callKind) *ssa.Value {
 // Calls the function n using the specified call type.
 // Returns the address of the return value (or nil if none).
 func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExtra ir.Expr) *ssa.Value {
-	if s.f.DetPreempt && detSyncCall(n, k == callGo) {
+	if detSyncCall(n, k == callGo) && s.detCounts(n.Pos()) {
 		s.detSync()
 	}
 	s.prevCall = nil

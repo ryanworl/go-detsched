@@ -105,6 +105,9 @@ func TestFaults(t *testing.T) {
 		a.Start(func() {})
 		b.Start(func() { echo("10.0.0.2:7") })
 		c.Start(func() { echo("10.0.0.3:7") })
+		// End setup, and with it the calm that would keep the forced
+		// disk faults off until the first fsync.
+		w.SetCalm(false)
 
 		// as runs f as node a and waits for it.
 		as := func(f func()) {

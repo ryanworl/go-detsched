@@ -10,8 +10,6 @@ import (
 	"cmp"
 	"slices"
 	"syscall"
-
-	"github.com/ryanworl/go-detsched/misc/detsched/sdk/buggify"
 )
 
 // The simulated network: TCP over IPv4.
@@ -147,7 +145,7 @@ func (w *World) latency(a, b *Node) int64 {
 			d += rto
 		}
 	}
-	if a != b && !calm() && buggify.OnChance("sim.net.retransmit", 0.05) {
+	if a != b && fault("sim.net.retransmit", "fault: sim.net.retransmit", 0.05) {
 		d += 200e6 + int64(runtime_rand()%800e6)
 	}
 	for _, e := range w.linkState(a, b).slow {
@@ -442,7 +440,7 @@ func (w *World) connect(s *socket, a [6]uintptr) (uintptr, uintptr) {
 		}
 		dst.inc.socks[srv] = true
 		c.ends = [2]*socket{s, srv}
-		w.allConns[c] = true
+		w.allConns[c.id] = c
 		l.backlog = append(l.backlog, srv)
 		runtime_ready(uintptr(l.fd), 'r')
 		// The SYN-ACK arrives back after another latency.
@@ -548,7 +546,7 @@ func (w *World) sockWrite(s *socket, bufs [][]byte) (uintptr, uintptr) {
 	for _, b := range bufs {
 		data = append(data, b[:min(len(b), n-len(data))]...)
 	}
-	if !calm() && buggify.OnChance("sim.net.reset", 0.001) {
+	if fault("sim.net.reset", "fault: sim.net.reset", 0.001) {
 		w.resetEnd(c, s.side, 0)
 		w.resetEnd(c, 1-s.side, uintptr(syscall.ECONNRESET))
 		return 0, uintptr(syscall.ECONNRESET)
@@ -737,7 +735,7 @@ func (w *World) netChanged() {
 // conns returns the connections, in the order they were made.
 func (w *World) conns() []*conn {
 	cs := make([]*conn, 0, len(w.allConns))
-	for c := range w.allConns {
+	for _, c := range w.allConns {
 		cs = append(cs, c)
 	}
 	slices.SortFunc(cs, func(a, b *conn) int { return cmp.Compare(a.id, b.id) })
@@ -754,7 +752,7 @@ func (w *World) resetEnd(c *conn, i int, errno uintptr) {
 	c.gone[i], c.err[i] = true, errno
 	c.dir[i].drop()
 	if c.gone[1-i] {
-		delete(w.allConns, c)
+		delete(w.allConns, c.id)
 	}
 	if s := c.ends[i]; s.fd != 0 && s.c == c {
 		runtime_ready(uintptr(s.fd), 'r')

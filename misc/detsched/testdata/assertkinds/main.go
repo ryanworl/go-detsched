@@ -5,7 +5,9 @@
 // Assertkinds fails one of two assertions, each with details, in most
 // runs: the first many times, and in a few of its runs a third, rarer one
 // too, as a symptom of the first. In others it fails a check, as a compose
-// check fails, with only an error for details, in one of two ways.
+// check fails, with only an error for details, in one of two ways, and in
+// a few an assertion whose details hold an error among others, which
+// must make one group whatever the other details are.
 package main
 
 import (
@@ -34,5 +36,8 @@ func main() {
 			err = errors.New("two leaders in one term")
 		}
 		assert.Always(false, "the check succeeds", map[string]any{"err": err.Error()})
+	case n < 96:
+		got := []string{"missing", "stale value", "v1"}[n%3]
+		assert.Always(false, "a read returns its own write", map[string]any{"err": nil, "got": got, "want": "v2"})
 	}
 }

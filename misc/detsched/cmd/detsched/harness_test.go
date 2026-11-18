@@ -282,6 +282,12 @@ func runSearch(t *testing.T, pkg string, n uint64) *search {
 		t.Fatal(err)
 	}
 	s.workers = 4
+	// The build without optimizations writes in TMPDIR until it is done.
+	t.Cleanup(func() {
+		if s.debugDone != nil {
+			<-s.debugDone
+		}
+	})
 	if err := s.run(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +297,7 @@ func runSearch(t *testing.T, pkg string, n uint64) *search {
 // searchReport returns s's summary.
 func searchReport(s *search) string {
 	var b strings.Builder
-	s.summary(&b)
+	s.summary(&b, true)
 	return b.String()
 }
 

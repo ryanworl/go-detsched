@@ -546,6 +546,12 @@ func GC() {
 
 	// Wait until the current sweep termination, mark, and mark
 	// termination complete.
+	if goexperiment.DetSched {
+		// Every call is an epoch; see detGC.
+		detGC.epoch, detGC.next, detGC.specials, detGC.ran = true, detStopNone, 0, false
+		defer func() { detGC.epoch = false }()
+	}
+
 	n := work.cycles.Load()
 	gcWaitOnMark(n)
 
@@ -821,7 +827,9 @@ func gcStart(trigger gcTrigger) {
 		}
 	}
 
-	gcBgMarkStartWorkers()
+	if !goexperiment.DetSched {
+		gcBgMarkStartWorkers() // det mode marks in this goroutine; see detGCMark
+	}
 
 	systemstack(gcResetMarkState)
 
@@ -951,7 +959,9 @@ func gcStart(trigger gcTrigger) {
 
 	// Make sure we block instead of returning to user code
 	// in STW mode.
-	if mode != gcBackgroundMode {
+	if goexperiment.DetSched {
+		detGCMark()
+	} else if mode != gcBackgroundMode {
 		Gosched()
 	}
 
@@ -2102,7 +2112,14 @@ func gcSweep(mode gcMode) bool {
 			pp.mcache.prepareForSweep()
 		}
 		// Sweep all spans eagerly.
+		if goexperiment.DetSched {
+			detGC.sweeping = true
+		}
 		for sweepone() != ^uintptr(0) {
+		}
+		if goexperiment.DetSched {
+			detGC.sweeping = false
+			detGCFlush()
 		}
 		// Free workbufs and span rings eagerly.
 		prepareFreeWorkbufs()
@@ -2184,8 +2201,8 @@ func boring_registerCache(p unsafe.Pointer) {
 }
 
 func clearpools() {
-	// clear sync.Pools
-	if poolcleanup != nil {
+	// clear sync.Pools, in det mode only in an epoch (see detGC)
+	if poolcleanup != nil && (!goexperiment.DetSched || detGC.epoch) {
 		poolcleanup()
 	}
 

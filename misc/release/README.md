@@ -95,7 +95,15 @@ whether it is a generic fix for upstream Delve or specific to detsched:
 - `0007`: generic: a breakpoint whose addresses another one partly has
   is set and says which (hits name the function it was set on), return
   lines and records carry their tracepoint's name, and `goroutines -t`
-  in JSON has each goroutine's frames.
+  in JSON has each goroutine's frames;
+- `0008`: generic but for its detsched part: a tracepoint's results read
+  from the ABI's registers at `RET` in optimized code, one shape for
+  frames in JSON, strings up to 1024 bytes; detsched: `breakpoints` says
+  whether the runtime counts a hit count, and why not, and the runtime
+  counts in builds with `-gcflags=all=-N -l` too;
+- `0009`: detsched: `restart` to a point where its goroutine yields
+  stays at the point (`runtime.detDebug.yields`), so that its position
+  is the point's, and names the goroutine's frame.
 
 To build dlv for this tree, `delve.bash bin/dlv`. To change the patches,
 copy Delve's module (`go mod download -json

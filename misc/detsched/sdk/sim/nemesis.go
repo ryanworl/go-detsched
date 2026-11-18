@@ -184,6 +184,7 @@ func (w *World) NewNemesis(cfg NemesisConfig) *Nemesis {
 
 // Start runs the nemesis in a goroutine that belongs to no node.
 func (nm *Nemesis) Start() {
+	nm.w.endSetup()
 	old := runtime_setNode(0)
 	go nm.loop()
 	runtime_setNode(old)

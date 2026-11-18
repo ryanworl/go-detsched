@@ -1,0 +1,130 @@
+pkg/proc, service/debugger, pkg/terminal: restart to a point where its goroutine yields stays there
+
+restart sN, kN or tD ran to runtime.detDebugStop and then continued to
+the return of runtime.detPreempt in the stopped goroutine, to leave the
+runtime for the goroutine's code. When the point is the last tick of
+the goroutine's quantum, detPreempt yields after the stop, as the run
+does without it, so the goroutine came back there only after other
+goroutines ran: the stop reported a later switch (and often a later
+tick) than GODETSTOP's stop line for the same point.
+
+The runtime now says at each stop whether the goroutine yields there,
+in runtime.detDebug.yields. restart then stays at runtime.detDebugStop,
+at the point's exact position, and says which frame is the goroutine's
+code:
+
+	goroutine 158 yields here, at the last tick of its quantum, so its code goes on only at a later switch; frame 3 is its code: net.(*netFD).connect.func2() .../src/net/fd_unix.go:94
+
+A runtime without the field keeps the old behavior.
+
+
+diff --git a/pkg/proc/detsched.go b/pkg/proc/detsched.go
+index cd77e86..db0cd43 100644
+--- a/pkg/proc/detsched.go
++++ b/pkg/proc/detsched.go
+@@ -76,6 +76,8 @@ type detInfo struct {
+ 	stopKind, stopN, nwatch, watch, watchSize, watchPC, watchCount, watchAt int64
+ 	nslots                                                                  int
+ 
++	yields int64 // the offset of detDebug.yields, or -1 for a runtime without it
++
+ 	stopFn, watchFn, preemptFn uint64
+ }
+ 
+@@ -210,6 +212,10 @@ func loadDetInfo(t *Target) (*detInfo, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	di.yields = -1
++	if f, err := field(debugType, "yields"); err == nil {
++		di.yields = f.ByteOffset
++	}
+ 	if f, err := field(debugType, "watch"); err == nil {
+ 		if at, ok := godwarf.ResolveTypedef(f.Type).(*godwarf.ArrayType); ok {
+ 			di.nslots = int(at.Count)
+@@ -405,6 +411,22 @@ func (t *Target) DetStopPC() uint64 {
+ 	return 0
+ }
+ 
++// DetStopYields reports whether the goroutine stopped at runtime.detDebugStop
++// yields there, at the last tick of its quantum: its code goes on only
++// after other goroutines ran, at a later switch. A runtime that does not
++// say reports false.
++func (t *Target) DetStopYields() bool {
++	di := t.detInfo()
++	if di == nil || di.yields < 0 {
++		return false
++	}
++	var b [1]byte
++	if _, err := t.Memory().ReadMemory(b[:], di.debug+uint64(di.yields)); err != nil {
++		return false
++	}
++	return b[0] != 0
++}
++
+ // DetSetBreakpoint sets an internal breakpoint at addr, which stops when
+ // cb returns true.
+ func (t *Target) DetSetBreakpoint(addr uint64, cb func(Thread, *Target) (bool, error)) (*Breakpoint, error) {
+diff --git a/pkg/terminal/detsched.go b/pkg/terminal/detsched.go
+index b3bfe69..4bb47f8 100644
+--- a/pkg/terminal/detsched.go
++++ b/pkg/terminal/detsched.go
+@@ -48,10 +48,32 @@ func restartDetsched(t *Term, pos string) error {
+ 	t.oldPid = state.Pid
+ 	printcontext(t, state)
+ 	printPos(t, state.CurrentThread, printPosShowArrow)
++	t.detSayYields(state)
+ 	t.onStop()
+ 	return nil
+ }
+ 
++// detSayYields says, when restart stopped at a position where its
++// goroutine yields, so that the program stays in the runtime, which frame
++// is the goroutine's code.
++func (t *Term) detSayYields(state *api.DebuggerState) {
++	th := state.CurrentThread
++	if th == nil || th.Function == nil || th.Function.Name() != "runtime.detDebugStop" {
++		return
++	}
++	stack, err := t.client.Stacktrace(th.GoroutineID, 8, 0, 0, nil)
++	if err != nil {
++		return
++	}
++	for i := 0; i+1 < len(stack); i++ {
++		if stack[i].Function != nil && stack[i].Function.Name() == "runtime.detPreempt" {
++			f := &stack[i+1]
++			t.detSay(fmt.Sprintf("goroutine %d yields here, at the last tick of its quantum, so its code goes on only at a later switch; frame %d is its code: %s() %s:%d", th.GoroutineID, i+1, f.Function.Name(), t.formatPath(f.File), f.Line))
++			return
++		}
++	}
++}
++
+ // detExitTimeout bounds the run to the end that exit makes.
+ var detExitTimeout = 5 * time.Minute
+ 
+diff --git a/service/debugger/detsched.go b/service/debugger/detsched.go
+index 2927c4e..4932187 100644
+--- a/service/debugger/detsched.go
++++ b/service/debugger/detsched.go
+@@ -257,7 +257,10 @@ func (d *Debugger) detContinueTo(addr uint64, cb func(proc.Thread, *proc.Target)
+ 
+ // detRunToPoint continues the newly started program to a point as of
+ // GODETSTOP, and then out of the runtime into the code of the goroutine
+-// that runs there.
++// that runs there, unless the goroutine yields at the point: then its
++// code goes on only at a later switch, and the program stays in the
++// runtime, at the point, where the frame below runtime.detPreempt is the
++// goroutine's code.
+ func (d *Debugger) detRunToPoint(kind byte, n uint64, what string) error {
+ 	return d.detWithoutBreakpoints(nil, func() error {
+ 		tgt := d.target.Selected
+@@ -269,6 +272,9 @@ func (d *Debugger) detRunToPoint(kind byte, n uint64, what string) error {
+ 			return err
+ 		}
+ 		tgt = d.target.Selected
++		if tgt.DetStopYields() {
++			return nil
++		}
+ 		th := tgt.CurrentThread()
+ 		g, err := proc.GetG(th)
+ 		if err != nil || g == nil {

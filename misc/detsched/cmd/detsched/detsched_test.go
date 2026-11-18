@@ -38,6 +38,7 @@ func TestCheck(t *testing.T) {
 		{"shuffle", true},      // -test.shuffle=on
 		{"gcheap", true},       // GC timing, cleanups, heap addresses
 		{"gcstress", true},     // concurrent allocation through many GCs
+		{"gcidle", false},      // waiting for finalizers and cleanups without runtime.GC
 		{"mutexstarve", false}, // sync.Mutex starvation mode
 		{"synctest", false},    // timers in a bubble, a sleep outside it
 		{"nonidle", false},     // bubbles blocked where synctest does not count it
@@ -688,7 +689,7 @@ func TestSimPrograms(t *testing.T) {
 		// stopped looking for defers: "fatal error: unknown pc".
 		{pkg: "simpanicpanic", exit: 2, want: []string{"panic: on the node\n\tpanic: in OnPanic"}},
 		// Node.Down is closed when a node ends, every way it ends.
-		{pkg: "simdown", want: []string{"panic down", "kill down", "killprocess down", "stop down"}},
+		{pkg: "simdown", want: []string{"panic down", "kill down", "killprocess down", "stop down", "start returned"}},
 		// A goroutine waiting for a mutex that a crashed node's sleeping
 		// goroutine holds gets it once the holder wakes and releases it.
 		{pkg: "simsharedlock", want: []string{"b took the lock"}},

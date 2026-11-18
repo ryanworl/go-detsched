@@ -33,7 +33,10 @@ import (
 // to standard error, with the current position (t- outside a bubble),
 // prints the stack of every goroutine for ":dump", and calls detStop(I),
 // on which a debugger breaks: in a debugger, the frame below detPreempt
-// is where goroutine G is. Then the run goes on, as if it had not
+// is where goroutine G is. When the stop is at the last tick of G's
+// quantum, detPreempt yields after it, as it would have without the
+// stop, so G's code goes on only at a later switch; detDebug.yields says
+// so. Then the run goes on, as if it had not
 // stopped: the stops draw no randomness, run no code that counts ticks,
 // and leave every goroutine's budget of ticks as it was.
 //
@@ -80,6 +83,14 @@ var detDebug struct {
 	// detDebugStop; kind 0 is none. The debugger writes it before the
 	// program starts.
 	stop detStopPoint
+
+	// yields is set by the runtime at a stop, of GODETSTOP or of stop:
+	// whether the goroutine yields there, at the last tick of its
+	// quantum, so that its code goes on only after other goroutines
+	// ran. A debugger that leaves the runtime for the goroutine's code
+	// would reach it at a later switch, so it stays at the stop, where
+	// the frame below detPreempt is the goroutine's code.
+	yields bool
 
 	// watch counts the entries of the functions whose entry tick the
 	// debugger made call detPreempt every time; see detWatchEntry. The
@@ -285,7 +296,7 @@ func detStopsCheck(pp *p, gp *g) {
 //
 //go:nosplit
 func detStopsNext() {
-	next := int64(detStopNone)
+	next := detGC.next // a GC epoch is due as a stop is
 	for i := -1; i < len(detStops.points); i++ {
 		p := detStopAt(i)
 		switch {
@@ -308,6 +319,9 @@ func detStopsNext() {
 //go:nosplit
 func detStopFire(gp *g, pc, sp uintptr) {
 	now := detTickNow()
+	// detPreempt yields after the stops, as it would have without them,
+	// unless they give back ticks or gp cannot be preempted here.
+	detDebug.yields = detTicksReal() <= 0 && canPreemptM(gp.m)
 	for i := -1; i < len(detStops.points); i++ {
 		p := detStopAt(i)
 		if p.kind == 0 || p.fired || !p.armed && !(p.kind == 'k' && int64(p.n) <= now) {

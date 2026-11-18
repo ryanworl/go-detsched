@@ -1168,6 +1168,7 @@ func mkinlcall(callerfn *ir.Func, n *ir.CallExpr, fn *ir.Func, bigCaller, closur
 	parent := base.Ctxt.PosTable.Pos(n.Pos()).Base().InliningIndex()
 	sym := fn.Linksym()
 	inlIndex := base.Ctxt.InlTree.Add(parent, n.Pos(), sym, ir.FuncName(fn))
+	ir.DetInlAdd(inlIndex, fn)
 
 	closureInitLSym := func(n *ir.CallExpr, fn *ir.Func) {
 		// The linker needs FuncInfo metadata for all inlined

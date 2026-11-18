@@ -2095,6 +2095,8 @@ type specialfinalizer struct {
 	nret    uintptr
 	fint    *_type   // May be a heap pointer, but always live.
 	ot      *ptrtype // May be a heap pointer, but always live.
+
+	det detFinalizer // see detGCFlush
 }
 
 // Adds a finalizer to the object p. Returns true if it succeeded.
@@ -2103,11 +2105,18 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 	s := (*specialfinalizer)(mheap_.specialfinalizeralloc.alloc())
 	unlock(&mheap_.speciallock)
 	s.special.kind = _KindSpecialFinalizer
+	if goexperiment.DetSched {
+		detGC.finSeq++
+		s.det.seq = detGC.finSeq
+	}
 	s.fn = f
 	s.nret = nret
 	s.fint = fint
 	s.ot = ot
 	if addspecial(p, &s.special, false) {
+		if goexperiment.DetSched {
+			detGCRegistered()
+		}
 		// This is responsible for maintaining the same
 		// GC-related invariants as markrootSpans in any
 		// situation where it's possible that markrootSpans
@@ -2176,6 +2185,9 @@ func addCleanup(p unsafe.Pointer, c cleanupFn) uint64 {
 
 	mp := acquirem()
 	addspecial(p, &s.special, true)
+	if goexperiment.DetSched {
+		detGCRegistered()
+	}
 	// This is responsible for maintaining the same
 	// GC-related invariants as markrootSpans in any
 	// situation where it's possible that markrootSpans
@@ -2540,6 +2552,9 @@ func getOrAddWeakHandle(p unsafe.Pointer) *atomic.Uintptr {
 	s.handle = handle
 	handle.Store(uintptr(p))
 	if addspecial(p, &s.special, false) {
+		if goexperiment.DetSched {
+			detGCRegistered()
+		}
 		// This is responsible for maintaining the same
 		// GC-related invariants as markrootSpans in any
 		// situation where it's possible that markrootSpans
@@ -2778,6 +2793,11 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 	switch s.kind {
 	case _KindSpecialFinalizer:
 		sf := (*specialfinalizer)(unsafe.Pointer(s))
+		if goexperiment.DetSched && detGC.sweeping {
+			sf.det.p = p
+			detGC.fins = detGCPush(detGC.fins, s)
+			break
+		}
 		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot)
 		lock(&mheap_.speciallock)
 		mheap_.specialfinalizeralloc.free(unsafe.Pointer(sf))
@@ -2804,6 +2824,10 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 		unlock(&mheap_.speciallock)
 	case _KindSpecialCleanup:
 		sc := (*specialCleanup)(unsafe.Pointer(s))
+		if goexperiment.DetSched && detGC.sweeping {
+			detGC.cleanups = detGCPush(detGC.cleanups, s)
+			break
+		}
 		// Cleanups, unlike finalizers, do not resurrect the objects
 		// they're attached to, so we only need to pass the cleanup
 		// function, not the object.

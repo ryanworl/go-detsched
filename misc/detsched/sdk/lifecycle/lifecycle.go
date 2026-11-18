@@ -7,12 +7,18 @@
 // Without GOEXPERIMENT=detsched its functions do nothing.
 package lifecycle
 
+import "github.com/ryanworl/go-detsched/misc/detsched/sdk/internal/hook"
+
 // SetupComplete reports that the program's setup is done. The runtime
 // records the switch of the first call, so that the search starts its runs
-// right after it instead of running setup again. The details are not used
-// yet.
+// right after it instead of running setup again, and package sim starts
+// injecting its faults, as Antithesis injects none before setup completes.
+// The details are not used yet.
 func SetupComplete(details map[string]any) {
 	setupComplete()
+	if f := hook.SetupComplete; f != nil {
+		f()
+	}
 }
 
 // Branches returns how many times the run has branched: the search forks

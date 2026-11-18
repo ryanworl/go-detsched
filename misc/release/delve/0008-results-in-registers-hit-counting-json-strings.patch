@@ -1,0 +1,722 @@
+pkg/proc, pkg/terminal: results in registers, hit counting, JSON frames, longer strings
+
+A tracepoint's return line read its results from their debug
+information, which optimized code rarely has at a return, so most
+results, error results above all, printed "(unreadable empty OP
+stack)". At a RET instruction the results are in the registers Go's
+internal ABI returns them in, whatever the debug information says:
+EvalScope.RegABIResults assigns them as cmd/compile/abi-internal.md
+does (integer and floating point registers in order, structs by field,
+strings, slices and interfaces as their words, the stack for what does
+not fit) and reads them, on amd64 and arm64. A result the debug
+information leaves unreadable at a return breakpoint is read so; one
+the ABI returns on the stack, or at a return that is not a RET (after
+deferred calls), says why and that a build without optimizations reads
+it. The results load following one pointer, so an error shows its
+message:
+
+	>> goroutine(1): [l] main.lookup => ("",error(*errors.errorString) *{s: "empty key"})
+
+breakpoints said "(enabled, hits counted by the runtime)" while the
+runtime of a detsched program counted a breakpoint's hits, but nothing
+when it did not, nor after the breakpoint was written at the hit before
+the one wanted. api.Breakpoint.RuntimeCounted now holds as long as the
+runtime counts, and RuntimeNotCounted says why it does not count a
+breakpoint with a hit condition (another condition, a per-goroutine
+count, an operator it does not count, several addresses, no entry
+tick, not at the entry, all slots taken):
+
+	Breakpoint n (enabled, hits counted by Delve, one trap each: it has a condition besides the hit count) at ...
+
+In the JSON output, breakpoints prints a record of its own, with
+counted_by ("runtime" or "delve") and not_runtime_counted.
+
+The runtime did not count the hits of any function of a build with
+-gcflags=all=-N -l, which the debug: lines of detsched now run: its
+entry tick branches past a jump to the call to runtime.detPreempt,
+which detEntryTick did not follow. It now follows unconditional jumps
+from either side of the branch.
+
+The JSON output had two shapes for a stack: the stack record's
+"frames", and a breakpoint record's "stack" for on NAME stack. The
+breakpoint record now has "frames" too.
+
+Strings were cut at 64 bytes, which cut keys and values. print, args -v,
+locals -v and on NAME print show 1024 bytes, and tracepoint lines,
+args and locals 256, unless config max-string-len says otherwise.
+
+The results in registers and the JSON and string changes are generic
+fixes for upstream Delve; the hit counting is detsched's (0004).
+
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 4ede5d2..65e19cc 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -152,7 +152,7 @@ configuration automatically.
+ See also Documentation/cli/substitutepath.md for how the rules are applied.
+ `,
+ 
+-	"max-string-len":            "Maximum string length used when printing variables.\n",
++	"max-string-len":            "Maximum string length used when printing variables (default 1024).\n",
+ 	"max-array-values":          "Maximum number of array values when printing variables.\n",
+ 	"max-variable-recurse":      "Maximum number of nested struct members when printing variables.\n",
+ 	"show-raw-strings":         "If true, print string values as-is with %s (no quoting or escaping) rather than with Go's %q.\n",
+@@ -378,7 +378,7 @@ substitute-path:
+ # max-array-values: 64
+ 
+ # Maximum loaded string length.
+-# max-string-len: 64
++# max-string-len: 1024
+ 
+ # Output evaluation.
+ # max-variable-recurse: 1
+diff --git a/pkg/proc/abiresults.go b/pkg/proc/abiresults.go
+new file mode 100644
+index 0000000..728ec00
+--- /dev/null
++++ b/pkg/proc/abiresults.go
+@@ -0,0 +1,190 @@
++package proc
++
++import (
++	"debug/dwarf"
++	"errors"
++	"fmt"
++	"reflect"
++
++	"github.com/go-delve/delve/pkg/dwarf/godwarf"
++	"github.com/go-delve/delve/pkg/dwarf/op"
++	"github.com/go-delve/delve/pkg/dwarf/reader"
++)
++
++// ErrResultOnStack is the error of a result RegABIResults cannot read:
++// the internal ABI passes it on the stack.
++var ErrResultOnStack = errors.New("the ABI returns this result on the stack, and optimized code does not say where")
++
++// RegABIResults reads the results of scope's function from the registers
++// in which Go's internal ABI (ABIInternal, register-based since Go 1.17)
++// returns them. It is for a scope stopped at a RET instruction of the
++// function, where the results are in those registers whatever the
++// function's debug information says: optimized code often has no
++// location for a result at its return ("empty OP stack"). It returns the
++// results in order, each with the name and type of its DWARF entry; one
++// the ABI passes on the stack has Unreadable set to ErrResultOnStack.
++// It works on amd64 and arm64. The results are loaded with cfg.
++//
++// The ABI assigns each result, in order, the next integer and floating
++// point registers its parts need, from the first register on: a
++// boolean, integer, pointer, channel, map or function takes one integer
++// register, a float one floating point register, a complex number two,
++// a string two integer registers, an interface two, a slice three, a
++// struct its fields', an array of one element its element's, and an
++// empty array none. A result that does not fit, or an array of more
++// elements, goes on the stack, and the next result goes on from the
++// registers that result would have started at. See
++// cmd/compile/abi-internal.md.
++func (scope *EvalScope) RegABIResults(cfg LoadConfig) ([]*Variable, error) {
++	bi := scope.BinInfo
++	var ints, floats []uint64
++	switch bi.Arch.Name {
++	case "amd64":
++		// RAX, RBX, RCX, RDI, RSI, R8-R11 and X0-X14, by DWARF number
++		ints = []uint64{0, 3, 2, 5, 4, 8, 9, 10, 11}
++		floats = dwarfRegRange(17, 15)
++	case "arm64":
++		// R0-R15 and F0-F15
++		ints = dwarfRegRange(0, 16)
++		floats = dwarfRegRange(64, 16)
++	default:
++		return nil, fmt.Errorf("results in registers are not supported on %s", bi.Arch.Name)
++	}
++	if !bi.regabi || scope.Fn == nil {
++		return nil, errors.New("not a function of the register-based ABI")
++	}
++	dwarfTree, err := scope.image().getDwarfTree(scope.Fn.offset)
++	if err != nil {
++		return nil, err
++	}
++	a := &abiAssign{ints: ints, floats: floats}
++	var results []*Variable
++	for _, entry := range reader.Variables(dwarfTree, scope.Fn.Entry, int(^uint(0)>>1), reader.VariablesSkipInlinedSubroutines) {
++		if isret, _ := entry.Val(dwarf.AttrVarParam).(bool); entry.Tag != dwarf.TagFormalParameter || !isret {
++			continue
++		}
++		name, typ, err := readVarEntry(entry.Tree, scope.image())
++		if err != nil {
++			return nil, err
++		}
++		ni, nf := a.ni, a.nf
++		a.pieces, a.off = nil, 0
++		if !a.value(typ) {
++			a.ni, a.nf = ni, nf
++			v := newVariable(name, 0, typ, bi, scope.Mem)
++			v.Flags |= VariableReturnArgument
++			v.Unreadable = ErrResultOnStack
++			results = append(results, v)
++			continue
++		}
++		cmem, err := newCompositeMemory(scope.Mem, bi.Arch, scope.Regs, a.pieces, typ.Size())
++		v := newVariable(name, fakeAddressUnresolv, typ, bi, scope.Mem)
++		if cmem != nil {
++			cmem.base = fakeAddressUnresolv
++			v = newVariable(name, cmem.base, typ, bi, cmem)
++		}
++		v.Flags |= VariableReturnArgument | VariableFakeAddress
++		if err != nil {
++			v.Unreadable = err
++		}
++		results = append(results, v)
++	}
++	loadValues(results, cfg)
++	return results, nil
++}
++
++func dwarfRegRange(first uint64, n int) []uint64 {
++	r := make([]uint64, n)
++	for i := range r {
++		r[i] = first + uint64(i)
++	}
++	return r
++}
++
++// abiAssign assigns the registers of one result, as pieces of its value.
++type abiAssign struct {
++	ints, floats []uint64 // the ABI's registers
++	ni, nf       int      // the next free ones
++	pieces       []op.Piece
++	off          int64 // the bytes of the value the pieces cover
++}
++
++func (a *abiAssign) value(t godwarf.Type) bool {
++	t = godwarf.ResolveTypedef(t)
++	size := t.Size()
++	kind := t.Common().ReflectKind
++	switch t.(type) {
++	case *godwarf.InterfaceType:
++		kind = reflect.Interface // whose DWARF entry has no kind
++	case *godwarf.PtrType:
++		kind = reflect.Pointer // unsafe.Pointer's has none
++	}
++	switch kind {
++	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
++		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
++		reflect.Pointer, reflect.UnsafePointer, reflect.Chan, reflect.Map, reflect.Func:
++		return a.reg(&a.ni, a.ints, size)
++	case reflect.Float32, reflect.Float64:
++		return a.reg(&a.nf, a.floats, size)
++	case reflect.Complex64, reflect.Complex128:
++		return a.reg(&a.nf, a.floats, size/2) && a.reg(&a.nf, a.floats, size/2)
++	case reflect.String, reflect.Slice, reflect.Interface, reflect.Struct:
++		var st *godwarf.StructType
++		switch t := t.(type) {
++		case *godwarf.StructType:
++			st = t
++		case *godwarf.StringType:
++			st = &t.StructType
++		case *godwarf.SliceType:
++			st = &t.StructType
++		case *godwarf.InterfaceType:
++			st, _ = godwarf.ResolveTypedef(t.Type).(*godwarf.StructType)
++		}
++		if st == nil {
++			return false
++		}
++		start := a.off
++		for _, f := range st.Field {
++			a.pad(start + f.ByteOffset)
++			if !a.value(f.Type) {
++				return false
++			}
++		}
++		a.pad(start + size)
++		return true
++	case reflect.Array:
++		at, ok := t.(*godwarf.ArrayType)
++		switch {
++		case !ok:
++			return false
++		case at.Count == 0:
++			return true
++		case at.Count == 1:
++			return a.value(at.Type)
++		}
++		return false
++	}
++	return false
++}
++
++// reg assigns the next of regs, at *n, to the next size bytes.
++func (a *abiAssign) reg(n *int, regs []uint64, size int64) bool {
++	if size == 0 {
++		return true
++	}
++	if *n >= len(regs) {
++		return false
++	}
++	a.pieces = append(a.pieces, op.Piece{Kind: op.RegPiece, Val: regs[*n], Size: int(size)})
++	*n++
++	a.off += size
++	return true
++}
++
++// pad fills the bytes up to off, the padding of a struct, with zeros.
++func (a *abiAssign) pad(off int64) {
++	if off > a.off {
++		a.pieces = append(a.pieces, op.Piece{Kind: op.ImmPiece, Size: int(off - a.off), Bytes: make([]byte, off-a.off)})
++		a.off = off
++	}
++}
+diff --git a/pkg/proc/breakpoints.go b/pkg/proc/breakpoints.go
+index ad52a92..f02a344 100644
+--- a/pkg/proc/breakpoints.go
++++ b/pkg/proc/breakpoints.go
+@@ -1261,7 +1261,8 @@ type LogicalBreakpoint struct {
+ 
+ 	// det is set while the runtime of a detsched program counts the
+ 	// breakpoint's hits; see detsched.go.
+-	det *detWatchState
++	det       *detWatchState
++	detWhyNot string // why the runtime does not count the hits; see detWatchEnable
+ 
+ 	// TraceReturnOf is the ID of the tracepoint a breakpoint on a
+ 	// function's returns belongs to, whose condition its returns follow;
+diff --git a/pkg/proc/detwatch.go b/pkg/proc/detwatch.go
+index 8fb54fa..df22c5f 100644
+--- a/pkg/proc/detwatch.go
++++ b/pkg/proc/detwatch.go
+@@ -35,9 +35,9 @@ type detTick struct {
+ }
+ 
+ // detEntryTick finds fn's entry tick: the first conditional branch from
+-// which the code reaches a call to runtime.detPreempt, either by falling
+-// through to it and branching past it, or by branching to a block that
+-// makes it.
++// which the code reaches a call to runtime.detPreempt, directly or through
++// unconditional jumps, either by falling through or by branching. The
++// patch makes the branch always take the path to the call.
+ func (t *Target) detEntryTick(fn *Function, preempt uint64) (*detTick, error) {
+ 	bi := t.BinInfo()
+ 	text, err := disassemble(t.Memory(), nil, t.Breakpoints(), bi, fn.Entry, fn.End, false)
+@@ -61,30 +61,66 @@ func (t *Target) detEntryTick(fn *Function, preempt uint64) (*detTick, error) {
+ 		}
+ 		return false
+ 	}
++	// reach follows the code from pc, through unconditional jumps, to a
++	// call to runtime.detPreempt, and returns the call's return address.
++	// Optimized code falls through to the call or branches to a block
++	// that makes it; code built with -N branches past a jump to it.
++	reach := func(pc uint64) (uint64, bool) {
++	hop:
++		for hops := 0; hops < 4; hops++ {
++			j, ok := at[pc]
++			if !ok {
++				return 0, false
++			}
++			for k := j; k < len(text) && k < j+8; k++ {
++				if callsPreempt(k) {
++					return text[k].Loc.PC + uint64(text[k].Size), true
++				}
++				if target, ok := jmpTarget(arm64, &text[k]); ok {
++					pc = target
++					continue hop
++				}
++				if text[k].IsJmp() || text[k].IsRet() || text[k].IsCall() {
++					return 0, false
++				}
++			}
++			return 0, false
++		}
++		return 0, false
++	}
+ 	for i := 0; i < len(text) && i < 64; i++ {
+ 		in := &text[i]
+ 		target, ok := condBranchTarget(arm64, in)
+ 		if !ok {
+ 			continue
+ 		}
+-		next := in.Loc.PC + uint64(in.Size)
+-		if i+1 < len(text) && callsPreempt(i+1) && target == next+uint64(text[i+1].Size) {
+-			return &detTick{branch: in.Loc.PC, orig: in.Bytes, patch: nopBytes(arm64, in.Size), ret: target}, nil
++		if ret, ok := reach(in.Loc.PC + uint64(in.Size)); ok {
++			return &detTick{branch: in.Loc.PC, orig: in.Bytes, patch: nopBytes(arm64, in.Size), ret: ret}, nil
+ 		}
+-		if j, ok := at[target]; ok {
+-			for k := j; k < len(text) && k < j+8; k++ {
+-				if callsPreempt(k) {
+-					return &detTick{branch: in.Loc.PC, orig: in.Bytes, patch: jmpBytes(arm64, in, target), ret: text[k].Loc.PC + uint64(text[k].Size)}, nil
+-				}
+-				if text[k].IsJmp() || text[k].IsRet() || text[k].IsCall() {
+-					break
+-				}
+-			}
++		if ret, ok := reach(target); ok {
++			return &detTick{branch: in.Loc.PC, orig: in.Bytes, patch: jmpBytes(arm64, in, target), ret: ret}, nil
+ 		}
+ 	}
+ 	return nil, fmt.Errorf("%s has no entry tick", fn.Name)
+ }
+ 
++// jmpTarget returns the target of in if it is an unconditional jump with
++// an immediate offset.
++func jmpTarget(arm64 bool, in *AsmInstruction) (uint64, bool) {
++	b := in.Bytes
++	switch {
++	case arm64 && len(b) == 4:
++		if w := binary.LittleEndian.Uint32(b); w&0xFC000000 == 0x14000000 {
++			return in.Loc.PC + uint64(signExtend(uint64(w&0x3FFFFFF), 26)*4), true
++		}
++	case !arm64 && len(b) == 2 && b[0] == 0xEB:
++		return in.Loc.PC + 2 + uint64(int64(int8(b[1]))), true
++	case !arm64 && len(b) == 5 && b[0] == 0xE9:
++		return in.Loc.PC + 5 + uint64(int64(int32(binary.LittleEndian.Uint32(b[1:])))), true
++	}
++	return 0, false
++}
++
+ func signExtend(v uint64, bits uint) int64 {
+ 	return int64(v<<(64-bits)) >> (64 - bits)
+ }
+@@ -140,26 +176,55 @@ func detWatchable(lbp *LogicalBreakpoint) bool {
+ 	return false
+ }
+ 
++// detWhyNot returns why the runtime cannot count the hits of lbp, which
++// has a hit condition, by its condition alone, or "" if it can.
++func detWhyNot(lbp *LogicalBreakpoint) string {
++	switch {
++	case lbp.HitCondPerG:
++		return "the hit count is per goroutine"
++	case lbp.cond != nil:
++		return "it has a condition besides the hit count"
++	case lbp.TraceReturn:
++		return "it is on a function's returns"
++	case !detWatchable(lbp):
++		return "the runtime counts only == N, >= N, > N and % N"
++	}
++	return ""
++}
++
+ // detWatchEnable makes the runtime count the hits of lbp, at addrs, if it
+-// can, and reports whether it does.
++// can, and reports whether it does. If it cannot, and lbp has a hit
++// condition, lbp.detWhyNot says why.
+ func (t *Target) detWatchEnable(lbp *LogicalBreakpoint, addrs []uint64) (bool, error) {
+-	if len(addrs) != 1 || !detWatchable(lbp) {
++	lbp.detWhyNot = ""
++	di := t.detInfo()
++	if lbp.hitCond == nil || di == nil {
+ 		return false, nil
+ 	}
+-	di := t.detInfo()
+-	if di == nil {
++	if lbp.detWhyNot = detWhyNot(lbp); lbp.detWhyNot != "" {
++		return false, nil
++	}
++	if len(addrs) != 1 {
++		lbp.detWhyNot = fmt.Sprintf("it is set at %d addresses, such as inlined copies, and the runtime counts one", len(addrs))
+ 		return false, nil
+ 	}
+ 	fn := t.BinInfo().PCToFunc(addrs[0])
+ 	if fn == nil {
++		lbp.detWhyNot = "its address is in no function"
+ 		return false, nil
+ 	}
+ 	tick, err := t.detEntryTick(fn, di.preemptFn)
+-	if err != nil || addrs[0] > tick.branch {
++	if err != nil {
++		lbp.detWhyNot = fn.Name + " has no entry tick: it neither calls nor loops, or it is code that counts no ticks (the runtime, os, syscall)"
++		return false, nil
++	}
++	if addrs[0] > tick.branch {
++		lbp.detWhyNot = "it is not at the function's entry"
+ 		return false, nil
+ 	}
+ 	for addr, bp := range t.Breakpoints().M {
+ 		if addr+uint64(len(bp.OriginalData)) > tick.branch && addr < tick.branch+uint64(len(tick.orig)) {
++			lbp.detWhyNot = "another breakpoint is at the function's entry tick"
+ 			return false, nil
+ 		}
+ 	}
+@@ -174,6 +239,7 @@ func (t *Target) detWatchEnable(lbp *LogicalBreakpoint, addrs []uint64) (bool, e
+ 		}
+ 	}
+ 	if slot < 0 {
++		lbp.detWhyNot = fmt.Sprintf("the runtime counts the hits of %d breakpoints already", di.nslots)
+ 		return false, nil
+ 	}
+ 	if t.Breakpoints().M[di.watchFn] == nil {
+@@ -404,6 +470,9 @@ func (grp *TargetGroup) detWatchUpdate(lbp *LogicalBreakpoint) error {
+ 		return nil
+ 	}
+ 	if lbp.det == nil && !detWatchable(lbp) {
++		if lbp.hitCond != nil {
++			lbp.detWhyNot = detWhyNot(lbp)
++		}
+ 		return nil
+ 	}
+ 	if err := grp.disableBreakpoint(lbp); err != nil {
+@@ -412,6 +481,12 @@ func (grp *TargetGroup) detWatchUpdate(lbp *LogicalBreakpoint) error {
+ 	return grp.enableBreakpoint(lbp)
+ }
+ 
++// DetCounted reports whether the runtime counts lbp's hits, and else, if
++// lbp has a hit condition in a detsched program, why it does not.
++func (lbp *LogicalBreakpoint) DetCounted() (bool, string) {
++	return lbp.det != nil, lbp.detWhyNot
++}
++
+ // DetCountedAddrs returns the addresses of lbp if the runtime counts its
+ // hits, rather than a breakpoint written in the program.
+ func (lbp *LogicalBreakpoint) DetCountedAddrs() []uint64 {
+diff --git a/pkg/terminal/command.go b/pkg/terminal/command.go
+index 4886ccf..9636328 100644
+--- a/pkg/terminal/command.go
++++ b/pkg/terminal/command.go
+@@ -96,11 +96,19 @@ var (
+ 	// * Does not limit struct fields
+ 	longLoadConfig = func() api.LoadConfig {
+ 		c := proc.LoadFullValue()
++		c.MaxStringLen = defaultMaxStringLen
+ 		return *api.LoadConfigFromProc(&c)
+ 	}()
++	// defaultMaxStringLen is how much of a string print, locals -v and
++	// args -v show without "config max-string-len": Delve's 64 bytes cut
++	// most keys and values.
++	defaultMaxStringLen = 1024
+ 	// ShortLoadConfig loads less information, not following pointers
+ 	// and limiting struct fields loaded to 3.
+-	ShortLoadConfig = api.LoadConfig{MaxStringLen: 64, MaxStructFields: 3}
++	ShortLoadConfig = api.LoadConfig{MaxStringLen: 256, MaxStructFields: 3}
++	// returnLoadConfig loads a tracepoint's results: as ShortLoadConfig,
++	// but following a pointer, so that an error result shows its message.
++	returnLoadConfig = api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 256, MaxArrayValues: 16, MaxStructFields: 3}
+ )
+ 
+ // DebugCommands returns a Commands struct with default commands defined.
+@@ -1906,6 +1914,10 @@ func breakpoints(t *Term, ctx callContext, args string) error {
+ 
+ 	// Display breakpoints (original functionality)
+ 	slices.SortFunc(breakPoints, func(a, b *api.Breakpoint) int { return cmp.Compare(a.ID, b.ID) })
++	if t.jsonOn() {
++		t.jsonBreakpoints(breakPoints)
++		return nil
++	}
+ 	for _, bp := range breakPoints {
+ 		enabled := "(enabled)"
+ 		if bp.Disabled {
+@@ -1914,6 +1926,8 @@ func breakpoints(t *Term, ctx callContext, args string) error {
+ 			enabled = "(suspended)"
+ 		} else if bp.RuntimeCounted {
+ 			enabled = "(enabled, hits counted by the runtime)"
++		} else if bp.RuntimeNotCounted != "" {
++			enabled = "(enabled, hits counted by Delve, one trap each: " + bp.RuntimeNotCounted + ")"
+ 		}
+ 		fmt.Fprintf(t.stdout, "%s %s", formatBreakpointName(bp, true), enabled)
+ 		if bp.ExprString != "" {
+@@ -2122,7 +2136,7 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
+ 					TraceReturn:   true,
+ 					TraceReturnOf: created[i].ID,
+ 					Line:          -1,
+-					LoadArgs:      &ShortLoadConfig,
++					LoadArgs:      &returnLoadConfig,
+ 				})
+ 				if err != nil && !strings.HasPrefix(err.Error(), "Breakpoint exists") {
+ 					// Returns another tracepoint has stop for that one.
+diff --git a/pkg/terminal/json.go b/pkg/terminal/json.go
+index d79f08b..adcac2b 100644
+--- a/pkg/terminal/json.go
++++ b/pkg/terminal/json.go
+@@ -248,7 +248,7 @@ func (t *Term) jsonThread(th *api.Thread) {
+ 					rec["locals"] = t.jsonVars(bpi.Locals, 0)
+ 				}
+ 				if bpi.Stacktrace != nil {
+-					rec["stack"] = t.jsonFrames(bpi.Stacktrace)
++					rec["frames"] = t.jsonFrames(bpi.Stacktrace) // as the stack record's
+ 				}
+ 				if bpi.Goroutine != nil {
+ 					rec["goroutine_info"] = t.jsonGoroutine(bpi.Goroutine)
+@@ -261,3 +261,67 @@ func (t *Term) jsonThread(th *api.Thread) {
+ 	}
+ 	t.jsonEmit(rec)
+ }
++
++// jsonBreakpoints prints the record of the breakpoints command.
++func (t *Term) jsonBreakpoints(bps []*api.Breakpoint) {
++	list := []map[string]any{}
++	for _, bp := range bps {
++		r := map[string]any{
++			"id":    bp.ID,
++			"kind":  "breakpoint",
++			"state": "enabled",
++			"hits":  bp.TotalHitCount,
++		}
++		if bp.Name != "" {
++			r["name"] = bp.Name
++		}
++		switch {
++		case bp.WatchExpr != "":
++			r["kind"], r["expr"] = "watchpoint", bp.WatchExpr
++		case bp.Tracepoint:
++			r["kind"] = "tracepoint"
++		}
++		switch {
++		case bp.Disabled:
++			r["state"] = "disabled"
++		case bp.ExprString != "":
++			r["state"], r["location"] = "suspended", bp.ExprString
++		}
++		if bp.ExprString == "" {
++			addrs := []string{}
++			for _, a := range bp.Addrs {
++				addrs = append(addrs, fmt.Sprintf("%#x", a))
++			}
++			r["addrs"], r["func"], r["file"], r["line"] = addrs, bp.FunctionName, t.formatPath(bp.File), bp.Line
++		}
++		if bp.Cond != "" {
++			r["cond"] = bp.Cond
++		}
++		if bp.HitCond != "" {
++			r["hitcond"] = bp.HitCond
++			if bp.HitCondPerG {
++				r["hitcond_per_g"] = true
++			}
++			// Who counts the hits: the runtime of a detsched program, at no
++			// cost until the hit before the one wanted, or Delve, at a trap
++			// a hit, and why.
++			switch {
++			case bp.RuntimeCounted:
++				r["counted_by"] = "runtime"
++			case bp.RuntimeNotCounted != "":
++				r["counted_by"], r["not_runtime_counted"] = "delve", bp.RuntimeNotCounted
++			}
++		}
++		var actions []string // what its on commands do
++		for _, a := range formatBreakpointAttrs("", bp, false) {
++			if !strings.HasPrefix(a, "cond ") {
++				actions = append(actions, a)
++			}
++		}
++		if len(actions) > 0 {
++			r["actions"] = actions
++		}
++		list = append(list, r)
++	}
++	t.jsonEmit(map[string]any{"event": "breakpoints", "breakpoints": list})
++}
+diff --git a/pkg/terminal/terminal.go b/pkg/terminal/terminal.go
+index 7e68306..90d7dc7 100644
+--- a/pkg/terminal/terminal.go
++++ b/pkg/terminal/terminal.go
+@@ -666,6 +666,7 @@ func (t *Term) handleExit() (int, error) {
+ // the configuration file.
+ func (t *Term) loadConfig() api.LoadConfig {
+ 	full := proc.LoadFullValue()
++	full.MaxStringLen = defaultMaxStringLen
+ 	r := *api.LoadConfigFromProc(&full)
+ 
+ 	if t.conf != nil && t.conf.MaxStringLen != nil {
+diff --git a/service/api/types.go b/service/api/types.go
+index 1e28694..6761e37 100644
+--- a/service/api/types.go
++++ b/service/api/types.go
+@@ -147,6 +147,10 @@ type Breakpoint struct {
+ 	// the breakpoint's hits until the one its hit condition asks for, so
+ 	// that the hits before it cost no trap.
+ 	RuntimeCounted bool `json:"runtimeCounted,omitempty"`
++	// RuntimeNotCounted says, for a breakpoint with a hit condition in a
++	// detsched program whose hits the runtime does not count, why not:
++	// Delve counts them, and each costs a trap.
++	RuntimeNotCounted string `json:"runtimeNotCounted,omitempty"`
+ 	// Disabled flag, signifying the state of the breakpoint
+ 	Disabled bool `json:"disabled"`
+ 
+diff --git a/service/debugger/debugger.go b/service/debugger/debugger.go
+index a2da672..525cb8a 100644
+--- a/service/debugger/debugger.go
++++ b/service/debugger/debugger.go
+@@ -872,8 +872,8 @@ func (d *Debugger) convertBreakpoint(lbp *proc.LogicalBreakpoint) *api.Breakpoin
+ 		}
+ 	}
+ 	api.ConvertPhysicalBreakpoints(abp, lbp, pids, bps)
++	abp.RuntimeCounted, abp.RuntimeNotCounted = lbp.DetCounted()
+ 	if addrs := lbp.DetCountedAddrs(); len(addrs) > 0 && len(bps) == 0 {
+-		abp.RuntimeCounted = true
+ 		abp.Addrs, abp.Addr, abp.ExprString = addrs, addrs[0], ""
+ 		for range addrs {
+ 			abp.AddrPid = append(abp.AddrPid, d.target.Selected.Pid())
+@@ -1443,7 +1443,7 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
+ 		bpi.Variables = make([]api.Variable, len(bp.Variables))
+ 	}
+ 	for i := range bp.Variables {
+-		v, err := s.EvalExpression(bp.Variables[i], proc.LoadFullValue())
++		v, err := s.EvalExpression(bp.Variables[i], bpVariablesLoadConfig)
+ 		if err != nil {
+ 			bpi.Variables[i] = api.Variable{Name: bp.Variables[i], Unreadable: fmt.Sprintf("eval error: %v", err)}
+ 		} else {
+@@ -1454,6 +1454,9 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
+ 		if vars, err := s.FunctionArguments(*api.LoadConfigToProc(bp.LoadArgs)); err == nil {
+ 			bpi.Arguments = api.ConvertVars(vars)
+ 		}
++		if bp.TraceReturn {
++			regABIReturns(tgt, s, bpi.Arguments, *api.LoadConfigToProc(bp.LoadArgs))
++		}
+ 	}
+ 	if bp.LoadLocals != nil {
+ 		if locals, err := s.LocalVariables(*api.LoadConfigToProc(bp.LoadLocals)); err == nil {
+@@ -1463,6 +1466,56 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
+ 	return nil
+ }
+ 
++// bpVariablesLoadConfig loads the expressions a breakpoint prints (on
++// NAME print EXPR): Delve's usual configuration, with strings of up to
++// 1024 bytes rather than 64.
++var bpVariablesLoadConfig = func() proc.LoadConfig {
++	c := proc.LoadFullValue()
++	c.MaxStringLen = 1024
++	return c
++}()
++
++// regABIReturns reads the results in args that the debug information
++// left unreadable, as at the return of optimized code, from the registers
++// the ABI returns them in when s is stopped at a RET instruction, and
++// otherwise says why they cannot be read and what can.
++func regABIReturns(tgt *proc.Target, s *proc.EvalScope, args []api.Variable, cfg proc.LoadConfig) {
++	unreadable := false
++	for _, v := range args {
++		unreadable = unreadable || v.Flags&api.VariableReturnArgument != 0 && v.Unreadable != ""
++	}
++	if !unreadable {
++		return
++	}
++	var results []*proc.Variable
++	if text, err := proc.Disassemble(tgt.Memory(), nil, tgt.Breakpoints(), tgt.BinInfo(), s.PC, s.PC+16); err == nil && len(text) > 0 && text[0].IsRet() {
++		results, _ = s.RegABIResults(cfg)
++	}
++	const hint = "; replay a build without optimizations to read it (delve.md: Read locals)"
++	for i := range args {
++		v := &args[i]
++		if v.Flags&api.VariableReturnArgument == 0 || v.Unreadable == "" {
++			continue
++		}
++		why := "optimized code has no location for this result at this return (" + v.Unreadable + ")"
++		for _, r := range results {
++			if r.Name != v.Name {
++				continue
++			}
++			if r.Unreadable == nil {
++				*v = *api.ConvertVar(r)
++				why = ""
++			} else {
++				why = r.Unreadable.Error()
++			}
++			break
++		}
++		if why != "" {
++			v.Unreadable = why + hint
++		}
++	}
++}
++
+ // Sources returns a list of the source files for target binary.
+ func (d *Debugger) Sources(filter string) ([]string, error) {
+ 	d.targetMutex.Lock()

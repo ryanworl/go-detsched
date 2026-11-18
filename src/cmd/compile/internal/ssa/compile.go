@@ -488,7 +488,7 @@ var passes = [...]pass{
 	{name: "memcombine", fn: memcombine},
 	{name: "writebarrier", fn: writebarrier, required: true}, // expand write barrier ops
 	{name: "insert resched checks", fn: insertLoopReschedChecks,
-		disabled: !buildcfg.Experiment.PreemptibleLoops && !buildcfg.Experiment.DetSched}, // insert resched checks in loops.
+		disabled: !buildcfg.Experiment.PreemptibleLoops}, // insert resched checks in loops.
 	{name: "cpufeatures", fn: cpufeatures, required: buildcfg.Experiment.SIMD, disabled: !buildcfg.Experiment.SIMD},
 	{name: "rewrite tern", fn: rewriteTern, required: false, disabled: !buildcfg.Experiment.SIMD},
 	{name: "lower", fn: lower, required: true},

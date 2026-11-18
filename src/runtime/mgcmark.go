@@ -455,12 +455,15 @@ func markrootSpans(gcw *gcWork, shard int) {
 				switch sp.kind {
 				case _KindSpecialFinalizer:
 					gcScanFinalizer((*specialfinalizer)(unsafe.Pointer(sp)), s, gcw)
+					detGCKeep(s, sp.offset, gcw)
 				case _KindSpecialWeakHandle:
 					// The special itself is a root.
 					spw := (*specialWeakHandle)(unsafe.Pointer(sp))
 					scanblock(uintptr(unsafe.Pointer(&spw.handle)), goarch.PtrSize, &oneptrmask[0], gcw, nil)
+					detGCKeep(s, sp.offset, gcw)
 				case _KindSpecialCleanup:
 					gcScanCleanup((*specialCleanup)(unsafe.Pointer(sp)), gcw)
+					detGCKeep(s, sp.offset, gcw)
 				}
 			}
 			unlock(&s.speciallock)

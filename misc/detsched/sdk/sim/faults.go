@@ -10,6 +10,9 @@ import (
 	"math"
 	"slices"
 	"time"
+
+	"github.com/ryanworl/go-detsched/misc/detsched/sdk/assert"
+	"github.com/ryanworl/go-detsched/misc/detsched/sdk/buggify"
 )
 
 // Network faults, after Antithesis's catalog: each directed link between
@@ -329,6 +332,23 @@ func normal(mean, dev time.Duration) int64 {
 		s += float64(runtime_rand()&(1<<26-1)) / (1 << 26)
 	}
 	return max(0, int64(mean)+int64(s*float64(dev)))
+}
+
+// fault reports whether to inject the fault at the buggify site with
+// probability p, which calm keeps off, and reports each fault it injects
+// as the assertion msg, "fault: " and the site, by which the detsched
+// command's summary says in what share of each group's runs it fired.
+func fault(site, msg string, p float64) bool {
+	if calm() || !buggify.OnChance(site, p) {
+		return false
+	}
+	injected(msg)
+	return true
+}
+
+// injected reports a fault the simulation injects, as fault does.
+func injected(msg string) {
+	runtime_call(func() { assert.Reachable(msg, nil) })
 }
 
 // chance reports true with probability p, from the fault stream.

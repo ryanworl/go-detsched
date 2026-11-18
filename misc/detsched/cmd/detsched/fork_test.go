@@ -331,17 +331,19 @@ func TestSearchSetup(t *testing.T) {
 }
 
 // TestSearchKinds checks that a search makes a group of the runs that fail
-// each assertion, whatever their details, but for each error, numbers
-// aside, of one whose details are only an error, and that a group lists
+// each assertion, whatever their details, even an error among others, but
+// for each error, numbers aside, of one whose details are only an error,
+// and that a group lists
 // another assertion its runs fail with the log of the first run that
 // failed it.
 func TestSearchKinds(t *testing.T) {
 	s := runSearch(t, "../../testdata/assertkinds", 300)
 	first := findGroup(s, "detsched: assertion failed: the first invariant holds")
 	second := findGroup(s, "detsched: assertion failed: the second invariant holds")
-	leaders := findGroup(s, "detsched: assertion failed: the check succeeds map[err:two leaders")
-	applied := findGroup(s, "detsched: assertion failed: the check succeeds map[err:node")
-	if len(s.groups) != 4 || first == nil || second == nil || first == second || leaders == nil || applied == nil || leaders == applied {
+	leaders := findGroup(s, `detsched: assertion failed: the check succeeds map[err:"two leaders`)
+	applied := findGroup(s, `detsched: assertion failed: the check succeeds map[err:"node`)
+	read := findGroup(s, "detsched: assertion failed: a read returns its own write")
+	if len(s.groups) != 5 || first == nil || second == nil || first == second || leaders == nil || applied == nil || leaders == applied || read == nil || read.key != "detsched: assertion failed: a read returns its own write" {
 		t.Fatalf("want a group for each invariant:\n%s", searchReport(s))
 	}
 	a := first.also[failureKey("detsched: assertion failed: the rare symptom is absent map[n:1]")]
@@ -431,8 +433,12 @@ func TestSearchReports(t *testing.T) {
 	if err := s.run(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	if want := regexp.MustCompile(`warning: seed 1 left the deterministic subset.*\n\tdetsched: goroutine 1 starts a subprocess \(\S*/true\), whose timing comes from the OS, at s\d+ k\d+; the program no longer runs deterministically\n`); s.left != 1 || !want.MatchString(b.String()) {
-		t.Errorf("%d reports, output:\n%s\nwant 1, matching %s", s.left, b.String(), want)
+	want := regexp.MustCompile(`\nWARNING: \d+ fallbacks limited this search.*\n  - seed 1 left the deterministic subset in 1 places, first: goroutine 1 starts a subprocess \(\S*/true\), whose timing comes from the OS, at s\d+ k\d+\n    cost: .*\n    fix:  .*seed-1\.log\n    docs: .*README\.md#seed-1-left-the-deterministic-subset\n`)
+	if r := searchReport(s); len(s.left) != 1 || !want.MatchString(r) {
+		t.Errorf("%d reports, summary:\n%s\nwant 1, matching %s", len(s.left), r, want)
+	}
+	if log, err := os.ReadFile(s.temp("seed-1.log")); err != nil || !bytes.Contains(log, []byte("syscall.forkExec")) {
+		t.Errorf("seed-1.log has no stack of the report: %v\n%s", err, log)
 	}
 }
 
@@ -475,6 +481,43 @@ func TestSearchCompose(t *testing.T) {
 	out, _ := cmd.CombinedOutput()
 	if !strings.Contains(string(out), s.groups[0].sig) || strings.Contains(string(out), "warning: this run's schedule is not") {
 		t.Errorf("with SIMCOMPOSE_EXTRA=1, %s printed\n%.3000s\nwant %s on the same schedule", s.groups[0].replay, out, s.groups[0].sig)
+	}
+
+	// The debug line runs the build without optimizations, which fails
+	// the same way on the same schedule.
+	<-s.debugDone
+	debug := s.debugLine(s.groups[0])
+	if s.debugBin == "" || !strings.Contains(debug, "dlv exec --disable-aslr "+s.debugBin) {
+		t.Fatalf("debug line %s does not run the build without optimizations (%s)", debug, s.debugNote)
+	}
+	out, _ = exec.Command("sh", "-c", strings.Replace(debug, "dlv exec --disable-aslr ", "", 1)).CombinedOutput()
+	if !strings.Contains(string(out), s.groups[0].sig) || strings.Contains(string(out), "warning: this run's schedule is not") {
+		t.Errorf("%s printed\n%.3000s\nwant %s on the same schedule", debug, out, s.groups[0].sig)
+	}
+}
+
+// TestSearchDebugFallback checks that debug lines keep the optimized
+// binary, and the summary says why, when the build without optimizations
+// runs another schedule: testdata/stackread's schedule depends on its own
+// stacks.
+func TestSearchDebugFallback(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	s, err := newSearch("../../testdata/stackread", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.run(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	<-s.debugDone
+	if len(s.groups) != 1 {
+		t.Fatalf("want one failure:\n%s", searchReport(s))
+	}
+	if debug := s.debugLine(s.groups[0]); s.debugBin != "" || !strings.Contains(debug, "dlv exec --disable-aslr "+quote(s.bin)) {
+		t.Errorf("debug line %s, want the optimized binary %s", debug, s.bin)
+	}
+	if r := searchReport(s); !strings.Contains(r, "debug lines run the optimized binary") || !strings.Contains(r, "ran seed 1 on another schedule") {
+		t.Errorf("summary does not say why debug lines run the optimized binary:\n%s", r)
 	}
 }
 

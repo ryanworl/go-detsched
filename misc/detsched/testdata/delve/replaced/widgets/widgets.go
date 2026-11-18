@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package strata is a module that ../app replaces with this directory,
+// Package widgets is a module that ../app replaces with this directory,
 // for the tests of the bundled Delve's locations in the directory above.
-package strata
+package widgets
 
 var sink int
 

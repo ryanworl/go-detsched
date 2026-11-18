@@ -75,6 +75,7 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: detsched [flags] [-exec binary | package]\n")
 		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nDocumentation: %s\n", docsPath())
 	}
 	flag.Parse()
 	if flag.NArg() > 1 || flag.NArg() == 1 && *execFlag != "" {
@@ -120,8 +121,20 @@ func main() {
 		defer cancel()
 	}
 	err = s.run(ctx, *seeds)
-	s.summary(os.Stdout)
-	s.writeSummary()
+	s.mu.Lock()
+	failed := len(s.groups) > 0
+	s.mu.Unlock()
+	if failed && s.debugDone != nil {
+		// Debug lines are the next step; give them the build without
+		// optimizations if it is nearly done.
+		select {
+		case <-s.debugDone:
+		case <-signals.Done():
+		case <-time.After(2 * time.Minute):
+		}
+	}
+	s.summary(os.Stdout, true)
+	s.writeSummary(true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "detsched: %v\n", err)
 		os.Exit(2)
@@ -130,11 +143,15 @@ func main() {
 		os.Exit(1)
 	}
 	// No failure: keep only the summary, whose path the search printed
-	// at its start, and the binary when the summary has replay lines.
+	// at its start, the logs it names, and the binary when the summary
+	// has replay lines.
 	keep := s.summaryReplays()
+	s.mu.Lock()
+	debug := s.debugBin != ""
+	s.mu.Unlock()
 	entries, _ := os.ReadDir(s.out)
 	for _, e := range entries {
-		if e.Name() != "summary" && !(keep && filepath.Join(s.out, e.Name()) == s.bin) {
+		if e.Name() != "summary" && !strings.HasSuffix(e.Name(), ".log") && !(keep && (filepath.Join(s.out, e.Name()) == s.bin || e.Name() == "debug" && debug)) {
 			os.RemoveAll(filepath.Join(s.out, e.Name()))
 		}
 	}
@@ -176,6 +193,8 @@ type search struct {
 	slowPass    time.Duration // the longest passing run
 	slowPassRun *result       // that run
 	slowFail    time.Duration // the longest failing run, timeouts aside
+	firstFail   time.Duration // when the first failure was recorded, after the search started
+	firstRun    int           // the runs recorded by then
 	groups      []*group      // in order of first appearance
 	byKey       map[string]*group
 	kinds       map[string]*also // every kind of failure, first in its run or not, by key
@@ -186,21 +205,39 @@ type search struct {
 	claimed     map[int]bool // new features of plain runs' cells not stopped yet
 	kept        int          // cells when the search ended
 	lowMem      bool         // memory ran low, which has been reported
-	memWaited   time.Time    // when waitMem last reported waiting
 	baseTrace   string       // the trace line of the base run, seed 1
 	unstable    string       // how seed 1 ran two schedules, or ""
-	left        int          // places where seed 1 left the deterministic subset
+	newShell    bool         // seed 1 runs another schedule in a new shell, for variables findVars did not find
+	rechecked   sync.Once    // runs recheck
+	built       bool         // whether the search built the binary (not -exec)
+	debugBin    string       // a build without optimizations that ran seed 1's schedule, or ""
+	debugNote   string       // why debug lines run the optimized binary, or ""
+	debugDone   chan bool    // closed when buildDebug is done, or nil
+	left        []string     // where seed 1 left the deterministic subset, a line each
+	aslr        string       // the runtime's report that seed 1 could not run without ASLR, or ""
 	only        int          // the only arm to run, for measuring, or -1
 	noFork      bool         // run fresh seeds without forking, for measuring
 	roots       map[int]bool // process groups of the fork servers
 	running     map[*liveRun]bool
-	outOfMem    int     // runs stopped because memory ran out, not counted as failures
-	bigStopped  *result // the one of them that held the most memory
-	features    int     // new features recorded during the search
+	outOfMem    int           // runs stopped because memory ran out, not counted as failures
+	bigStopped  *result       // the one of them that held the most memory
+	memWait     time.Duration // time waitMem kept runs from starting
+	memWaiting  int           // workers waitMem keeps waiting
+	memWaitFrom time.Time     // when they started to
+	tooLongLog  string        // the log of tooLongRun
+	tooLongStat string        // whether its replay reproduced it
+	features    int           // new features recorded during the search
 	canFork     bool
-	forked      bool   // a fork succeeded
-	refused     int    // forks the program refused
-	refusal     string // why the search stopped forking, or ""
+	forked      bool           // a fork succeeded
+	refused     int            // forks the program refused
+	refusals    map[uint64]int // forks the program refused, by reason
+	forks       int            // forks that succeeded
+	refusal     uint64         // why the search stopped forking, or 0
+	skipped     int            // runs in which a branch of a composer timeline did not run
+	skipWhy     map[uint64]int // those runs, by why
+	cut         int            // runs whose output was cut
+	passed      int            // runs that passed
+	passFaults  map[string]int // faults that fired in passing runs, by assertion message
 	yieldSites  []string
 	predicted   []string                // deadlocks the lock order predicts
 	directed    [2]int                  // runs directed at predicted deadlocks, and those that failed
@@ -227,14 +264,16 @@ type group struct {
 	index  int              // its number, from 1, which its logs' names have
 	also   map[string]*also // other failures in its runs, by key
 	left   string           // for a deadlock at the end of the test, the goroutines left
+	faults map[string]int   // faults that fired in its runs, by assertion message
 }
 
 // An also is a failure of another kind in a group's runs, such as a
 // symptom of the failure the runs fail with first.
 type also struct {
-	sig  string // its signature in the first run that had it
-	runs int
-	log  string // the log of that run
+	sig    string // its signature in the first run that had it
+	runs   int
+	log    string // the log of that run
+	replay string // the command that replays that run
 }
 
 // keepLogs is how many logs of each group a search keeps.
@@ -259,7 +298,11 @@ func newSearch(pkg, bin, run string) (*search, error) {
 		claimed: map[int]bool{},
 		asserts: map[string]*assertCount{},
 		rng:     rand.New(rand.NewPCG(1, 2)),
-		only:    -1,
+
+		refusals:   map[uint64]int{},
+		skipWhy:    map[uint64]int{},
+		passFaults: map[string]int{},
+		only:       -1,
 	}
 	if bin != "" {
 		// Runs and replay lines use a copy, so that rebuilding the
@@ -272,6 +315,7 @@ func newSearch(pkg, bin, run string) (*search, error) {
 		}
 	} else {
 		s.dir, s.bin, err = buildPackage(pkg, out)
+		s.built = true
 	}
 	if err != nil {
 		os.RemoveAll(out)
@@ -311,8 +355,8 @@ func isFile(name string) bool {
 // buildPackage builds pkg's test binary, or pkg itself if it is a command
 // without tests, with the experiment and without cgo, which a process
 // that forks a branch of a timeline must not use. It returns the
-// package's directory and the binary.
-func buildPackage(pkg, out string) (dir, bin string, err error) {
+// package's directory and the binary. flags go to the go command.
+func buildPackage(pkg, out string, flags ...string) (dir, bin string, err error) {
 	exp := "detsched"
 	if e := os.Getenv("GOEXPERIMENT"); e != "" {
 		exp = e + ",detsched"
@@ -344,6 +388,7 @@ func buildPackage(pkg, out string) (dir, bin string, err error) {
 		bin = filepath.Join(out, filepath.Base(dir))
 		args = []string{"build", "-o", bin, pkg}
 	}
+	args = slices.Insert(args, 1, flags...)
 	cmd := exec.Command(goCmd(), args...)
 	cmd.Env = env
 	if b, err := cmd.CombinedOutput(); err != nil {
@@ -368,6 +413,7 @@ type result struct {
 	outOfMem    bool   // stopped because memory ran out
 	memAtStop   uint64 // the private memory it held then, if known
 	outputSize  int64  // the bytes of output it wrote, which may be more than output holds
+	maxSwitches uint64 // the maxswitches it ran with, or 0
 }
 
 var (
@@ -385,8 +431,9 @@ var (
 	failureLine   = regexp.MustCompile(`(?m)^(detsched: assertion failed: |panic: |fatal error: ).*`)
 	testFailure   = regexp.MustCompile(`(?m)^\s*--- FAIL: \S+`)
 	branchLine    = regexp.MustCompile(`(?m)^detsched: branch (\d+) \(GODETBRANCH=\d+ runs it in place\)$`)
+	skippedLine   = regexp.MustCompile(`(?m)^detsched: branch \d+ did not run: the process cannot fork now \((.*)\)$`)
 	assertDetails = regexp.MustCompile(`^detsched: assertion failed: .*?( map\[| \(and \d+ more failures?\)$)`)
-	errDetails    = regexp.MustCompile(`^map\[err:(.*)\]( \(and \d+ more failures?\))?$`)
+	errDetails    = regexp.MustCompile(`^map\[err:("(?:[^"\\]|\\.)*"|[^ "]*)\]( \(and \d+ more failures?\))?$`)
 	masked        = regexp.MustCompile(`0x[0-9a-f]+|\b[0-9A-Fa-f]{16,}\b|\d+`)
 )
 
@@ -402,6 +449,27 @@ func (r *result) tooLong() bool {
 // trace returns the run's first trace line, which is that of the
 // branch whose output comes first, or "".
 func (r *result) trace() string { return string(traceLine.Find(r.output)) }
+
+// spun returns the branch of the composer timeline that a run stopped for
+// too many switches stopped in, or 0 for the timeline, and the trace line
+// printed where it stopped.
+func (r *result) spun() (int, string) {
+	i := bytes.Index(r.output, []byte("more switches than maxswitches"))
+	if i < 0 {
+		return r.branch(), r.trace()
+	}
+	rest := r.output[i:]
+	loc := traceLine.FindIndex(rest)
+	if loc == nil {
+		return 0, ""
+	}
+	trace := string(rest[loc[0]:loc[1]])
+	if m := branchLine.FindSubmatchIndex(rest[loc[1]:]); m != nil && m[0] == 1 {
+		n, _ := strconv.Atoi(string(rest[loc[1]+m[2] : loc[1]+m[3]]))
+		return n, trace
+	}
+	return 0, trace
+}
 
 // signature returns the line that tells how the run failed: its first
 // assertion failure, panic, or fatal error (a branch of a composer
@@ -449,6 +517,9 @@ func splitSignature(sig string) (msg, details string) {
 	}
 	msg, details = sig[:m[2]], sig[m[2]+1:]
 	if e := errDetails.FindStringSubmatch(details); e != nil {
+		if u, uerr := strconv.Unquote(e[1]); uerr == nil {
+			e[1] = u
+		}
 		err, _, _ := strings.Cut(e[1], "\n")
 		msg += ": " + truncate(err, 160)
 	}
@@ -526,16 +597,26 @@ func (s *search) temp(name string) string { return filepath.Join(s.out, name) }
 // the branch of a composer timeline it failed in, if any. With debug, it
 // runs it under Delve instead: --disable-aslr because on macOS the
 // program re-executes itself without ASLR, which loses Delve's
-// breakpoints.
+// breakpoints. A run stopped for too many switches replays with the same
+// limit, so that it stops at the same switch; one stopped because memory
+// ran out replays in a subshell that caps its memory, on Linux.
 func (s *search) replayLine(r *result, debug bool) string {
-	env := []string{fmt.Sprintf("GODETSEED=%d", r.seed), fmt.Sprintf("GODETBRANCH=%d", r.branch())}
+	branch, trace := r.branch(), r.trace()
+	if r.tooLong() {
+		branch, trace = r.spun()
+	}
+	env := []string{fmt.Sprintf("GODETSEED=%d", r.seed), fmt.Sprintf("GODETBRANCH=%d", branch)}
 	if r.tape != "" {
 		env = addSearch(env, "tape="+r.tape)
 	}
 	env = addSearch(env, yieldField(r.yield)...)
-	// The schedule the line replays, which the run checks its own against.
-	if m := traceHash.FindSubmatch(r.output); m != nil {
-		env = addSearch(env, "trace="+string(m[1]))
+	if r.tooLong() {
+		env = addSearch(env, fmt.Sprintf("maxswitches=%d", r.maxSwitches))
+	}
+	// The schedule the line replays, which the run checks its own against,
+	// unless the run was stopped from outside, where the replay goes on.
+	if m := traceHash.FindStringSubmatch(trace); m != nil && !r.timedOut && !r.outOfMem {
+		env = addSearch(env, "trace="+m[1])
 	}
 	env = slices.Concat(env, r.env, s.vars)
 	// Set the variables the program read as the run had them, and unset
@@ -553,6 +634,11 @@ func (s *search) replayLine(r *result, debug bool) string {
 		}
 	}
 	var b strings.Builder
+	capped := r.outOfMem && r.memAtStop > 0 && !debug && runtime.GOOS == "linux"
+	if capped {
+		// The address space of a run starts at about 1.3 GB.
+		fmt.Fprintf(&b, "(ulimit -v %d; ", (r.memAtStop+r.memAtStop/4+3<<29)>>10)
+	}
 	fmt.Fprintf(&b, "cd %s && ", quote(s.dir))
 	if len(unset) > 0 {
 		b.WriteString("env")
@@ -575,7 +661,57 @@ func (s *search) replayLine(r *result, debug bool) string {
 	for _, a := range s.args {
 		b.WriteString(" " + quote(a))
 	}
+	if capped {
+		b.WriteString(")")
+	}
 	return b.String()
+}
+
+// debugLine returns g's debug line, which runs the build without
+// optimizations once it has run seed 1's schedule, so that dlv reads
+// every local. The caller holds s.mu.
+func (s *search) debugLine(g *group) string {
+	if s.debugBin == "" {
+		return g.debug
+	}
+	return strings.Replace(g.debug, "dlv exec --disable-aslr "+quote(s.bin), "dlv exec --disable-aslr "+quote(s.debugBin), 1)
+}
+
+// buildDebug builds the program with -gcflags=all=-N -l, for debug lines,
+// and runs seed 1 in it: with detsched's ticks, which count where the
+// source has them, it runs the same schedule as the optimized build
+// unless the program reads its own stacks or its work depends on heap
+// addresses, and then debug lines keep the optimized binary.
+func (s *search) buildDebug(ctx context.Context) {
+	defer close(s.debugDone)
+	dir := filepath.Join(s.out, "debug")
+	err := os.Mkdir(dir, 0o777)
+	var bin string
+	if err == nil {
+		_, bin, err = buildPackage(s.pkg, dir, "-gcflags=all=-N -l")
+	}
+	var r *result
+	// Up to three runs: a run on a loaded machine can leave the
+	// deterministic subset, such as when a system call outlasts the
+	// watchdog, while a build that runs another schedule does so every
+	// time.
+	for try := 0; err == nil && try < 3 && (r == nil || r.trace() != s.baseTrace); try++ {
+		cmd := s.plain(1, addSearch(nil, "feedback=1")...)
+		cmd.Path, cmd.Args[0] = bin, bin
+		r, err = s.exec(context.WithoutCancel(ctx), cmd)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case errors.Is(err, errCanceled):
+	case err != nil:
+		s.debugNote = fmt.Sprintf("building or running it without optimizations failed: %v", truncate(err.Error(), 500))
+	case r.trace() != s.baseTrace:
+		s.debugNote = fmt.Sprintf("its build without optimizations (-gcflags=all=-N -l) ran seed 1 on another schedule three times (%s, not %s), as a program that reads its own stacks or whose work depends on heap addresses does", strings.TrimPrefix(r.trace(), "detsched: "), strings.TrimPrefix(s.baseTrace, "detsched: "))
+	default:
+		s.debugBin = bin
+		s.printf("detsched: debug lines from here on run %s, built without optimizations (-gcflags=all=-N -l), which runs the same schedules and in which dlv reads every local\n", bin)
+	}
 }
 
 // envRead returns the names of the variables the program read, in the
@@ -774,7 +910,7 @@ func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
 	}
 	pgid := cmd.Process.Pid
 	defer syscall.Kill(-pgid, syscall.SIGKILL)
-	untrack := s.track(start, pgid, func() { syscall.Kill(-pgid, syscall.SIGKILL) })
+	untrack := s.track(start, pgid, func(sig syscall.Signal) { syscall.Kill(-pgid, sig) })
 	defer untrack()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -826,13 +962,17 @@ func (s *search) run(ctx context.Context, n uint64) error {
 		defer stop()
 	}
 	defer s.closeAll()
+	go s.guardMem(ctx)
 	if err := s.prepare(ctx); err != nil {
 		if errors.Is(err, errCanceled) {
 			return nil
 		}
 		return err
 	}
-	go s.guardMem(ctx)
+	// Check seed 1's schedule again a minute in, as well as at the end,
+	// so that a search stopped by a signal checks it too.
+	recheck := time.AfterFunc(time.Minute, func() { s.rechecked.Do(s.recheck) })
+	defer recheck.Stop()
 	jobs := make(chan uint64)
 	go func() {
 		defer close(jobs)
@@ -875,19 +1015,21 @@ func (s *search) run(ctx context.Context, n uint64) error {
 	// sender may kill it for (as a tool's stop often follows SIGTERM
 	// with SIGKILL a second later).
 	if firstErr == nil && !errors.Is(ctx.Err(), context.Canceled) {
-		s.mu.Lock()
-		s.printf("detsched: %d runs done; running seed 1 once more, to check that its schedule has not changed, before the summary\n", s.runs)
-		s.mu.Unlock()
-		s.recheck()
+		s.rechecked.Do(func() {
+			s.mu.Lock()
+			s.printf("detsched: %d runs done; running seed 1 once more, to check that its schedule has not changed, before the summary\n", s.runs)
+			s.mu.Unlock()
+			s.recheck()
+		})
 	}
 	return firstErr
 }
 
-// recheck runs seed 1 once more, minutes after the base run in real time,
-// and warns if it runs another schedule: a program that reads the real
-// clock outside a bubble, such as at init, often runs the same schedule
-// in two runs started at once. A signal, also after -duration ended the
-// search, stops it and goes on to the summary.
+// recheck runs seed 1 once more, a minute or more after the base run in
+// real time, and warns if it runs another schedule: a program that reads
+// the real clock outside a bubble, such as at init, often runs the same
+// schedule in two runs started at once. A signal, also after -duration
+// ended the search, stops it and goes on to the summary.
 func (s *search) recheck() {
 	ctx := s.signals
 	if ctx == nil {
@@ -899,8 +1041,10 @@ func (s *search) recheck() {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.unstable = fmt.Sprintf("seed 1 ran two different schedules (%q at the start of the search, %q at its end), so failures may not replay; the program depends on something besides its seed, such as real time or the OS", s.baseTrace, r.trace())
-	s.printf("detsched: warning: %s\n", s.unstable)
+	if s.unstable == "" {
+		s.unstable = fmt.Sprintf("seed 1 ran two different schedules: %q at the start of the search, %q %v later", strings.TrimPrefix(s.baseTrace, "detsched: "), strings.TrimPrefix(r.trace(), "detsched: "), time.Since(s.start).Round(time.Second))
+		s.notice(s.unstable)
+	}
 }
 
 // record records a run, and when it is the first of its group, replays it.
@@ -912,7 +1056,11 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	s.mu.Lock()
 	s.predict(r.output)
 	s.countAsserts(r.output)
+	s.countSkipped(r.output)
 	s.bigOutput = max(s.bigOutput, r.outputSize)
+	if r.outputSize > maxOutput {
+		s.cut++
+	}
 	s.runs++
 	if a == armDirected {
 		s.directed[0]++
@@ -922,35 +1070,66 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	if r.tooLong() {
 		s.tooLong++
-		if s.tooLongRun == nil {
-			s.tooLongRun = r
+		if s.tooLongRun != nil {
+			s.mu.Unlock()
+			return nil
 		}
+		s.tooLongRun, s.tooLongLog, s.tooLongStat = r, s.temp("spin.log"), "replaying"
+		line := s.replayLine(r, false)
+		s.mu.Unlock()
+		if err := os.WriteFile(s.tooLongLog, append([]byte("# "+line+"\n"), r.output...), 0o666); err != nil {
+			return err
+		}
+		status, err := s.replay(ctx, line, r)
+		if errors.Is(err, errCanceled) {
+			status = "was not run: the search ended first"
+		} else if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.tooLongStat = status
 		s.mu.Unlock()
 		return nil
 	}
 	if r.outOfMem {
 		s.outOfMem++
-		if s.bigStopped == nil || r.memAtStop > s.bigStopped.memAtStop {
-			s.bigStopped = r
+		if s.bigStopped != nil && r.memAtStop <= s.bigStopped.memAtStop {
+			s.mu.Unlock()
+			return nil
 		}
+		s.bigStopped = r
+		line := s.replayLine(r, false)
 		s.mu.Unlock()
-		return nil
+		return os.WriteFile(s.temp("memory.log"), append([]byte("# "+line+"\n"), r.output...), 0o666)
 	}
+	faults := faultsOf(r.output)
 	if !r.failed() {
+		s.passed++
+		for _, f := range faults {
+			s.passFaults[f]++
+		}
 		if r.wall > s.slowPass {
 			s.slowPass, s.slowPassRun = r.wall, r
+		}
+		// A run that makes 1000 times the switches of a whole run that
+		// passed spins; stopCell passes the limit to forked runs.
+		if m := switchesField.FindStringSubmatch(r.trace()); m != nil && s.maxSwitches == 0 {
+			s.maxSwitches = 1000 * max(atou(m[1]), 1000)
 		}
 		s.mu.Unlock()
 		return nil
 	}
 	s.failed++
+	if s.failed == 1 {
+		s.firstFail, s.firstRun = time.Since(s.start), s.runs
+	}
 	if !r.timedOut {
 		s.slowFail = max(s.slowFail, r.wall)
 	}
 	g := s.byKey[r.key()]
 	first := g == nil
 	if first {
-		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}}
+		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}, faults: map[string]int{}}
 		if strings.Contains(g.sig, "blocked goroutines remain") {
 			g.left = leftGoroutines(r.output)
 		}
@@ -958,24 +1137,30 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		s.groups = append(s.groups, g)
 	}
 	g.runs++
+	for _, f := range faults {
+		g.faults[f]++
+	}
 	counted := map[string]bool{g.key: true}
 	if s.kinds[g.key] == nil {
 		s.kinds[g.key] = &also{sig: g.sig}
 	}
 	s.kinds[g.key].runs++
-	var news []*also // kinds no run of the group had before
-	for _, line := range r.failures() {
-		k := failureKey(line)
-		if counted[k] || branchWrapper.MatchString(line) {
+	line := s.replayLine(r, false)
+	var news []*also  // kinds no run of the group had before
+	var fresh []*also // kinds no run had before
+	for _, f := range r.failures() {
+		k := failureKey(f)
+		if counted[k] || branchWrapper.MatchString(f) {
 			continue // the timeline's report of its failed branch, whose failure comes first
 		}
 		counted[k] = true
 		if s.kinds[k] == nil {
-			s.kinds[k] = &also{sig: line}
+			s.kinds[k] = &also{sig: f}
+			fresh = append(fresh, s.kinds[k])
 		}
 		s.kinds[k].runs++
 		if g.also[k] == nil {
-			g.also[k] = &also{sig: line}
+			g.also[k] = &also{sig: f, replay: line}
 			news = append(news, g.also[k])
 		}
 		g.also[k].runs++
@@ -990,24 +1175,32 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	for _, a := range news {
 		a.log = log
 	}
-	if first {
-		s.printf("FAIL %s\n\tlog:    %s\n\treplay: %s\n\tdebug:  %s\n", g.sig, log, g.replay, g.debug)
+	// Another kind of failure, after the group's, may be another bug,
+	// which its run's replay line shows. The group's first run prints
+	// its other kinds under the group's own lines, once replayed.
+	var firstAlso string
+	for _, a := range fresh {
+		if first {
+			firstAlso += "\talso:   " + a.sig + "\n"
+			continue
+		}
+		s.printf("ALSO %s\n\tafter:  %s\n\tlog:    %s\n\treplay: %s\n", a.sig, g.msg(), log, line)
 	}
 	s.mu.Unlock()
 
-	if log != "" {
-		s.mu.Lock()
-		line := s.replayLine(r, false)
-		s.mu.Unlock()
+	writeLog := func(line string) error {
+		if log == "" {
+			return nil
+		}
 		// The failures head the log, which may be long.
 		head := "# " + line + "\n"
 		for _, f := range r.failures() {
 			head += "# " + f + "\n"
 		}
-		data := append([]byte(head), r.output...)
-		if err := os.WriteFile(log, data, 0o666); err != nil {
-			return err
-		}
+		return os.WriteFile(log, append([]byte(head), r.output...), 0o666)
+	}
+	if err := writeLog(line); err != nil {
+		return err
 	}
 	if !first {
 		return nil
@@ -1030,12 +1223,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 				}
 			}
 			g.replay, g.debug = s.replayLine(r, false), s.replayLine(r, true)
-			s.printf("detsched: the replay of %q needs %s:\n\treplay: %s\n\tdebug:  %s\n", g.msg(), strings.Join(vars, " "), g.replay, g.debug)
 			s.mu.Unlock()
-			if log != "" {
-				if err := os.WriteFile(log, append([]byte("# "+g.replay+"\n"), r.output...), 0o666); err != nil {
-					return err
-				}
+			if err := writeLog(g.replay); err != nil {
+				return err
 			}
 			status, err = s.replay(ctx, g.replay, r)
 		}
@@ -1047,17 +1237,44 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	s.mu.Lock()
 	g.status = status
-	s.printf("detsched: the replay of %q %s\n", g.msg(), verdict(status))
+	s.printf("FAIL %s\n%s\tlog:    %s\n\treplay: %s\n\tdebug:  %s\n\t%s\n", g.sig, firstAlso, g.logs[0], g.replay, s.debugLine(g), replayVerdict(status))
 	s.mu.Unlock()
 	return nil
 }
 
-// verdict returns how a replay's status reads after "the replay".
-func verdict(status string) string {
-	if status == "reproduced" {
-		return "reproduced the failure in a new shell"
+// replayVerdict returns the line under a group that says whether its
+// replay reproduced it, which warns when it did not.
+func replayVerdict(status string) string {
+	switch status {
+	case "reproduced":
+		return "the replay reproduced the failure in a new shell"
+	case "replaying":
+		return "the replay is being checked"
 	}
-	return status
+	return "WARNING: the replay " + status
+}
+
+// countSkipped counts a run in which a branch of a composer timeline did
+// not run because the process could not fork. s.mu must be held.
+func (s *search) countSkipped(out []byte) {
+	if m := skippedLine.FindSubmatch(out); m != nil {
+		s.skipped++
+		s.skipWhy[branchReasons[string(m[1])]]++
+	}
+}
+
+// faultsOf returns the faults that fired in a run, as the simulation
+// reports them: the assertions "fault: SITE" and "nemesis: KIND" that
+// were reached.
+func faultsOf(out []byte) []string {
+	var fs []string
+	for _, m := range assertCounts.FindAllSubmatch(out, -1) {
+		msg := string(m[3])
+		if string(m[1]) == "reachable" && string(m[2]) != "0" && (strings.HasPrefix(msg, "fault: ") || strings.HasPrefix(msg, "nemesis: ")) && !slices.Contains(fs, msg) {
+			fs = append(fs, msg)
+		}
+	}
+	return fs
 }
 
 // replay runs the replay command line with a shell, as a user would in
@@ -1069,11 +1286,16 @@ func (s *search) replay(ctx context.Context, line string, r *result) (string, er
 	if err != nil {
 		return "", err
 	}
+	want, got := r.trace(), again.trace()
+	if r.tooLong() {
+		_, want = r.spun()
+		_, got = again.spun()
+	}
 	switch {
 	case again.key() != r.key():
 		return fmt.Sprintf("did not reproduce the failure: it ended with %q", again.signature()), nil
-	case again.trace() != r.trace():
-		return fmt.Sprintf("failed the same way, but ran another schedule (%q, not %q)", again.trace(), r.trace()), nil
+	case got != want && !r.timedOut: // a run stopped from outside stops anywhere
+		return fmt.Sprintf("failed the same way, but ran another schedule (%q, not %q)", got, want), nil
 	}
 	return "reproduced", nil
 }
@@ -1132,14 +1354,17 @@ func (s *search) status() string {
 	if slow > 0 {
 		line += fmt.Sprintf("; %d runs going on for over %v%s, the oldest for %v; -timeout is %v", slow, limit.Round(time.Second), why, oldest.Round(time.Second), s.timeout)
 	}
+	if s.memWaiting > 0 {
+		line += "; waiting for memory to start runs"
+	}
 	return line
 }
 
 // report prints the status line every second on a terminal, else after
-// 5 seconds and then every 30, and writes the summary so far to a file
+// 5 seconds and then every 10, and writes the summary so far to a file
 // every 30 seconds, until the returned function is called.
 func (s *search) report() (stop func()) {
-	every := 30 * time.Second
+	every := 10 * time.Second
 	if s.live {
 		every = time.Second
 	}
@@ -1166,7 +1391,7 @@ func (s *search) report() (stop func()) {
 			s.mu.Unlock()
 			if time.Since(last) >= 30*time.Second {
 				last = time.Now()
-				s.writeSummary()
+				s.writeSummary(false)
 			}
 		}
 	}()
@@ -1179,33 +1404,185 @@ func (s *search) report() (stop func()) {
 	}
 }
 
-// writeSummary writes the summary so far to the file "summary" in the
-// search's directory, replacing it whole.
-func (s *search) writeSummary() {
+// writeSummary writes the summary to the file "summary" in the search's
+// directory, replacing it whole: the summary so far, or with final, the
+// summary of the search that ended.
+func (s *search) writeSummary(final bool) {
 	var b bytes.Buffer
-	s.summary(&b)
+	s.summary(&b, final)
 	if os.WriteFile(s.temp("summary.new"), b.Bytes(), 0o666) == nil {
 		os.Rename(s.temp("summary.new"), s.temp("summary"))
 	}
 }
 
-// summary prints the counts, the search's mix, and every group.
-func (s *search) summary(w io.Writer) {
+// docsPath returns where detsched's README is: in the toolchain whose go
+// command detsched runs, else its path in a release.
+func docsPath() string {
+	if g, err := exec.LookPath(goCmd()); err == nil {
+		if p := filepath.Join(filepath.Dir(g), "..", "misc", "detsched", "README.md"); isFile(p) {
+			return filepath.Clean(p)
+		}
+	}
+	return "misc/detsched/README.md"
+}
+
+// A fallback is something that limited the search, or what its replay or
+// debug lines can do, which the user can fix.
+type fallback struct {
+	anchor string // its section of the README, under Fallbacks
+	what   string // what happened
+	cost   string // what it costs
+	fix    string // how to fix it
+}
+
+// fallbacks returns the search's fallbacks. s.mu must be held.
+func (s *search) fallbacks() []fallback {
+	var fs []fallback
+	add := func(anchor, what, cost, fix string) { fs = append(fs, fallback{anchor, what, cost, fix}) }
+	if s.unstable != "" {
+		add("seed-1-ran-two-schedules", s.unstable,
+			"failures may not replay: the program depends on something besides its seed",
+			"find what it reads outside a synctest bubble, usually time.Now() at package init: diff two runs of seed 1 with GODEBUG=dettrace=2")
+	}
+	if len(s.left) > 0 {
+		add("seed-1-left-the-deterministic-subset", fmt.Sprintf("seed 1 left the deterministic subset in %d places, first: %s", len(s.left), s.left[0]),
+			"failures may not replay",
+			"move that work into the synctest bubble or onto a sim node; each place's stack is in "+s.temp("seed-1.log"))
+	}
+	if s.aslr != "" {
+		add("aslr", "seed 1 could not run itself again without ASLR: "+s.aslr,
+			"schedules may differ between runs, and failures may not replay",
+			"run the binary as a regular program, not set-user-ID, from a writable directory")
+	}
+	if s.newShell {
+		add("new-shell", "seed 1 runs another schedule in a new shell, and detsched could not find which of its variables cause it",
+			"replay lines may not reproduce failures in another shell",
+			"run replay lines from the shell that ran detsched")
+	}
+	if r, ok := forkReasons[s.refusal]; ok {
+		add("fork-refused", "the program refused to fork: "+r.why,
+			"the search ran fresh seeds only, so it starts fewer runs per second and finds bugs that need several rare events in a row later",
+			r.fix)
+	} else if s.refused > 0 {
+		var most uint64
+		var why []string
+		for _, k := range slices.Sorted(maps.Keys(s.refusals)) {
+			why = append(why, fmt.Sprintf("%d %s", s.refusals[k], strings.TrimPrefix(errRefused{k}.Error(), "fork refused: ")))
+			if s.refusals[k] > s.refusals[most] {
+				most = k
+			}
+		}
+		add("fork-refused", fmt.Sprintf("%d of %d forks were refused: %s", s.refused, s.refused+s.forks, strings.Join(why, "; ")),
+			"those launches ran a fresh seed from the start instead",
+			forkReasons[most].fix)
+	}
+	if c := s.asserts["sometimes "+setupAssert]; c != nil && c.held == 0 {
+		add("no-faults", "the simulation injected no disk or network faults: no run's World finished setting up",
+			"no run tested failed fsyncs, bad sectors, a full disk, or late or reset packets",
+			"call lifecycle.SetupComplete(nil) when setup is done, or start a Nemesis, or drive the test with compose")
+	}
+	if s.skipped > 0 {
+		var most uint64
+		for k, n := range s.skipWhy {
+			if n > s.skipWhy[most] {
+				most = k
+			}
+		}
+		add("branch-did-not-run", fmt.Sprintf("in %d of %d runs a branch of the composer timeline did not run: the process could not fork (%s)", s.skipped, s.runs, forkReasons[most].why),
+			"those branches' Eventually and Finally checks did not run",
+			forkReasons[most].fix)
+	}
+	var bad, unchecked []string
+	for _, g := range s.groups {
+		switch {
+		case g.status == "was not run: the search ended first":
+			unchecked = append(unchecked, strconv.Itoa(g.index))
+		case g.status != "reproduced" && g.status != "replaying":
+			bad = append(bad, strconv.Itoa(g.index))
+		}
+	}
+	if len(bad) > 0 {
+		add("replay-did-not-reproduce", fmt.Sprintf("the replays of %d failures did not reproduce them in a new shell: groups %s", len(bad), strings.Join(bad, ", ")),
+			"their replay and debug lines may show another run than the failure",
+			"read the WARNING under each; diff GODEBUG=dettrace=2 runs of the replay line to find where runs part")
+	}
+	if len(unchecked) > 0 {
+		add("replay-not-checked", fmt.Sprintf("the replays of %d failures were not checked, as the search ended first: groups %s", len(unchecked), strings.Join(unchecked, ", ")),
+			"their replay lines may not reproduce them",
+			"run a replay line and check that its trace line equals the first one in the log")
+	}
+	if len(s.groups) > 0 && s.debugBin == "" {
+		why, fix := s.debugNote, "debug the optimized binary: read values at function entries, where arguments are readable"
+		if why == "" {
+			why = "the build without optimizations was not ready when the search ended"
+			if !s.built {
+				why = "-exec gave a binary, so detsched built none without optimizations"
+			}
+			fix = "build the same source with -gcflags='all=-N -l' and put it in place of the binary on the debug line (see delve.md)"
+		}
+		add("debug-lines-run-the-optimized-binary", "debug lines run the optimized binary: "+why,
+			"dlv cannot read some locals or step line by line", fix)
+	}
+	if s.outOfMem > 0 || s.lowMem {
+		what := "memory ran low"
+		if s.memWait >= time.Second {
+			what += fmt.Sprintf("; the search waited %v to start runs", s.memWait.Round(time.Second))
+		}
+		fix := "bound what the harness keeps, such as its history and logs, or lower -p"
+		if s.outOfMem > 0 {
+			what += fmt.Sprintf("; it stopped %d runs", s.outOfMem)
+			if r := s.bigStopped; r.memAtStop > 0 {
+				what += fmt.Sprintf("; the largest held %d MB, whose stacks are in %s", r.memAtStop>>20, s.temp("memory.log"))
+				fix += "; replay the largest, with its memory capped on Linux: " + s.replayLine(r, false)
+			}
+		}
+		add("memory", what, "fewer runs, and stopped runs count as neither pass nor failure, so the search lost what they would have found", fix)
+	}
+	if s.tooLong > 0 {
+		add("switch-limit", fmt.Sprintf("%d runs made over 1000 times the switches of a passing run and were stopped, not counted as failures; the first one's log is %s, and its replay %s", s.tooLong, s.tooLongLog, strings.TrimPrefix(replayVerdict(s.tooLongStat), "the replay ")),
+			"a run that loops forever in virtual time is a liveness bug that the search did not count",
+			"read its log's stacks, or replay it, which stops at the same switch: "+s.replayLine(s.tooLongRun, false))
+	}
+	if g := s.byKey[failureKey("still running when the search ended")]; g != nil {
+		limit, why := s.hangLimit()
+		add("still-running", fmt.Sprintf("%d runs were still running after %v%s when the search ended: group %d", g.runs, limit.Round(time.Second), why, g.index),
+			"they may hang, or only be slow",
+			"read the stacks in the group's logs; a replay that ends was only slow")
+	}
+	if s.cut > 0 {
+		add("output-cut", fmt.Sprintf("%d runs wrote more than %d MB of output; their logs keep the first and last %d MB", s.cut, maxOutput>>20, maxOutput>>21),
+			"the middle of their output is lost",
+			"print diagnostics once per run, after an assertion failed (assert.Failures() > 0)")
+	}
+	return fs
+}
+
+// setupAssert is the message of the assertion package sim makes as its
+// World closes, true if the World finished setting up.
+const setupAssert = "sim: setup completed, so the simulation injected faults"
+
+// notice prints a fallback as it happens. s.mu must be held.
+func (s *search) notice(what string) {
+	s.printf("detsched: fallback: %s (the summary says what it costs and how to fix it)\n", what)
+}
+
+// summary prints the counts, the fallbacks, the search's statistics, and
+// every group. Before the search ends, final is false, and the summary
+// says it is not the last.
+func (s *search) summary(w io.Writer, final bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !final {
+		fmt.Fprintf(w, "detsched: the search is still running; this file is rewritten every 30 seconds until it ends\n")
+	}
 	fmt.Fprintf(w, "detsched: %s: %s\n", s.pkg, s.status())
-	if len(s.vars) > 0 {
-		fmt.Fprintf(w, "detsched: the schedule depends on these variables of detsched's environment, which replay lines set: %s\n", strings.Join(s.vars, " "))
-	}
-	if s.unstable != "" {
-		fmt.Fprintf(w, "detsched: warning: %s\n", s.unstable)
-	}
-	if s.left > 0 {
-		places := fmt.Sprintf("%d places", s.left)
-		if s.left == 1 {
-			places = "1 place"
+	if fs := s.fallbacks(); len(fs) > 0 {
+		docs := docsPath()
+		fmt.Fprintf(w, "\nWARNING: %d fallbacks limited this search; each costs what it says until fixed:\n", len(fs))
+		for _, f := range fs {
+			fmt.Fprintf(w, "  - %s\n    cost: %s\n    fix:  %s\n    docs: %s#%s\n", f.what, f.cost, f.fix, docs, f.anchor)
 		}
-		fmt.Fprintf(w, "detsched: warning: seed 1 left the deterministic subset in %s, printed when the search started, so failures may not replay\n", places)
+		fmt.Fprintln(w)
 	}
 	if s.runs == 0 {
 		return
@@ -1217,25 +1594,19 @@ func (s *search) summary(w io.Writer) {
 		}
 	}
 	if len(mix) > 0 {
-		fmt.Fprintf(w, "detsched: runs by start: %s; %d cells kept; new features: %s\n", strings.Join(mix, ", "), s.kept, s.novelty)
+		fmt.Fprintf(w, "detsched: runs started: %s; %d cells kept; features count %s\n", strings.Join(mix, ", "), s.kept, s.novelty)
 	}
-	if s.refusal != "" {
-		fmt.Fprintf(w, "detsched: the program refused to fork (%s), so the search ran fresh seeds only\n", s.refusal)
+	if len(s.vars) > 0 {
+		fmt.Fprintf(w, "detsched: replay lines set these variables of detsched's environment, which the schedule depends on: %s\n", strings.Join(s.vars, " "))
 	}
 	if len(s.predicted) > 0 {
-		fmt.Fprintf(w, "detsched: lock pairs that runs took in both orders, which predict a deadlock, or a false alarm when a lock's memory was freed and reused for another lock; %d runs were directed at them, holding the first lock longer, and %d of those failed:\n", s.directed[0], s.directed[1])
-	}
-	for _, p := range s.predicted {
-		fmt.Fprintf(w, "detsched: predicted deadlock: %s\n", p)
-	}
-	if s.outOfMem > 0 {
-		fmt.Fprintf(w, "detsched: %d runs were stopped because memory ran out, not counted as failures\n", s.outOfMem)
-		if r := s.bigStopped; r.memAtStop > 0 {
-			fmt.Fprintf(w, "detsched: the largest held %d MB of its own when it was stopped; a run that grows without bound is a bug of the program or the harness:\n\treplay: %s\n", r.memAtStop>>20, s.replayLine(r, false))
+		fmt.Fprintf(w, "detsched: lock orders that predict a deadlock, at which %d runs were directed, %d of which failed (a prediction no directed run fails is likely a false alarm: a freed lock's memory reused for another):\n", s.directed[0], s.directed[1])
+		for _, p := range s.predicted {
+			fmt.Fprintf(w, "\t%s\n", p)
 		}
 	}
-	if s.tooLong > 0 {
-		fmt.Fprintf(w, "detsched: %d runs made 1000 times the switches of the first and were stopped, not counted as failures; one of them, which may loop forever:\n\treplay: %s\n", s.tooLong, s.replayLine(s.tooLongRun, false))
+	if s.failed > 0 {
+		fmt.Fprintf(w, "detsched: first failure after %v, at run %d\n", s.firstFail.Round(100*time.Millisecond), s.firstRun)
 	}
 	if s.slowFail > 0 {
 		fmt.Fprintf(w, "detsched: slowest passing run %v, slowest failing run %v; -timeout is %v\n", s.slowPass.Round(time.Millisecond), s.slowFail.Round(time.Millisecond), s.timeout)
@@ -1247,6 +1618,9 @@ func (s *search) summary(w io.Writer) {
 	}
 	s.assertSummary(w)
 	s.kindSummary(w)
+	if len(s.groups) > 0 && !slices.ContainsFunc(s.groups, func(g *group) bool { return g.status != "reproduced" }) {
+		fmt.Fprintf(w, "detsched: every failure's replay line reproduced it in a new shell\n")
+	}
 	for _, g := range s.groups {
 		// The heading leaves out the details, which are only the first
 		// run's.
@@ -1258,22 +1632,68 @@ func (s *search) summary(w io.Writer) {
 		if g.left != "" {
 			fmt.Fprintf(w, "\tthe goroutines left in the bubble, by where they wait and what created them: %s\n", g.left)
 		}
+		if f := s.faultLine(g); f != "" {
+			fmt.Fprintf(w, "\tfaults in its runs: %s\n", f)
+		}
 		more := ""
 		if len(g.logs) > 1 {
 			more = fmt.Sprintf(" (and %d more of these runs: %s)", len(g.logs)-1, filepath.Join(s.out, fmt.Sprintf("fail-%d-*.log", g.index)))
 		}
 		fmt.Fprintf(w, "\tlog:    %s%s\n", g.logs[0], more)
-		fmt.Fprintf(w, "\treplay: %s\n\tdebug:  %s\n", g.replay, g.debug)
-		fmt.Fprintf(w, "\tthe replay %s\n", verdict(g.status))
+		fmt.Fprintf(w, "\treplay: %s\n\tdebug:  %s\n", g.replay, s.debugLine(g))
+		if g.status != "reproduced" {
+			fmt.Fprintf(w, "\t%s\n", replayVerdict(g.status))
+		}
 		alsos := slices.SortedFunc(maps.Values(g.also), func(a, b *also) int { return cmp.Or(b.runs-a.runs, strings.Compare(a.sig, b.sig)) })
 		for i, a := range alsos {
-			if i == 20 {
-				fmt.Fprintf(w, "\tand %d other kinds of failure, each first in a log above\n", len(alsos)-i)
+			if i == 10 {
+				fmt.Fprintf(w, "\tand %d other kinds of failure, each first in a log above, whose first line replays it\n", len(alsos)-i)
 				break
 			}
 			fmt.Fprintf(w, "\talso in %d of these runs: %s (first in %s)\n", a.runs, a.sig, filepath.Base(a.log))
+			if a.replay != g.replay {
+				fmt.Fprintf(w, "\t\tits replay: %s\n", a.replay)
+			}
 		}
 	}
+}
+
+// faultLine describes the faults that fired in most of a group's runs, in
+// at least 3, and in a share of them at least 25 points above the share
+// of passing runs they fired in, most frequent first, as "SITE in N of M
+// (P% of passing runs)". s.mu must be held.
+func (s *search) faultLine(g *group) string {
+	type corr struct {
+		name       string
+		n          int
+		lift, pass float64
+	}
+	var cs []corr
+	for f, n := range g.faults {
+		share := float64(n) / float64(g.runs)
+		pass := 0.0
+		if s.passed > 0 {
+			pass = float64(s.passFaults[f]) / float64(s.passed)
+		}
+		if n >= 3 && 2*n >= g.runs && share-pass >= 0.25 && !strings.HasPrefix(f, "nemesis: a ") && f != "nemesis: overlapping faults" {
+			cs = append(cs, corr{strings.Replace(strings.TrimPrefix(f, "fault: "), "nemesis: ", "nemesis ", 1), n, share - pass, pass})
+		}
+	}
+	slices.SortFunc(cs, func(a, b corr) int {
+		return cmp.Or(b.n-a.n, cmp.Compare(b.lift, a.lift), strings.Compare(a.name, b.name))
+	})
+	var parts []string
+	for i, c := range cs {
+		if i == 3 {
+			break
+		}
+		p := "no run passed"
+		if s.passed > 0 {
+			p = fmt.Sprintf("%.0f%% of passing runs", 100*c.pass)
+		}
+		parts = append(parts, fmt.Sprintf("%s in %d of %d (%s)", c.name, c.n, g.runs, p))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // kindSummary prints how many runs failed each way, first or after
@@ -1322,7 +1742,7 @@ func (s *search) countAsserts(out []byte) {
 
 // sdkAsserts are the prefixes of the SDK's own assertions, which say what
 // faults and composer features runs reached.
-var sdkAsserts = []string{"nemesis: ", "compose: ", "node panicked: "}
+var sdkAsserts = []string{"fault: ", "nemesis: ", "compose: ", "node panicked: "}
 
 // assertSummary prints the sometimes and reachable assertions, those never
 // true first, and then on one line those of the SDK. s.mu must be held.
@@ -1333,6 +1753,9 @@ func (s *search) assertSummary(w io.Writer) {
 	var own []string
 	sdk := make([][]string, len(sdkAsserts))
 	for _, c := range cs {
+		if c.msg == setupAssert {
+			continue // a fallback when never true
+		}
 		i := slices.IndexFunc(sdkAsserts, func(p string) bool { return strings.HasPrefix(c.msg, p) })
 		switch {
 		case i >= 0:

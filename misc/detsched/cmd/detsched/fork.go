@@ -49,21 +49,37 @@ const (
 // system gives, which a harness with files on the real disk gives for
 // every later fork.
 const (
-	forkCgo   = 1
-	forkFiles = 9
+	forkCgo      = 1
+	forkNotM0    = 2
+	forkBusyM    = 3
+	forkPollFDs  = 4
+	forkSecurity = 8
+	forkFiles    = 9
 )
 
-var forkReasons = map[uint64]string{
-	forkCgo: "runtime.iscgo is set: the binary was built with cgo, or github.com/ebitengine/purego's internal/fakecgo sets it",
-	2:       "the P is not on the main thread",
-	3:       "an M that is locked to a goroutine, in a system call, or the template thread",
-	4:       "descriptors registered with the network poller",
-	5:       "already branched at this switch",
-	6:       "bad descriptors",
-	7:       "clone failed",
-	8:       "the system's certificate verifier was used, and its connection to trustd does not survive fork",
-	forkFiles: "the program uses the real file system (it has a file open, or created a file or directory), " +
-		"which forked runs would share with each other; put its files on a sim node's disk (see harness.md) for the search to fork",
+// forkReasons says why a program refused to fork, by the reason it gave,
+// and how to make it fork.
+var forkReasons = map[uint64]struct{ why, fix string }{
+	forkCgo:      {"runtime.iscgo is set: the binary was built with cgo, or github.com/ebitengine/purego's internal/fakecgo sets it", "drop the dependency that imports purego's internal/fakecgo (go list -deps finds it)"},
+	forkNotM0:    {"the P is not on the main thread", "keep goroutines out of long system calls and off locked threads where the search forks"},
+	forkBusyM:    {"a thread is locked to a goroutine or in a system call", "keep goroutines out of long system calls and off locked threads (runtime.LockOSThread) where the search forks"},
+	forkPollFDs:  {"descriptors are registered with the network poller (real pipes or sockets)", "close real pipes and sockets, or run the code on a sim node, whose network is simulated"},
+	5:            {"it already branched at this switch", "report it: it is detsched's bug"},
+	6:            {"bad descriptors", "report it: it is detsched's bug"},
+	7:            {"clone failed", "check the machine's limits on processes (ulimit -u)"},
+	forkSecurity: {"the system's certificate verifier was used, and its connection to trustd does not survive fork", "give TLS clients a fixed root pool (tls.Config.RootCAs), so that crypto/x509 does not call the system's verifier"},
+	forkFiles:    {"it uses the real file system (it has a file open, or created a file or directory, such as t.TempDir())", "put its files on a sim node's disk instead (sim.NewWorld, AddNode, Start)"},
+}
+
+// branchReasons maps the runtime's description of why a branch of a
+// composer timeline did not run (runtime.detForkWhy) to the reason.
+var branchReasons = map[string]uint64{
+	"cgo":                             forkCgo,
+	"the P is not on the main thread": forkNotM0,
+	"an M is locked to a goroutine, in a system call, or slow to park":         forkBusyM,
+	"descriptors are registered with the network poller":                       forkPollFDs,
+	"the system's certificate verifier was used":                               forkSecurity,
+	"it uses the real file system, which a fork would share with this process": forkFiles,
 }
 
 // errRefused is returned by branch when the program cannot fork.
@@ -71,7 +87,7 @@ type errRefused struct{ reason uint64 }
 
 func (e errRefused) Error() string {
 	if r, ok := forkReasons[e.reason]; ok {
-		return "fork refused: " + r
+		return "fork refused: " + r.why
 	}
 	return fmt.Sprintf("fork refused: reason %d", e.reason)
 }

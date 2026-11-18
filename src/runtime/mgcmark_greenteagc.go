@@ -797,7 +797,8 @@ func freeDeadSpanSPMCs() {
 func (w *gcWork) tryStealSpan() objptr {
 	pp := getg().m.p.ptr()
 
-	for enum := stealOrder.start(cheaprand()); !enum.done(); enum.next() {
+	// mcheaprand: in det mode, GC work must not shift the P's draws.
+	for enum := stealOrder.start(mcheaprand()); !enum.done(); enum.next() {
 		if !work.spanqMask.read(enum.position()) {
 			continue
 		}

@@ -82,8 +82,8 @@ import (
 //     the platter: the program reads what it wrote until a power failure
 //     empties the page cache.
 //
-// A harness for a system that treats a kind as fatal, as raft treats
-// failed writes to its stable store, disables it with buggify.Disable.
+// A harness for a system that treats a kind as fatal, such as one that
+// stops on a failed write to its log, disables it with buggify.Disable.
 
 type disk struct {
 	dev     uint64
@@ -132,7 +132,7 @@ func (d *disk) noSpace() bool {
 	if d.full || now() < d.fullUntil {
 		return true
 	}
-	if !calm() && buggify.OnChance("sim.disk.enospc", 0.001) {
+	if fault("sim.disk.enospc", "fault: sim.disk.enospc", 0.001) {
 		d.fullUntil = now() + 100e6 + int64(runtime_rand()%4900e6)
 		world.logEvent(d.nodeName(), "disk full (ENOSPC) for", strconv.FormatFloat(float64(d.fullUntil-now())/1e9, 'f', 3, 64)+"s")
 		return true
@@ -235,7 +235,7 @@ func (d *disk) wait(n *inode) {
 	if left := d.stallUntil - now(); left > 0 {
 		t += left
 	}
-	if !calm() && buggify.OnChance("sim.disk.slowsync", 0.01) {
+	if fault("sim.disk.slowsync", "fault: sim.disk.slowsync", 0.01) {
 		stall := logUniform(10*time.Millisecond, 5*time.Second)
 		world.logEvent(d.nodeName(), "slow sync", stall.Round(time.Millisecond).String())
 		t += int64(stall)
@@ -354,7 +354,7 @@ func cloneEnts(m map[string]*inode) map[string]*inode {
 // (fsyncgate).
 func (d *disk) sync(n *inode) uintptr {
 	d.wait(n)
-	if !n.dir && len(n.pending) > 0 && !calm() && buggify.OnChance("sim.disk.fsyncfail", 0.05) && !d.exempt(n) {
+	if !n.dir && len(n.pending) > 0 && !d.exempt(n) && fault("sim.disk.fsyncfail", "fault: sim.disk.fsyncfail", 0.05) {
 		world.logEvent(d.nodeName(), "fsync failed (EIO): unsynced writes stay readable, a power failure loses them")
 		n.pending = nil
 		n.errSeq++
@@ -362,6 +362,9 @@ func (d *disk) sync(n *inode) uintptr {
 		return uintptr(syscall.EIO)
 	}
 	d.fsync(n)
+	if !n.dir && world != nil && world.setup {
+		world.endSetup()
+	}
 	return 0
 }
 
@@ -1242,8 +1245,8 @@ func (w *World) fileCall(d *fdesc, trap uintptr, a [6]uintptr) (uintptr, uintptr
 		case _F_OFD_SETLK, _F_OFD_SETLKW:
 			// Linux's open file description locks belong to the
 			// open file, as flock's do, so two opens of a file in
-			// one process conflict; etcd relies on it to keep its
-			// purger from removing WAL files in use.
+			// one process conflict; a store may rely on it to keep
+			// a cleaner from removing log files in use.
 			switch fl := (*syscall.Flock_t)(ptr(a[2])); fl.Type {
 			case syscall.F_UNLCK:
 				delete(n.locks[lockOFD], f)
@@ -1316,12 +1319,13 @@ const (
 // conflicts reports whether an open file other than f holds a lock of
 // kind on n that conflicts with a shared, or with an exclusive, lock.
 func (n *inode) conflicts(f *openFile, kind int, excl bool) bool {
+	// No early return: the map's order depends on heap addresses, and
+	// the work done must not.
+	c := false
 	for o, ex := range n.locks[kind] {
-		if o != f && (ex || excl) {
-			return true
-		}
+		c = c || o != f && (ex || excl)
 	}
-	return false
+	return c
 }
 
 // lock takes a lock of kind on n for f, or reports EWOULDBLOCK if another
@@ -1355,7 +1359,7 @@ func (d *disk) readSectors(n *inode, off, end int64) uintptr {
 	if off >= end {
 		return 0
 	}
-	if !calm() && buggify.OnChance("sim.disk.readerror", 0.0005) {
+	if fault("sim.disk.readerror", "fault: sim.disk.readerror", 0.0005) {
 		first, last := off/sectorSize, (end-1)/sectorSize
 		if s := first + int64(runtime_rand()%uint64(last-first+1)); !n.cached(s) {
 			if n.bad == nil {
@@ -1401,11 +1405,13 @@ func corrupt(wr pwrite) pwrite {
 		return wr
 	}
 	if len(wr.data) > 0 && buggify.OptIn("sim.disk.bitflip") && chance(0.001) {
+		injected("fault: sim.disk.bitflip")
 		wr.data = slices.Clone(wr.data)
 		i := runtime_rand() % uint64(len(wr.data))
 		wr.data[i] ^= 1 << (runtime_rand() % 8)
 	}
 	if buggify.OptIn("sim.disk.misdirect") && chance(0.0005) {
+		injected("fault: sim.disk.misdirect")
 		d := int64(1+runtime_rand()%4) * 4096
 		if runtime_rand()&1 == 0 && wr.off >= d {
 			d = -d

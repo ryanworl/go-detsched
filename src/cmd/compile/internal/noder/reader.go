@@ -1424,6 +1424,9 @@ func (r *reader) funcBody(fn *ir.Func) {
 		}
 		fn.Body = body
 		fn.Endlineno = r.pos()
+		if buildcfg.Experiment.DetSched {
+			fn.SetDetLeaf(ir.DetLeaf(body))
+		}
 	})
 
 	r.marker.WriteTo(fn)
@@ -3808,6 +3811,9 @@ func unifiedInlineCall(callerfn *ir.Func, call *ir.CallExpr, fn *ir.Func, inlInd
 
 			r.curfn.Body = r.stmts()
 			r.curfn.Endlineno = r.pos()
+			if buildcfg.Experiment.DetSched {
+				ir.DetInlLeaf[r.inlTreeIndex] = ir.DetLeaf(r.curfn.Body)
+			}
 		}
 
 		// TODO(mdempsky): This shouldn't be necessary. Inlining might

@@ -434,7 +434,9 @@ func rangeConvert(nrange *ir.RangeStmt, dst *types.Type, src, typeWord, srcRType
 //
 // where == for keys of map m is reflexive.
 func isMapClear(n *ir.RangeStmt) bool {
-	if base.Flag.N != 0 || base.Flag.Cfg.Instrumenting {
+	// Under GOEXPERIMENT=detsched, -N clears too, since a loop counts a
+	// tick on every iteration and the call none.
+	if base.Flag.N != 0 && !buildcfg.Experiment.DetSched || base.Flag.Cfg.Instrumenting {
 		return false
 	}
 
@@ -502,7 +504,8 @@ func mapClear(m, rtyp ir.Node) ir.Node {
 //
 // Parameters are as in walkRange: "for v1, v2 = range a".
 func arrayRangeClear(loop *ir.RangeStmt, v1, v2, a ir.Node) ir.Node {
-	if base.Flag.N != 0 || base.Flag.Cfg.Instrumenting {
+	// As in isMapClear.
+	if base.Flag.N != 0 && !buildcfg.Experiment.DetSched || base.Flag.Cfg.Instrumenting {
 		return nil
 	}
 

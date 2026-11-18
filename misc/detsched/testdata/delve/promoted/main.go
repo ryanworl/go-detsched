@@ -3,11 +3,10 @@
 // license that can be found in the LICENSE file.
 
 // Promoted has the shapes of two tracepoint traps, for the tests of the
-// bundled Delve in the directory above. As in bbolt's freelist, the
-// method AddReadonlyTXID of shared is promoted through the embedded
-// struct into array and hashMap, and calls through the interface go
-// through the compiler's wrappers (*array).AddReadonlyTXID and
-// (*hashMap).AddReadonlyTXID, into which it is inlined. And work, called
+// bundled Delve in the directory above. The method Record of base is
+// promoted through the embedded struct into list and index, and calls
+// through the interface go through the compiler's wrappers
+// (*list).Record and (*index).Record, into which it is inlined. And work, called
 // once by each of several goroutines, and depth, which calls itself, are
 // for conditional tracepoints whose returns must follow their entries.
 package main
@@ -17,26 +16,26 @@ import (
 	"sync"
 )
 
-type shared struct {
-	readonly []int
-}
-
-func (s *shared) AddReadonlyTXID(id int) {
-	s.readonly = append(s.readonly, id)
-}
-
-type array struct {
-	*shared
+type base struct {
 	ids []int
 }
 
-type hashMap struct {
-	*shared
+func (s *base) Record(id int) {
+	s.ids = append(s.ids, id)
+}
+
+type list struct {
+	*base
+	ids []int
+}
+
+type index struct {
+	*base
 	m map[int]int
 }
 
-type freelist interface {
-	AddReadonlyTXID(id int)
+type recorder interface {
+	Record(id int)
 }
 
 //go:noinline
@@ -53,9 +52,9 @@ func depth(n int) int {
 }
 
 func main() {
-	fls := []freelist{&array{shared: &shared{}}, &hashMap{shared: &shared{}}}
+	rs := []recorder{&list{base: &base{}}, &index{base: &base{}}}
 	for id := 1; id <= 4; id++ {
-		fls[id%2].AddReadonlyTXID(id)
+		rs[id%2].Record(id)
 	}
 
 	var wg sync.WaitGroup

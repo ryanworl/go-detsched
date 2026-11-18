@@ -438,7 +438,7 @@ func (w *World) udpRoute(src, dst *Node, dg dgram) {
 		if l.Drop > 0 && chance(l.Drop) {
 			return
 		}
-		if !calm() && buggify.OnChance("sim.net.udpdrop", 0.05) {
+		if fault("sim.net.udpdrop", "fault: sim.net.udpdrop", 0.05) {
 			return
 		}
 		if dg.tos != 0 {
@@ -449,7 +449,7 @@ func (w *World) udpRoute(src, dst *Node, dg dgram) {
 				dg.tos = 1
 			}
 		}
-		if dg.tos != 0 && !calm() && buggify.OnChance("sim.net.ecnce", 0.05) {
+		if dg.tos != 0 && fault("sim.net.ecnce", "fault: sim.net.ecnce", 0.05) {
 			dg.tos = 3
 		}
 		st := w.linkState(src, dst)
@@ -462,7 +462,7 @@ func (w *World) udpRoute(src, dst *Node, dg dgram) {
 		}
 	}
 	copies := 1
-	if src != dst && !calm() && buggify.OnChance("sim.net.udpdup", 0.02) {
+	if src != dst && fault("sim.net.udpdup", "fault: sim.net.udpdup", 0.02) {
 		copies = 2
 	}
 	for range copies {
@@ -503,7 +503,7 @@ func (w *World) udpLatency(a, b *Node) int64 {
 	for _, e := range w.linkState(a, b).slow {
 		d += normal(e.Mean, e.Dev)
 	}
-	if a != b && !calm() && buggify.OnChance("sim.net.udpreorder", 0.05) {
+	if a != b && fault("sim.net.udpreorder", "fault: sim.net.udpreorder", 0.05) {
 		d += int64(runtime_rand() % 50e6)
 	}
 	return d
