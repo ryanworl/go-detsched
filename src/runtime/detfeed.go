@@ -600,7 +600,7 @@ type detAssertion struct {
 	kind          uint8
 	n             uint8 // bytes of msg
 	trues, falses uint32
-	msg           [56]byte
+	msg           [120]byte
 }
 
 var detSDK struct {

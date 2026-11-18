@@ -40,3 +40,10 @@ func memory() (avail, total uint64) {
 	}
 	return total / 100 * uint64(level), total
 }
+
+// lowerPriority lowers our scheduling priority to nice 10, which the
+// programs we run inherit, so that a search that keeps every CPU busy
+// leaves the CPUs to the user's other work when it wants them.
+func lowerPriority() {
+	syscall.Setpriority(syscall.PRIO_PROCESS, 0, 10)
+}

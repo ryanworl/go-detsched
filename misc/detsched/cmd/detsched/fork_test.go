@@ -342,6 +342,9 @@ func TestSearchKinds(t *testing.T) {
 	if a == nil || len(first.also) != 1 || len(second.also) != 0 {
 		t.Fatalf("want the symptom in the first group only:\n%s", searchReport(s))
 	}
+	if k := s.kinds[failureKey(a.sig)]; k == nil || k.runs != a.runs || s.kinds[first.key].runs != first.runs {
+		t.Errorf("want the runs that failed each way counted:\n%s", searchReport(s))
+	}
 	b, err := os.ReadFile(a.log)
 	if err != nil || !bytes.Contains(b, []byte("\ndetsched: assertion failed: the rare symptom is absent map[")) {
 		t.Errorf("log of the symptom's first run %s: %v\n%.2000s", a.log, err, b)

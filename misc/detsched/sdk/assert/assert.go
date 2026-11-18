@@ -22,6 +22,8 @@ package assert
 import (
 	"fmt"
 	"sync/atomic"
+
+	"github.com/ryanworl/go-detsched/misc/detsched/sdk/internal/hook"
 )
 
 // Kinds of assertion, as the runtime numbers them (runtime/detfeed.go).
@@ -73,6 +75,9 @@ func report(kind int, cond bool, message string, details map[string]any) {
 	failed := kind == unreachable || !cond && (kind == always || kind == alwaysOrUnreachable)
 	if failed {
 		failures.Add(1)
+		if f := hook.AssertFailed; f != nil {
+			f(message)
+		}
 	}
 	d := ""
 	if failed && len(details) > 0 {

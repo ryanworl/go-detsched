@@ -15,7 +15,7 @@ For each failure signature, `detsched` prints the path of the run's log, the rep
 - its first lines, `# ` followed by the replay line, then `# ` followed by each of the run's failures;
 - the test's output, each failing assertion once, with its first failure's details and how many more times it failed (`detsched: assertion failed: MESSAGE DETAILS (and N more failures)`), and the failing branch (`detsched: branch K (GODETBRANCH=K runs it in place)`);
 - the trace line, `detsched: trace=0x... switches=N syncs=M`, which identifies the run;
-- the fault timeline, after the output on stderr: `sim: SECONDS NODE: EVENT` lines, from `world: new` to `world: close`, with every crash, power failure, restart, partition, pause, clock skip, and disk fault (failed fsyncs, sectors that went bad, a full disk), in seconds of virtual time;
+- the fault timeline, after the output on stderr: `sim: SECONDS NODE: EVENT` lines, from `world: new` to `world: close`, with every crash, power failure, restart, partition, pause, clock skip, and disk fault (failed fsyncs, sectors that went bad, a full disk), and the first failure of each assertion (`NODE: assertion failed: MESSAGE`, `world` for a goroutine of no node), in seconds of virtual time;
 - for a failure in a compose branch, two of each: the branch's output comes first, with its own fault timeline under `sim: fault timeline of branch K:`, then the timeline's, under `sim: fault timeline of the timeline (branch K's is above):`, which ends at the fork, before the branch's failure;
 - for a run stopped at the per-run timeout, every goroutine's stack. Goroutines of the simulation say their node, by name and start, and its state in the header, such as `goroutine 10 gp=0x... m=nil [waiting, node n1 (start 2) crashed]:`.
 

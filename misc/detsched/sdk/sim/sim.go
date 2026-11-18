@@ -87,6 +87,7 @@ import (
 	"time"
 
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/assert"
+	"github.com/ryanworl/go-detsched/misc/detsched/sdk/internal/hook"
 )
 
 // Config configures a World.
@@ -121,11 +122,12 @@ const (
 
 // World is a simulated network of nodes.
 type World struct {
-	cfg   Config
-	nodes []*Node
-	byIP  map[[4]byte]*Node
-	incs  map[int32]*incarnation // by node handle
-	quiet int64                  // no buggify faults before then (calm)
+	cfg    Config
+	nodes  []*Node
+	byIP   map[[4]byte]*Node
+	incs   map[int32]*incarnation // by node handle
+	failed map[string]bool        // assertions that failed, which the timeline shows
+	quiet  int64                  // no buggify faults before then (calm)
 
 	fds map[int]*fdesc
 
@@ -217,6 +219,7 @@ func NewWorld(cfg Config) *World {
 		events:   make(map[uint64]func()),
 		allConns: make(map[*conn]bool),
 		links:    make(map[[2]int]Link),
+		failed:   make(map[string]bool),
 	}
 	// Handling a message takes no simulated time, so without rounding
 	// two events almost never fall at the same instant, where the
@@ -233,8 +236,26 @@ func NewWorld(cfg Config) *World {
 	runtime_clock(true, 0)
 	runtime_onPanic(onPanic)
 	runtime_busyOn(true)
+	hook.AssertFailed = w.assertFailed
 	w.logEvent("world", "new")
 	return w
+}
+
+// assertFailed puts the first failure of each assertion in the fault
+// timeline, under the node whose goroutine failed it.
+func (w *World) assertFailed(msg string) {
+	name, first := "world", false
+	runtime_call(func() {
+		if first = !w.failed[msg]; first {
+			w.failed[msg] = true
+			if inc := w.incs[runtime_node()]; inc != nil {
+				name = inc.node.name
+			}
+		}
+	})
+	if first {
+		w.logEvent(name, "assertion failed:", msg)
+	}
 }
 
 // Close crashes every node that is up, freezing its goroutines, unmaps
@@ -256,6 +277,7 @@ func (w *World) Close() {
 	runtime_clock(false, 0)
 	runtime_onPanic(nil)
 	runtime_busyOn(false)
+	hook.AssertFailed = nil
 }
 
 // onPanic crashes the node of a goroutine that panicked, if the world's

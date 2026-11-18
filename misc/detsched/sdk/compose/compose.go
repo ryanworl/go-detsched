@@ -35,7 +35,11 @@
 //     its states rather than only from where it ends. The mean time
 //     between branches is drawn for each timeline from 2 to 30 seconds.
 //     The timeline also runs the terminal phase itself when its drive
-//     phase ends. A branch that fails fails the run, and the failure it
+//     phase ends. Once the timeline has failed, it forks no more
+//     branches, as each would fail the same way, so a symptom that only
+//     a terminal command checks is checked less often in a run that
+//     failed first some other way; check it in an Anytime command too to
+//     count it in every run. A branch that fails fails the run, and the failure it
 //     reports comes first in the output, with the GODETBRANCH setting
 //     that replays the branch in one process, as a debugger needs. For an
 //     Eventually command, the composer cancels the drivers' context,

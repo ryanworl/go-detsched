@@ -1,0 +1,21 @@
+Delve 1.27.2 loads the runtime's module data, which it needs to name the
+dynamic type of an interface, through the memory of the variable it is
+printing. For a variable held in registers, such as an argument of struct
+type, that memory holds only the variable, so printing an interface field
+of it failed with "error loading module data: read out of bounds" until
+some interface in memory had been printed. Read the process's memory.
+
+--- a/pkg/proc/bininfo.go
++++ b/pkg/proc/bininfo.go
+@@ -1564,6 +1564,11 @@
+ }
+ 
+ func (bi *BinaryInfo) getModuleData(mem MemoryReadWriter) ([]ModuleData, error) {
++	// The memory of a variable held in registers, such as an argument,
++	// holds only that variable, not runtime.firstmoduledata.
++	if cm, ok := mem.(*compositeMemory); ok {
++		mem = cm.realmem
++	}
+ 	if bi.moduleDataCache == nil {
+ 		var err error
+ 		bi.moduleDataCache, err = LoadModuleData(bi, mem)

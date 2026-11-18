@@ -105,6 +105,7 @@ func main() {
 	}
 	s.progress = os.Stderr
 	s.live = isTerminal(os.Stderr)
+	lowerPriority()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	if *duration > 0 {
@@ -118,6 +119,7 @@ func main() {
 	}()
 	err = s.run(ctx, *seeds)
 	s.summary(os.Stdout)
+	s.writeSummary()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "detsched: %v\n", err)
 		os.Exit(2)
@@ -162,6 +164,7 @@ type search struct {
 	slowFail   time.Duration // the longest failing run, timeouts aside
 	groups     []*group      // in order of first appearance
 	byKey      map[string]*group
+	kinds      map[string]*also // every kind of failure, first in its run or not, by key
 	arms       [numArms]arm
 	cells      []*cell      // the archive
 	lru        []*cell      // cells with stopped programs, least recently used first
@@ -234,6 +237,7 @@ func newSearch(pkg, bin, run string) (*search, error) {
 		timeout: 10 * time.Minute,
 		workers: runtime.NumCPU(),
 		byKey:   map[string]*group{},
+		kinds:   map[string]*also{},
 		roots:   map[int]bool{},
 		running: map[*liveRun]bool{},
 		claimed: map[int]bool{},
@@ -390,7 +394,7 @@ func (r *result) signature() string {
 	}
 	switch {
 	case line != nil:
-		return truncate(string(line), 200)
+		return truncate(string(line), 600)
 	case r.timedOut:
 		return "timeout"
 	}
@@ -416,7 +420,7 @@ func failureKey(sig string) string {
 func (r *result) failures() []string {
 	var lines []string
 	for _, line := range failureLine.FindAll(r.output, -1) {
-		if l := truncate(string(line), 200); !slices.Contains(lines, l) {
+		if l := truncate(string(line), 600); !slices.Contains(lines, l) {
 			lines = append(lines, l)
 		}
 	}
@@ -823,6 +827,10 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	g.runs++
 	counted := map[string]bool{g.key: true}
+	if s.kinds[g.key] == nil {
+		s.kinds[g.key] = &also{sig: g.sig}
+	}
+	s.kinds[g.key].runs++
 	var news []*also // kinds no run of the group had before
 	for _, line := range r.failures() {
 		k := failureKey(line)
@@ -830,6 +838,10 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 			continue // the timeline's report of its failed branch, whose failure comes first
 		}
 		counted[k] = true
+		if s.kinds[k] == nil {
+			s.kinds[k] = &also{sig: line}
+		}
+		s.kinds[k].runs++
 		if g.also[k] == nil {
 			g.also[k] = &also{sig: line}
 			news = append(news, g.also[k])
@@ -972,15 +984,18 @@ func (s *search) status() string {
 }
 
 // report prints the status line every second on a terminal, else every
-// 30 seconds, until the returned function is called.
+// 30 seconds, and writes the summary so far to a file every 30 seconds,
+// until the returned function is called.
 func (s *search) report() (stop func()) {
 	every := 30 * time.Second
 	if s.live {
 		every = time.Second
 	}
+	fmt.Fprintf(s.progress, "detsched: the summary so far is in %s, every 30 seconds\n", s.temp("summary"))
 	t := time.NewTicker(every)
 	done := make(chan bool)
 	go func() {
+		last := time.Now()
 		for {
 			select {
 			case <-done:
@@ -994,6 +1009,10 @@ func (s *search) report() (stop func()) {
 				fmt.Fprintln(s.progress, "detsched: "+s.status())
 			}
 			s.mu.Unlock()
+			if time.Since(last) >= 30*time.Second {
+				last = time.Now()
+				s.writeSummary()
+			}
 		}
 	}()
 	return func() {
@@ -1005,11 +1024,24 @@ func (s *search) report() (stop func()) {
 	}
 }
 
+// writeSummary writes the summary so far to the file "summary" in the
+// search's directory, replacing it whole.
+func (s *search) writeSummary() {
+	var b bytes.Buffer
+	s.summary(&b)
+	if os.WriteFile(s.temp("summary.new"), b.Bytes(), 0o666) == nil {
+		os.Rename(s.temp("summary.new"), s.temp("summary"))
+	}
+}
+
 // summary prints the counts, the search's mix, and every group.
 func (s *search) summary(w io.Writer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fmt.Fprintf(w, "detsched: %s: %s\n", s.pkg, s.status())
+	if len(s.vars) > 0 {
+		fmt.Fprintf(w, "detsched: the schedule depends on these variables of detsched's environment, which replay lines set: %s\n", strings.Join(s.vars, " "))
+	}
 	if s.unstable != "" {
 		fmt.Fprintf(w, "detsched: warning: %s\n", s.unstable)
 	}
@@ -1049,6 +1081,7 @@ func (s *search) summary(w io.Writer) {
 	}
 	fmt.Fprintf(w, "detsched: slowest passing run %v, slowest failing run %v; -timeout is %v\n", s.slowPass.Round(time.Millisecond), s.slowFail.Round(time.Millisecond), s.timeout)
 	s.assertSummary(w)
+	s.kindSummary(w)
 	for _, g := range s.groups {
 		// The heading leaves out the details, which are only the first
 		// run's.
@@ -1075,6 +1108,28 @@ func (s *search) summary(w io.Writer) {
 			}
 			fmt.Fprintf(w, "\talso in %d of these runs: %s (first in %s)\n", a.runs, a.sig, filepath.Base(a.log))
 		}
+	}
+}
+
+// kindSummary prints how many runs failed each way, first or after
+// another failure, when some run failed more than one way. s.mu must be
+// held.
+func (s *search) kindSummary(w io.Writer) {
+	if !slices.ContainsFunc(s.groups, func(g *group) bool { return len(g.also) > 0 }) {
+		return
+	}
+	ks := slices.SortedFunc(maps.Values(s.kinds), func(a, b *also) int { return cmp.Or(b.runs-a.runs, strings.Compare(a.sig, b.sig)) })
+	fmt.Fprintf(w, "detsched: runs that failed each way, first or after another failure:\n")
+	for i, k := range ks {
+		if i == 20 {
+			fmt.Fprintf(w, "\t(and %d more)\n", len(ks)-i)
+			break
+		}
+		msg := k.sig
+		if m := assertDetails.FindStringSubmatchIndex(msg); m != nil {
+			msg = msg[:m[2]]
+		}
+		fmt.Fprintf(w, "\t%d: %s\n", k.runs, msg)
 	}
 }
 
@@ -1131,7 +1186,7 @@ func (s *search) assertSummary(w io.Writer) {
 		}
 	}
 	if len(own) > 0 {
-		fmt.Fprintf(w, "detsched: sometimes and reachable assertions (one no run reached is not listed; messages are cut at 56 bytes):\n")
+		fmt.Fprintf(w, "detsched: sometimes and reachable assertions (one no run reached is not listed; messages are cut at 120 bytes):\n")
 		for i, l := range own {
 			if i == 40 {
 				fmt.Fprintf(w, "\t(and %d more)\n", len(own)-i)

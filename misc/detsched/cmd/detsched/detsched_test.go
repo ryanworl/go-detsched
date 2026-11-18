@@ -508,6 +508,11 @@ func TestSimBranchInline(t *testing.T) {
 	if !failure.MatchString(forked.stdout + forked.stderr) {
 		t.Errorf("the timeline's failure does not name branch %s and %s:\n%s%s", m[1], m[2], forked.stdout, forked.stderr)
 	}
+	// The branch's fault timeline says when its assertion failed.
+	branchErr, _, _ := strings.Cut(forked.stderr, "sim: fault timeline of the timeline")
+	if !regexp.MustCompile(`(?m)^sim: \d+\.\d{9} \S+: assertion failed: compose: `).MatchString(branchErr) {
+		t.Errorf("the branch's fault timeline has no line for its failure:\n%s", branchErr)
+	}
 	inline, _, err := runBin(bin, append(env, m[2])...)
 	if err != nil {
 		t.Fatal(err)

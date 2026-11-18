@@ -71,3 +71,19 @@ func readUint(file string) (uint64, error) {
 	}
 	return strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64) // fails for "max"
 }
+
+// lowerPriority lowers our scheduling priority to nice 10, which the
+// programs we run inherit, so that a search that keeps every CPU busy
+// leaves the CPUs to the user's other work when it wants them. Linux keeps
+// a nice value per thread, so it sets each of ours, twice in case one was
+// started meanwhile; threads started later inherit it.
+func lowerPriority() {
+	for range 2 {
+		tasks, _ := os.ReadDir("/proc/self/task")
+		for _, t := range tasks {
+			if tid, err := strconv.Atoi(t.Name()); err == nil {
+				syscall.Setpriority(syscall.PRIO_PROCESS, tid, 10)
+			}
+		}
+	}
+}
