@@ -11,6 +11,9 @@
 // restart to a checkpoint, a position and rewind; the JSON output mode;
 // the trace line at exit, unchanged by the breakpoints; and that the
 // runtime-counted hit count stops at the hit stock Delve's counting does.
+// On a small program of its own, promoted, they check that the hits of a
+// method inlined into compiler-generated wrappers name the method, and
+// that a conditional tracepoint's returns follow its condition.
 //
 // $DLV names the dlv to test; the default is dlv next to go. gate.bash
 // runs them when the tree has bin/dlv:
@@ -243,13 +246,13 @@ func TestExitTraceLine(t *testing.T) {
 // position, rewind, goroutines by node, all in the JSON mode.
 func TestCheckpointJSON(t *testing.T) {
 	f := findFailure(t)
-	// A switch halfway through the run, which every failure reaches.
-	m := regexp.MustCompile(` switches=(\d+)`).FindStringSubmatch(f.trace)
+	// A switch halfway through the run, from its trace line.
+	m := regexp.MustCompile(` switches=(\d+) `).FindStringSubmatch(f.trace)
 	if m == nil {
-		t.Fatalf("no switches in the trace line %q", f.trace)
+		t.Fatalf("no switch count in the trace line %q", f.trace)
 	}
-	n, _ := strconv.Atoi(m[1])
-	mid := fmt.Sprintf("s%d", n/2)
+	switches, _ := strconv.Atoi(m[1])
+	point := fmt.Sprintf("s%d", switches/2)
 	script := `break s simcompose.serve
 continue
 continue
@@ -265,10 +268,9 @@ clear s
 continue
 restart c1
 print detsched.tick
-restart MID
+restart ` + point + `
 exit
 `
-	script = strings.Replace(script, "MID", mid, 1)
 	out := runDlv(t, f, script, "--json")
 	defer func() {
 		if t.Failed() {
@@ -316,14 +318,14 @@ exit
 	}
 	// restart sN stops where the runtime's GODETSTOP=sN does.
 	var at string
-	for _, r := range byCmd["restart "+mid] {
+	for _, r := range byCmd["restart "+point] {
 		if r.str("event") == "stop" {
 			p := r.pos()
 			at = fmt.Sprintf("at t%s s%d k%d goroutine %d", p.str("t"), p.num("s"), p.num("k"), r.num("goroutine"))
 		}
 	}
-	if want := runtimeStop(t, f, mid); at != want {
-		t.Errorf("restart %s stopped %q, the runtime's GODETSTOP=%s %q", mid, at, mid, want)
+	if want := runtimeStop(t, f, point); at != want {
+		t.Errorf("restart %s stopped %q, the runtime's GODETSTOP=%s %q", point, at, point, want)
 	}
 	gs := byCmd["goroutines -with node server"]
 	if len(gs) != 1 || gs[0].str("event") != "goroutines" {
@@ -389,4 +391,67 @@ func TestRuntimeCountedHits(t *testing.T) {
 		t.Errorf("the runtime-counted breakpoint stopped at k%s, stock counting at k%s", ticks[true], ticks[false])
 	}
 	t.Logf("time.Now == %d on %s/%s: %v counted by the runtime, %v by Delve", n, runtime.GOOS, runtime.GOARCH, took[true].Round(time.Millisecond), took[false].Round(time.Millisecond))
+}
+
+// A tracepoint on a method promoted through an embedded struct, inlined
+// into the compiler's wrappers, names the method in each hit, with the
+// wrapper; and the returns of conditional tracepoints follow their
+// entries, across goroutines and recursive calls. promoted is a plain
+// program: this is Delve's, not detsched's.
+func TestInlinedAndReturns(t *testing.T) {
+	dlv := dlvPath(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "promoted")
+	if out, err := exec.Command("go", "build", "-o", bin, "./promoted").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	script := filepath.Join(dir, "script.dlv")
+	if err := os.WriteFile(script, []byte(`trace a main.(*shared).AddReadonlyTXID
+trace w main.work
+cond w i == 3
+trace d main.depth
+cond d n == 2
+continue
+exit
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(flags ...string) string {
+		args := append([]string{"exec", bin, "-r", "stdout:" + filepath.Join(dir, "prog.out"), "--init", script, "--allow-non-terminal-interactive=true"}, flags...)
+		out, err := exec.Command(dlv, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("dlv %q: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+
+	out := run()
+	inl := regexp.MustCompile(`(?m)^> goroutine\(\d+\): \[a\] main\.\(\*shared\)\.AddReadonlyTXID\(.*, \d\) \(inlined in main\.\(\*(array|hashMap)\)\.AddReadonlyTXID\)$`)
+	if n := len(inl.FindAllString(out, -1)); n != 4 {
+		t.Errorf("got %d hit lines naming (*shared).AddReadonlyTXID and its wrapper, want 4:\n%s", n, out)
+	}
+	for _, f := range []struct{ name, entry string }{{"work", `\[w\] main\.work\(3\)`}, {"depth", `\[d\] main\.depth\(2\)`}} {
+		entries := regexp.MustCompile(`(?m)^> goroutine\((\d+)\): `+f.entry+`$`).FindAllStringSubmatch(out, -1)
+		returns := regexp.MustCompile(`(?m)^>> goroutine\((\d+)\): main\.`+f.name+` => `).FindAllStringSubmatch(out, -1)
+		if len(entries) != 1 || len(returns) != 1 || entries[0][1] != returns[0][1] {
+			t.Errorf("%s: got entries %q and returns %q, want one of each on the same goroutine:\n%s", f.name, entries, returns, out)
+		}
+	}
+
+	var inlined, rets int
+	for _, r := range parseJSON(t, run("--json")) {
+		switch r.str("event") {
+		case "trace":
+			if r.str("bp") == "a" && (r.str("func") != "main.(*shared).AddReadonlyTXID" || !strings.HasSuffix(r.str("inlined_in"), ").AddReadonlyTXID")) {
+				t.Errorf("JSON hit of a: %v", r)
+			} else if r.str("bp") == "a" {
+				inlined++
+			}
+		case "return":
+			rets++
+		}
+	}
+	if inlined != 4 || rets != 2 {
+		t.Errorf("dlv --json: %d hits of a with inlined_in, want 4; %d returns, want 2", inlined, rets)
+	}
 }

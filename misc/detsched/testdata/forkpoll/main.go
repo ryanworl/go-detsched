@@ -3,7 +3,8 @@
 // license that can be found in the LICENSE file.
 
 // Forkpoll keeps a pipe registered with the network poller open in the
-// middle of its run, which fork mode must refuse to fork.
+// middle of its run, then a regular file, and fork mode must refuse to
+// fork while either is open.
 package main
 
 import (
@@ -25,6 +26,18 @@ func main() {
 	}
 	r.Close()
 	w.Close()
+	for range 50 {
+		runtime.Gosched()
+	}
+	f, err := os.CreateTemp("", "forkpoll")
+	if err != nil {
+		panic(err)
+	}
+	defer os.Remove(f.Name())
+	for range 50 {
+		runtime.Gosched()
+	}
+	f.Close()
 	for range 50 {
 		runtime.Gosched()
 	}

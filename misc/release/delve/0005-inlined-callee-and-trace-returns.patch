@@ -1,0 +1,371 @@
+pkg/proc, pkg/terminal: name the inlined function in hits; returns follow the condition
+
+A breakpoint on a function inlined into another, such as a method
+promoted through an embedded struct and inlined into the compiler's
+wrappers ((*shared).AddReadonlyTXID in (*array).AddReadonlyTXID), stops
+in the caller's code, and every hit line named the caller: a tracepoint
+on (*shared).AddReadonlyTXID printed "(*array).AddReadonlyTXID(...)",
+which reads as a hit of another function. api.Thread.Inlined now carries
+the function inlined where the thread stopped, and hit and stop lines
+name it, followed by the function it was inlined into:
+
+	> goroutine(1): [a] main.(*shared).AddReadonlyTXID(...) (inlined in main.(*hashMap).AddReadonlyTXID)
+
+In the JSON output, "func" is the inlined function and "inlined_in" the
+caller.
+
+The breakpoints a tracepoint sets on its function's returns had no
+condition, so a conditional tracepoint printed a return line for every
+call, also those whose entry did not pass the condition. A return
+breakpoint now belongs to its tracepoint (api.Breakpoint.TraceReturnOf),
+which records for each call, by goroutine and frame, whether its entry
+stopped, and the return stops only if it did, so returns follow the
+condition, also for recursive calls and many goroutines.
+
+Both are generic fixes for upstream Delve; the JSON field is for the
+output mode of 0003.
+
+diff --git a/pkg/proc/breakpoints.go b/pkg/proc/breakpoints.go
+index a29cdb3..63b14f2 100644
+--- a/pkg/proc/breakpoints.go
++++ b/pkg/proc/breakpoints.go
+@@ -307,6 +307,9 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
+ 		bpstate.CondError = condErr
+ 	}
+ 	if !active {
++		if lbp := bpstate.Breakpoint.Logical; breaklet.Kind == UserBreakpoint && lbp != nil && lbp.traceCalls != nil {
++			lbp.traceEntered(tgt, thread, condErr != nil)
++		}
+ 		return
+ 	}
+ 
+@@ -315,6 +318,10 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
+ 		var goroutineID int64
+ 		lbp := bpstate.Breakpoint.Logical
+ 		if lbp != nil {
++			if lbp.traceEntry != nil && !lbp.traceReturned(tgt, thread) {
++				active = false
++				break
++			}
+ 			if g, err := GetG(thread); err == nil {
+ 				goroutineID = g.ID
+ 				lbp.HitCount[goroutineID]++
+@@ -325,6 +332,9 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
+ 			}
+ 		}
+ 		active = checkHitCond(lbp, goroutineID)
++		if lbp != nil && lbp.traceCalls != nil {
++			lbp.traceEntered(tgt, thread, active)
++		}
+ 
+ 	case StepBreakpoint, NextBreakpoint, NextDeferBreakpoint:
+ 		nextDeferOk := true
+@@ -1216,6 +1226,13 @@ type LogicalBreakpoint struct {
+ 	// det is set while the runtime of a detsched program counts the
+ 	// breakpoint's hits; see detsched.go.
+ 	det *detWatchState
++
++	// TraceReturnOf is the ID of the tracepoint a breakpoint on a
++	// function's returns belongs to, whose condition its returns follow;
++	// see tracereturn.go.
++	TraceReturnOf int
++	traceEntry    *LogicalBreakpoint
++	traceCalls    map[traceCall]bool // of a tracepoint with returns: whether each call's entry stopped
+ }
+ 
+ // SetBreakpoint describes how a breakpoint should be set.
+diff --git a/pkg/proc/target_group.go b/pkg/proc/target_group.go
+index 930b132..ba48cd5 100644
+--- a/pkg/proc/target_group.go
++++ b/pkg/proc/target_group.go
+@@ -87,6 +87,9 @@ func Restart(grp, oldgrp *TargetGroup, discard func(*LogicalBreakpoint, error))
+ 		bp.HitCount = make(map[int64]uint64)
+ 		bp.Set.PidAddrs = nil // breakpoints set through a list of addresses can not be restored after a restart
+ 		bp.det = nil
++		if bp.traceCalls != nil {
++			bp.traceCalls = map[traceCall]bool{}
++		}
+ 		if bp.enabled {
+ 			toenable = append(toenable, bp)
+ 		}
+diff --git a/pkg/proc/tracereturn.go b/pkg/proc/tracereturn.go
+new file mode 100644
+index 0000000..d47af1a
+--- /dev/null
++++ b/pkg/proc/tracereturn.go
+@@ -0,0 +1,72 @@
++package proc
++
++// The returns of a traced function follow the condition of its
++// tracepoint: a breakpoint on the function's returns, linked to the
++// tracepoint with SetTraceEntry, stops only at the return of a call whose
++// entry the tracepoint stopped at. Calls are told apart by goroutine and
++// frame (its canonical frame address), so that recursive calls and calls
++// on many goroutines pair up.
++
++// traceCall is a call of a traced function: its goroutine (0 on a
++// system stack, or before the runtime set up goroutines) and frame.
++type traceCall struct {
++	goid int64
++	cfa  int64
++}
++
++// SetTraceEntry makes lbp, a breakpoint on the returns of a function,
++// stop only at the returns of the calls whose entry the tracepoint entry
++// stopped at.
++func (lbp *LogicalBreakpoint) SetTraceEntry(entry *LogicalBreakpoint) {
++	lbp.TraceReturnOf = entry.LogicalID
++	lbp.traceEntry = entry
++	if entry.traceCalls == nil {
++		entry.traceCalls = map[traceCall]bool{}
++	}
++}
++
++// traceCallOf returns the call that thread, stopped at a breakpoint of a
++// function's entry or return, is in, and whether it is in the function
++// itself rather than in a copy inlined into another, whose returns no
++// breakpoint stops at.
++func traceCallOf(tgt *Target, thread Thread) (traceCall, bool) {
++	frames, err := ThreadStacktrace(tgt, thread, 0)
++	if err != nil || len(frames) == 0 || frames[0].Inlined {
++		return traceCall{}, false
++	}
++	c := traceCall{cfa: frames[0].Regs.CFA}
++	if g, err := GetG(thread); err == nil && g != nil {
++		c.goid = g.ID
++	}
++	return c, true
++}
++
++// traceEntered records whether the tracepoint lbp stopped at the entry of
++// the call thread is in. A call whose entry did not stop also replaces
++// what an earlier call in the same frame left, such as one that never
++// returned because it panicked.
++func (lbp *LogicalBreakpoint) traceEntered(tgt *Target, thread Thread, stopped bool) {
++	if lbp == nil || lbp.traceCalls == nil {
++		return
++	}
++	if c, ok := traceCallOf(tgt, thread); ok {
++		lbp.traceCalls[c] = stopped
++	}
++}
++
++// traceReturned reports whether lbp, a breakpoint on a function's
++// returns, stops at the return thread is at: whether the tracepoint it
++// belongs to stopped at the call's entry.
++func (lbp *LogicalBreakpoint) traceReturned(tgt *Target, thread Thread) bool {
++	entry := lbp.traceEntry
++	if entry == nil || entry.traceCalls == nil {
++		return true
++	}
++	c, ok := traceCallOf(tgt, thread)
++	if !ok {
++		return true
++	}
++	stopped := entry.traceCalls[c]
++	delete(entry.traceCalls, c)
++	return stopped
++}
+diff --git a/pkg/terminal/command.go b/pkg/terminal/command.go
+index cf60955..9e76df3 100644
+--- a/pkg/terminal/command.go
++++ b/pkg/terminal/command.go
+@@ -2081,10 +2081,11 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
+ 			}
+ 			for j := range addrs {
+ 				_, err = t.client.CreateBreakpoint(&api.Breakpoint{
+-					Addr:        addrs[j],
+-					TraceReturn: true,
+-					Line:        -1,
+-					LoadArgs:    &ShortLoadConfig,
++					Addr:          addrs[j],
++					TraceReturn:   true,
++					TraceReturnOf: created[i].ID,
++					Line:          -1,
++					LoadArgs:      &ShortLoadConfig,
+ 				})
+ 				if err != nil {
+ 					return nil, err
+@@ -2892,7 +2893,7 @@ func printcontext(t *Term, state *api.DebuggerState) {
+ 			}
+ 		}
+ 		if th == nil {
+-			printcontextLocation(t, state.SelectedGoroutine.CurrentLoc, "")
++			printcontextLocation(t, state.SelectedGoroutine.CurrentLoc, "", "")
+ 			return
+ 		}
+ 	}
+@@ -2914,8 +2915,8 @@ func printcontext(t *Term, state *api.DebuggerState) {
+ 	}
+ }
+ 
+-func printcontextLocation(t *Term, loc api.Location, pos string) {
+-	fmt.Fprintf(t.stdout, "> %s() %s:%d (PC: %#v)%s\n", loc.Function.Name(), t.formatPath(loc.File), loc.Line, loc.PC, pos)
++func printcontextLocation(t *Term, loc api.Location, inl, pos string) {
++	fmt.Fprintf(t.stdout, "> %s()%s %s:%d (PC: %#v)%s\n", loc.Function.Name(), inl, t.formatPath(loc.File), loc.Line, loc.PC, pos)
+ 	if loc.Function != nil && loc.Function.Optimized {
+ 		fmt.Fprintln(t.stdout, optimizedFunctionWarning)
+ 	}
+@@ -2937,10 +2938,15 @@ func printcontextThread(t *Term, th *api.Thread) {
+ 		t.jsonThread(th)
+ 		return
+ 	}
+-	fn := th.Function
++	// In inlined code, the inlined function, which a breakpoint on it was
++	// set on, and the function it was inlined into.
++	fn, inl := th.Function, ""
++	if th.Inlined != nil {
++		fn, inl = th.Inlined, fmt.Sprintf(" (inlined in %s)", th.Function.Name())
++	}
+ 
+ 	if th.Breakpoint == nil {
+-		printcontextLocation(t, api.Location{PC: th.PC, File: th.File, Line: th.Line, Function: th.Function}, posSuffix(th))
++		printcontextLocation(t, api.Location{PC: th.PC, File: th.File, Line: th.Line, Function: fn}, inl, posSuffix(th))
+ 		printReturnValues(t, th)
+ 		return
+ 	}
+@@ -2975,15 +2981,16 @@ func printcontextThread(t *Term, th *api.Thread) {
+ 	}
+ 
+ 	if th.Breakpoint.Tracepoint || th.Breakpoint.TraceReturn {
+-		printTracepoint(t, th, bpname, fn, args, hasReturnValue)
++		printTracepoint(t, th, bpname, fn, inl, args, hasReturnValue)
+ 		return
+ 	}
+ 
+ 	if hitCount, ok := th.Breakpoint.HitCount[strconv.FormatInt(th.GoroutineID, 10)]; ok {
+-		fmt.Fprintf(t.stdout, "> %s%s(%s) %s:%d (hits goroutine(%d):%d total:%d) (PC: %#v)%s\n",
++		fmt.Fprintf(t.stdout, "> %s%s(%s)%s %s:%d (hits goroutine(%d):%d total:%d) (PC: %#v)%s\n",
+ 			bpname,
+ 			fn.Name(),
+ 			args,
++			inl,
+ 			t.formatPath(th.File),
+ 			th.Line,
+ 			th.GoroutineID,
+@@ -2992,10 +2999,11 @@ func printcontextThread(t *Term, th *api.Thread) {
+ 			th.PC,
+ 			posSuffix(th))
+ 	} else {
+-		fmt.Fprintf(t.stdout, "> %s%s(%s) %s:%d (hits total:%d) (PC: %#v)%s\n",
++		fmt.Fprintf(t.stdout, "> %s%s(%s)%s %s:%d (hits total:%d) (PC: %#v)%s\n",
+ 			bpname,
+ 			fn.Name(),
+ 			args,
++			inl,
+ 			t.formatPath(th.File),
+ 			th.Line,
+ 			th.Breakpoint.TotalHitCount,
+@@ -3093,7 +3101,7 @@ func printBreakpointInfo(t *Term, th *api.Thread, tracepointOnNewline bool) {
+ 
+ }
+ 
+-func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, args string, hasReturnValue bool) {
++func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, inl, args string, hasReturnValue bool) {
+ 	if t.conf.TraceShowTimestamp {
+ 		fmt.Fprintf(t.stdout, "%s ", time.Now().Format(time.RFC3339Nano))
+ 	}
+@@ -3170,7 +3178,7 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, a
+ 				// Levels 3-4: Multi-line format - params on separate lines
+ 				fmt.Fprintf(t.stdout, "\n")
+ 			}
+-			fmt.Fprintf(t.stdout, "%s)%s\n", paramStr, posSuffix(th))
++			fmt.Fprintf(t.stdout, "%s)%s%s\n", paramStr, inl, posSuffix(th))
+ 
+ 		}
+ 
+@@ -3184,7 +3192,7 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, a
+ 			for _, v := range th.ReturnValues {
+ 				retVals = append(retVals, api.FormatTraceVariable(v, verbosity))
+ 			}
+-			fmt.Fprintf(t.stdout, "%s>> %s %s => (%s)%s\n", depthPrefix, tracePrefix, fn.Name(), strings.Join(retVals, ","), posSuffix(th))
++			fmt.Fprintf(t.stdout, "%s>> %s %s%s => (%s)%s\n", depthPrefix, tracePrefix, fn.Name(), inl, strings.Join(retVals, ","), posSuffix(th))
+ 		}
+ 	}
+ 	if th.Breakpoint.TraceFollowCalls > 0 {
+diff --git a/pkg/terminal/json.go b/pkg/terminal/json.go
+index 4df6b3f..09632ef 100644
+--- a/pkg/terminal/json.go
++++ b/pkg/terminal/json.go
+@@ -192,6 +192,11 @@ func (t *Term) jsonThread(th *api.Thread) {
+ 	if th.Position != nil {
+ 		rec["pos"] = jsonPos(th.Position)
+ 	}
++	if th.Inlined != nil {
++		// The inlined function, which a breakpoint on it was set on, and
++		// the function it was inlined into.
++		rec["func"], rec["inlined_in"] = th.Inlined.Name(), th.Function.Name()
++	}
+ 	if bp := th.Breakpoint; bp != nil {
+ 		switch {
+ 		case bp.TraceReturn:
+diff --git a/service/api/conversions.go b/service/api/conversions.go
+index d5ab836..82be88b 100644
+--- a/service/api/conversions.go
++++ b/service/api/conversions.go
+@@ -23,6 +23,7 @@ func ConvertLogicalBreakpoint(lbp *proc.LogicalBreakpoint) *Breakpoint {
+ 		Name:             lbp.Name,
+ 		Tracepoint:       lbp.Tracepoint,
+ 		TraceReturn:      lbp.TraceReturn,
++		TraceReturnOf:    lbp.TraceReturnOf,
+ 		Stacktrace:       lbp.Stacktrace,
+ 		Goroutine:        lbp.Goroutine,
+ 		Variables:        lbp.Variables,
+diff --git a/service/api/types.go b/service/api/types.go
+index 6525dfb..1e28694 100644
+--- a/service/api/types.go
++++ b/service/api/types.go
+@@ -116,6 +116,10 @@ type Breakpoint struct {
+ 	// TraceReturn flag signifying this is a breakpoint set at a return
+ 	// statement in a traced function.
+ 	TraceReturn bool `json:"traceReturn"`
++	// TraceReturnOf is, for a breakpoint on a function's returns, the ID of
++	// the tracepoint on its entry: it stops only at the returns of the
++	// calls whose entry the tracepoint stopped at.
++	TraceReturnOf int `json:"traceReturnOf,omitempty"`
+ 	// retrieve goroutine information
+ 	Goroutine bool `json:"goroutine"`
+ 	// number of stack frames to retrieve
+@@ -206,6 +210,13 @@ type Thread struct {
+ 	// CallReturn is true if ReturnValues are the return values of an injected call.
+ 	CallReturn bool
+ 
++	// Inlined is the function inlined into Function where the thread
++	// stopped, the innermost one when calls were inlined into each other,
++	// and nil when the thread is not in inlined code. File and Line are in
++	// Inlined. It is set for the current thread and the threads stopped at
++	// a breakpoint.
++	Inlined *Function `json:"inlined,omitempty"`
++
+ 	// Position is the position of a detsched run (GOEXPERIMENT=detsched)
+ 	// where the thread stopped, set for the current thread and the threads
+ 	// stopped at a breakpoint.
+diff --git a/service/debugger/debugger.go b/service/debugger/debugger.go
+index d911d2d..b0e5298 100644
+--- a/service/debugger/debugger.go
++++ b/service/debugger/debugger.go
+@@ -631,6 +631,14 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig, withBreakpointInfo bool) (
+ 			}
+ 		}
+ 
++		if th.Breakpoint != nil || thread.ThreadID() == tgt.CurrentThread().ThreadID() {
++			// The function inlined where the thread stopped, which a
++			// breakpoint on it, or a step into it, stops in.
++			if frames, err := proc.ThreadStacktrace(tgt, thread, 0); err == nil && len(frames) > 0 && frames[0].Inlined {
++				th.Inlined = api.ConvertFunction(frames[0].Call.Fn)
++			}
++		}
++
+ 		th.CallReturn = thread.Common().CallReturn
+ 		if retLoadCfg != nil {
+ 			th.ReturnValues = api.ConvertVars(thread.Common().ReturnValues(*retLoadCfg))
+@@ -952,6 +960,9 @@ func (d *Debugger) copyLogicalBreakpointInfo(lbp *proc.LogicalBreakpoint, reques
+ 	lbp.UserData = requested.UserData
+ 	lbp.RootFuncName = requested.RootFuncName
+ 	lbp.TraceFollowCalls = requested.TraceFollowCalls
++	if entry := d.target.LogicalBreakpoints[requested.TraceReturnOf]; requested.TraceReturn && entry != nil && entry.Tracepoint {
++		lbp.SetTraceEntry(entry)
++	}
+ 
+ 	return d.target.ChangeBreakpointCondition(lbp, requested.Cond, requested.HitCond, requested.HitCondPerG)
+ }

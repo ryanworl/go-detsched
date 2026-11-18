@@ -638,6 +638,8 @@ func TestSimPrograms(t *testing.T) {
 		// Before, its unwinding skipped to where the first panic had
 		// stopped looking for defers: "fatal error: unknown pc".
 		{pkg: "simpanicpanic", exit: 2, want: []string{"panic: on the node\n\tpanic: in OnPanic"}},
+		// Node.Down is closed when a node ends, every way it ends.
+		{pkg: "simdown", want: []string{"panic down", "kill down", "killprocess down", "stop down"}},
 		// A goroutine waiting for a mutex that a crashed node's sleeping
 		// goroutine holds gets it once the holder wakes and releases it.
 		{pkg: "simsharedlock", want: []string{"b took the lock"}},
@@ -1014,6 +1016,38 @@ func TestNonblockingStdio(t *testing.T) {
 		if got := newOutcome("", string(b), cmd.ProcessState.ExitCode()); got.trace != want.trace {
 			t.Errorf("%s: nonblocking standard descriptors: %s, blocking: %s", env, got.trace, want.trace)
 		}
+	}
+}
+
+// TestTempNames checks that a run whose temporary names are taken, as
+// they are while another run of its seed has its files, takes others of
+// the same length and keeps its schedule.
+func TestTempNames(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/tempname")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	env := []string{"GODETSEED=3", "TEMPNAME_DIR=" + t.TempDir()}
+	first, _, err := runBin(bin, env...)
+	if err != nil || first.exitCode != 0 {
+		t.Fatalf("first run: %v, %+v", err, first)
+	}
+	second, _, err := runBin(bin, env...)
+	if err != nil || second.exitCode != 0 {
+		t.Fatalf("second run: %v, %+v", err, second)
+	}
+	a, b := strings.Fields(first.stdout), strings.Fields(second.stdout)
+	if len(a) != 2 || len(b) != 2 {
+		t.Fatalf("output %q and %q, want two names each", first.stdout, second.stdout)
+	}
+	for i := range a {
+		if a[i] == b[i] || len(a[i]) != len(b[i]) {
+			t.Errorf("names %q then %q, want different names of the same length", a[i], b[i])
+		}
+	}
+	if first.trace != second.trace {
+		t.Errorf("with its names taken: %s, first: %s", second.trace, first.trace)
 	}
 }
 

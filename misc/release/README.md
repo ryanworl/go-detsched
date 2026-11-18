@@ -85,7 +85,10 @@ whether it is a generic fix for upstream Delve or specific to detsched:
   goroutines by node, `checkpoint`/`restart`/`rewind`, the trace line at
   `exit`, and the JSON output mode (generic but for its detsched fields);
 - `0004`: detsched: hit counts counted by the runtime
-  (`runtime.detDebug` in `src/runtime/detstop.go`).
+  (`runtime.detDebug` in `src/runtime/detstop.go`);
+- `0005`: generic: hit and stop lines name the inlined function and the
+  one it was inlined into, and a tracepoint's returns follow its
+  condition.
 
 To build dlv for this tree, `delve.bash bin/dlv`. To change the patches,
 copy Delve's module (`go mod download -json

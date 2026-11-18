@@ -363,6 +363,7 @@ type result struct {
 	newFeatures int    // features no run had recorded before
 	exitCode    int
 	timedOut    bool
+	hung        bool // stopped when the search ended, after mayHang said it may hang
 	wall        time.Duration
 	outOfMem    bool   // stopped because memory ran out
 	memAtStop   uint64 // the private memory it held then, if known
@@ -405,8 +406,9 @@ func (r *result) trace() string { return string(traceLine.Find(r.output)) }
 // signature returns the line that tells how the run failed: its first
 // assertion failure, panic, or fatal error (a branch of a composer
 // timeline that fails writes its output first, unless the timeline had
-// failed before it), else its first failing test, else "timeout" or its
-// exit status.
+// failed before it), else its first failing test, else "timeout", or
+// for a run the search's end stopped, which may hang, "still running when
+// the search ended", or its exit status.
 func (r *result) signature() string {
 	line := failureLine.Find(r.output)
 	if line == nil {
@@ -415,6 +417,8 @@ func (r *result) signature() string {
 	switch {
 	case line != nil:
 		return truncate(string(line), 600)
+	case r.hung:
+		return "still running when the search ended"
 	case r.timedOut:
 		return "timeout"
 	}
@@ -781,11 +785,17 @@ func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		syscall.Kill(-pgid, syscall.SIGKILL)
-		<-done
-		return nil, errCanceled
+		if !s.mayHang(start) {
+			syscall.Kill(-pgid, syscall.SIGKILL)
+			<-done
+			return nil, errCanceled
+		}
+		r.timedOut, r.hung = true, true
 	case <-timer.C:
 		r.timedOut = true
+	}
+	if r.timedOut {
+		// SIGQUIT, for the goroutines' stacks.
 		syscall.Kill(-pgid, syscall.SIGQUIT)
 		select {
 		case err = <-done:
@@ -1082,6 +1092,26 @@ func (s *search) printf(format string, args ...any) {
 	}
 }
 
+// hangLimit returns how long a run goes on before the search counts it
+// as one that may hang: 10 times the slowest pass, and at least 10 s, and
+// why, to print after it. s.mu must be held.
+func (s *search) hangLimit() (time.Duration, string) {
+	if limit := 10 * s.slowPass; limit >= 10*time.Second {
+		return limit, " (10 times the slowest pass)"
+	}
+	return 10 * time.Second, ""
+}
+
+// mayHang reports whether a run that started at start has gone on past
+// hangLimit. When the search ends, such a run is stopped with SIGQUIT and
+// recorded, with its stacks and replay line, rather than dropped.
+func (s *search) mayHang(start time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit, _ := s.hangLimit()
+	return time.Since(start) > limit
+}
+
 // status returns a line of counts, including the runs going on for over
 // 10 times as long as any run that passed, which may hang, so that they
 // show before -timeout stops them. s.mu must be held.
@@ -1091,10 +1121,7 @@ func (s *search) status() string {
 	if s.slowPass >= 5*time.Second {
 		line += fmt.Sprintf("; slowest passing run %v", s.slowPass.Round(time.Second))
 	}
-	limit, why := 10*s.slowPass, " (10 times the slowest pass)"
-	if limit < 10*time.Second {
-		limit, why = 10*time.Second, ""
-	}
+	limit, why := s.hangLimit()
 	slow, oldest := 0, time.Duration(0)
 	for l := range s.running {
 		if age := time.Since(l.start); !l.stopped && age > limit {

@@ -6,7 +6,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/atomic"
+	"unsafe"
+)
 
 // Fork mode for GOEXPERIMENT=detsched. See the comment above detFork.
 // detfork_linux.go and detfork_darwin.go have the system calls.
@@ -53,6 +56,7 @@ const (
 	detForkBadFDs      = 6 // the command did not carry the descriptors its flags call for
 	detForkCloneFailed = 7
 	detForkSecurity    = 8 // the system's certificate verifier was used (darwin)
+	detForkFiles       = 9 // regular files are open
 )
 
 // detForkInit sets s, GODETSEARCH's fork field, as the driver's control
@@ -173,6 +177,9 @@ func detForkCheck() uint64 {
 	if detFork.security {
 		return detForkSecurity
 	}
+	if atomic.Loadint32(&detFork.files) != 0 {
+		return detForkFiles
+	}
 	// An M that just gave up the P, such as one that handed it to a
 	// locked goroutine, is on its way to park; give it time to.
 	for try := 0; !detForkMsIdle(); try++ {
@@ -197,6 +204,8 @@ func detForkWhy(r uint64) string {
 		return "descriptors are registered with the network poller"
 	case detForkSecurity:
 		return "the system's certificate verifier was used"
+	case detForkFiles:
+		return "regular files are open, which a fork would share with this process"
 	}
 	return "unknown reason"
 }

@@ -7,6 +7,7 @@ package os
 import (
 	"errors"
 	"internal/bytealg"
+	"internal/goexperiment"
 	"internal/strconv"
 	_ "unsafe" // for go:linkname
 )
@@ -21,6 +22,30 @@ func runtime_rand() uint64
 
 func nextRandom() string {
 	return strconv.FormatUint(uint64(uint32(runtime_rand())), 10)
+}
+
+// runtime_detOSRand returns a random number from the OS under
+// GOEXPERIMENT=detsched, where runtime_rand's numbers come from the
+// seed. It is provided by the runtime.
+func runtime_detOSRand() uint64
+
+// retryRandom returns the random part of the name to try after the name
+// with random part prev exists. Under GOEXPERIMENT=detsched, runs of one
+// seed name their temporary files alike, so a run started while another
+// run of its seed still has its files gets one that exists. Its next name
+// then comes from the OS, at prev's width, rather than from the seed's
+// numbers, whose next draw would change everything the run does after.
+func retryRandom(prev string) string {
+	if !goexperiment.DetSched {
+		return nextRandom()
+	}
+	b := make([]byte, len(prev))
+	x := runtime_detOSRand()
+	for i := range b {
+		b[i] = byte('0' + x%10)
+		x /= 10
+	}
+	return string(b)
 }
 
 // CreateTemp creates a new temporary file in the directory dir,
@@ -44,11 +69,21 @@ func CreateTemp(dir, pattern string) (*File, error) {
 	prefix = joinPath(dir, prefix)
 
 	try := 0
+	r := nextRandom()
 	for {
-		name := prefix + nextRandom() + suffix
-		f, err := OpenFile(name, O_RDWR|O_CREATE|O_EXCL, 0600)
+		name := prefix + r + suffix
+		var f *File
+		var err error
+		if try == 0 || !goexperiment.DetSched {
+			f, err = OpenFile(name, O_RDWR|O_CREATE|O_EXCL, 0600)
+		} else {
+			// Not through testlog, whose check is a synchronization
+			// point the run would not have had (see retryRandom).
+			f, err = openFileNolog(name, O_RDWR|O_CREATE|O_EXCL, 0600)
+		}
 		if IsExist(err) {
 			if try++; try < 10000 {
+				r = retryRandom(r)
 				continue
 			}
 			return nil, &PathError{Op: "createtemp", Path: prefix + "*" + suffix, Err: ErrExist}
@@ -95,14 +130,16 @@ func MkdirTemp(dir, pattern string) (string, error) {
 	prefix = joinPath(dir, prefix)
 
 	try := 0
+	r := nextRandom()
 	for {
-		name := prefix + nextRandom() + suffix
+		name := prefix + r + suffix
 		err := Mkdir(name, 0700)
 		if err == nil {
 			return name, nil
 		}
 		if IsExist(err) {
 			if try++; try < 10000 {
+				r = retryRandom(r)
 				continue
 			}
 			return "", &PathError{Op: "mkdirtemp", Path: prefix + "*" + suffix, Err: ErrExist}

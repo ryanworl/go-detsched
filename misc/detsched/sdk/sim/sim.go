@@ -190,7 +190,15 @@ type incarnation struct {
 	nextEp uint16
 	// stopping is set once Stop ran the OnStop functions.
 	stopping bool
+	down     chan struct{} // closed when the incarnation ends
 }
+
+// closedChan is Down's channel for a node that is down.
+var closedChan = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
 
 // pid is the incarnation's process ID, which os.Getpid returns on its
 // goroutines: each start of a node is a new process. The real process ID
@@ -476,9 +484,11 @@ func (n *Node) Start(f func()) {
 	}
 	n.onStop = nil
 	var inc *incarnation
+	down := make(chan struct{})
 	runtime_call(func() {
 		nextHandle++
 		inc = &incarnation{
+			down:   down,
 			node:   n,
 			handle: nextHandle,
 			alive:  true,
@@ -499,8 +509,21 @@ func (n *Node) Start(f func()) {
 	goAs(inc, f)
 }
 
+// Down returns a channel that is closed when the node's current run ends,
+// however it ends: Kill, KillProcess, Stop, or a panic that Config.OnPanic
+// caught. While the node is down, the channel is closed already. A harness
+// that waits for a node it started to finish waits on it, since a crashed
+// node's goroutines never return.
+func (n *Node) Down() <-chan struct{} {
+	if inc := n.inc; inc != nil {
+		return inc.down
+	}
+	return closedChan
+}
+
 // Go runs f in a new goroutine that belongs to the node, if the node is
-// up, and reports whether it did. Use it to act as the node from outside,
+// up, and reports whether it did; on a node that is down, or was never
+// started, it runs nothing. Use it to act as the node from outside,
 // such as a test that calls into the node's code: if the node crashes, the
 // goroutine freezes with it.
 func (n *Node) Go(f func()) bool {
@@ -774,6 +797,7 @@ func (n *Node) crashAs(process bool, ev string) {
 		n.throttlePaused = false
 		runtime_crash(inc.handle)
 	})
+	close(inc.down)
 	if self {
 		runtime_halt()
 	}

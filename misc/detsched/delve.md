@@ -229,7 +229,10 @@ it answers "did the node lose power, and when" without a debugger.
 
 Harnesses create the `World` as the bubble starts, so the timeline's
 times are the `t` of the positions Delve prints, and `detsched.time` in
-expressions: the power failure at 9.408758544 is at `t9.408758544`. (With
+expressions: the power failure at 9.408758544 is at `t9.408758544`.
+Virtual time moves only when every goroutine of the bubble waits on a
+timer, so a run that never sleeps stays at `t0.000000000` throughout;
+order its events by `s` and `k`, which always move. (With
 a stock Delve, `print runtime.curg.bubble.now` gives the time in
 nanoseconds since the Unix epoch; a bubble starts at 2000-01-01 UTC,
 946684800000000000.) To look only at a window of the timeline, don't put
@@ -304,7 +307,7 @@ hits until 10.2s, and the third runs to the end without breakpoints. On
 testdata/simcompose, tracing `time.Now` from 10s to 12s this way, 645
 hits, takes 2.7s, and the two stops alone 0.15s. Use `clearall`, not
 `clear cand`: a tracepoint also sets breakpoints on the function's
-returns, which `clear` leaves behind.
+returns, which `clear` leaves behind, still trapping at every return.
 
 At a stop, `stack` shows `runtime.detStop`, `runtime.detStopFire`, and
 `runtime.detPreempt` on top of the code of the goroutine the stop line
@@ -405,7 +408,14 @@ refused anyway on optimized functions (`can not call optimized function`).
 - Read the line Delve prints when it sets a breakpoint. It names the
   function the address belongs to: a line inside a closure lands in
   `F.func1`, a line of an inlined function in its caller, and
-  `(multiple functions)` means several copies. `could not find statement`
+  `(multiple functions)` means several copies, such as a function
+  inlined into its callers or a method promoted through an embedded
+  struct and inlined into the compiler's wrappers. The bundled Delve's
+  hit and stop lines then name the function you asked for and the one it
+  was inlined into:
+  `> goroutine(1): [a] go.etcd.io/bbolt.(*shared).AddReadonlyTXID(...) (inlined in go.etcd.io/bbolt.(*array).AddReadonlyTXID)`
+  (in JSON, `func` and `inlined_in`). A stock Delve names only the
+  wrapper. `could not find statement`
   means the line has no code (a declaration, a constant, a line the
   compiler folded into another); pick a nearby line with a statement.
 - A breakpoint that never stops is a claim to check, not evidence that the
@@ -462,7 +472,11 @@ continue
 Each hit prints a line
 `> goroutine(16): [pf] github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.(*disk).powerFail(...) at t25.380001899 s4265 k128779`
 followed by one line per `on` action; lines starting with `>>` are the
-function's returns.
+function's returns. In the bundled Delve, returns follow the entry's
+condition: a return line prints only for a call whose entry printed,
+matched by goroutine and frame (a stock Delve prints every return). An
+inlined copy of the function has no return to break at, so its hits print
+no return line.
 
 - `on` takes one expression; add one `on` line per value.
 - Goroutine IDs are the same in every replay. Find the goroutine in one
@@ -686,8 +700,8 @@ that printed it:
 
 | event | printed by | fields besides `cmd` and `src` |
 | --- | --- | --- |
-| `trace` | a tracepoint hit | `bp`, `hits`, `goroutine`, `func`, `file`, `line`, `pc`, `pos`, and `args`, `vars` (one per `on ... print`), `stack`, `locals`, `goroutine_info` as its `on` actions ask |
-| `return` | a tracepoint's return | the same, with `ret` |
+| `trace` | a tracepoint hit | `bp`, `hits`, `goroutine`, `func`, `inlined_in` (the function `func` was inlined into, when it was), `file`, `line`, `pc`, `pos`, and `args`, `vars` (one per `on ... print`), `stack`, `locals`, `goroutine_info` as its `on` actions ask |
+| `return` | a tracepoint's return, only for a call whose entry passed the condition | the same, with `ret` |
 | `break` | a stop at a breakpoint | as `trace` |
 | `watch` | a stop at a watchpoint | as `trace`, with `expr` |
 | `stop` | a stop elsewhere (`next`, `step`, `restart` to a point, `rewind`) | `goroutine`, `func`, `file`, `line`, `pc`, `pos` |

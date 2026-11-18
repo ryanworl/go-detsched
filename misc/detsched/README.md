@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched18
+v=go1.27.4-detsched19
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -91,7 +91,11 @@ Flags, all optional:
   summary prints the slowest passing and failing runs to choose it from,
   with the slowest passing run's replay line when it took 5 seconds or more,
   and the progress line counts the runs going on for over 10 times as long
-  as the slowest passing run, which may hang, before `-timeout` stops them.
+  as the slowest passing run (and at least 10 seconds), which may hang,
+  before `-timeout` stops them. When the search is cut short (`-duration`,
+  SIGINT or SIGTERM) such runs are stopped with `SIGQUIT` too and grouped
+  as `still running when the search ended`, with their logs and replay
+  lines; shorter ones are dropped.
   When seed 1 passes, a forked run that makes 1000 times its goroutine
   switches is taken to spin and stopped sooner; the summary counts such runs
   apart, not as failures, with the replay line of one.
@@ -215,7 +219,8 @@ change seed 1's schedule, such as one a test reads to plant a bug, or
 `NO_COLOR`, which logging libraries read at init, which detsched finds by
 running seed 1 without groups of its variables, and every other variable
 the program read (the runtime records their names), unsetting with
-`env -u` those it read that detsched's environment did not have, so the
+`env -u` those it read that detsched's environment did not have (`TZ`,
+which package `time` reads, is the usual one), so the
 command runs the same in a new shell whatever that shell sets. Change
 nothing: another binary, other arguments
 (even `-test.v` or `-test.run`), or a line of debugging output added to the
@@ -256,10 +261,10 @@ change the run.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched18:
+and release N's version is v0.N.0, so with go1.27.4-detsched19:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.18.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.19.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -295,7 +300,10 @@ base address, the `math/rand` globals, `-test.shuffle=on`, and all
 cryptographic randomness, including `crypto/rand`) comes from `GODETSEED`, a
 decimal uint64. With `GODETSEED` set, as detsched sets it, the runtime also
 perturbs the schedule, prints a trace line at exit
-(`detsched: trace=... switches=... syncs=...`), and reports where the program
+(`detsched: trace=... switches=... syncs=...`: a hash of the schedule, the
+goroutine switches, and the synchronization points passed, such as lock,
+channel, and atomic operations, which a busy run counts in the hundreds of
+millions), and reports where the program
 leaves the deterministic subset. Without it, a program built with the
 experiment runs one unperturbed schedule of seed 0 and prints nothing extra.
 
@@ -343,12 +351,17 @@ fork while `runtime.iscgo` is set, which detsched's `CGO_ENABLED=0` build
 leaves unset unless a package sets it, as
 `github.com/ebitengine/purego/internal/fakecgo` does; during package
 initialization; while a goroutine is in a system call or locked to its
-thread; while a file is registered with the network poller; and on macOS
-once it has used the system's certificate verifier. detsched then runs
-without forking. Real files open across a fork
-share their offsets, locks, and shared mappings between processes, and
-subprocesses started before it are not the children's children, so a
+thread; while a file is registered with the network poller; while a
+regular file it opened with package `os` is open, since a fork would share
+its offset, locks, and shared mappings with the process it forked from; and
+on macOS once it has used the system's certificate verifier. detsched then
+runs without forking, and says why when it starts and in its summary.
+Subprocesses started before a fork are not the children's children, so a
 program that forks should keep to simulated files and start no processes.
+Runs of one seed name their temporary files alike (`os.MkdirTemp`,
+`os.CreateTemp`, `t.TempDir`); a run that finds its name taken, because
+another run of its seed is still going, takes a random one of the same
+length instead, which leaves its schedule unchanged.
 
 ## Simulating a cluster
 
@@ -444,7 +457,9 @@ it, so the replay command a failure prints shows the timeline again.
   new process ID: `os.Getpid` differs between nodes and between the
   incarnations of one), and `World.RemoveNode`, after which `World.ReAddNode`
   brings the node back with its disk unless `Node.WipeDisk` emptied it. A
-  crash freezes the node's goroutines where they are. Nodes share the
+  crash freezes the node's goroutines where they are, so a harness waits
+  for a node to end on `Node.Down()`, a channel closed when its current
+  run ends however it ends, rather than on a channel its code would close. Nodes share the
   process's memory, such as libraries' global state: a frozen goroutine
   that holds a `sync.Mutex` or `RWMutex` a live node waits for runs on, as
   a zombie whose system calls fail with `EIO`, until it releases it. So a

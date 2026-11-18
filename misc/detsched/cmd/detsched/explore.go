@@ -424,8 +424,9 @@ func (s *search) forkLaunch(ctx context.Context, a int, c *cell, seed uint64) (f
 var errGone = errors.New("the program ended before the cell")
 
 // isRefused reports whether err is a refusal to fork. A setup root that
-// refuses 10 times before any fork succeeded, or a refusal for cgo, which
-// every later fork would get too, makes the search stop forking.
+// refuses 10 times before any fork succeeded, or a refusal for cgo or
+// open files, which later forks would get too, makes the search stop
+// forking.
 func (s *search) isRefused(err error, root bool) bool {
 	var refused errRefused
 	if !errors.As(err, &refused) {
@@ -434,7 +435,7 @@ func (s *search) isRefused(err error, root bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refused++
-	if (root && !s.forked && s.refused >= 10 || refused.reason == forkCgo) && s.canFork {
+	if (root && !s.forked && s.refused >= 10 || refused.reason == forkCgo || refused.reason == forkFiles) && s.canFork {
 		s.canFork = false
 		s.refusal = refused.Error()
 		s.printf("detsched: the program refused to fork (%s), so the search runs fresh seeds without forking\n", s.refusal)
@@ -619,6 +620,9 @@ func (s *search) stopCell(ctx context.Context, c *cell, p *proc) error {
 	p.srv, p.pid, p.tape = srv, pid, c.tape
 	if c.at > 0 {
 		ok, err := s.runSrv(ctx, srv, pid, start, func() (bool, error) { return srv.run(c.at) })
+		if err == errHung {
+			err = errCanceled // only a run to a cell, whose output is not kept
+		}
 		if err == nil && !ok {
 			err = errGone
 		}
@@ -662,6 +666,9 @@ func (s *search) stopCell(ctx context.Context, c *cell, p *proc) error {
 		feature = f
 		return ok, err
 	})
+	if err == errHung {
+		err = errCanceled
+	}
 	if err == nil && !ok {
 		err = errGone
 	}
@@ -774,7 +781,8 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 		tape = p.tape + "," + tape
 	}
 	_, err = s.runSrv(ctx, child, pid, start, func() (bool, error) { return child.run(0) })
-	timedOut := errors.Is(err, os.ErrDeadlineExceeded)
+	hung := err == errHung
+	timedOut := errors.Is(err, os.ErrDeadlineExceeded) || hung
 	child.close()
 	p.mu.Lock()
 	_, werr := p.srv.wait(pid)
@@ -787,7 +795,7 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 	}
 	hits, _ := os.ReadFile(fb.Name())
 	output, size := readOutput(out.Name())
-	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, wall: time.Since(start)}
+	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, hung: hung, wall: time.Since(start)}
 	r.outOfMem, r.memAtStop = untrack()
 	var novelAt uint64
 	if len(hits) == len(s.seen)+32 {
@@ -933,20 +941,28 @@ func (s *search) guardMem(ctx context.Context) {
 	}
 }
 
+// errHung is runSrv's error for a run the search's end stopped after
+// mayHang said it may hang.
+var errHung = errors.New("still running when the search ended")
+
 // runSrv runs f, which waits for a reply from srv, within the run's
 // timeout from start, and stops process pid when it passes or ctx is
-// done. It then clears the deadline, since srv may be kept and serve
-// other runs.
+// done: with SIGQUIT, for its stacks, after the timeout or when the run
+// may hang (errHung), else with SIGKILL. It then clears the deadline,
+// since srv may be kept and serve other runs.
 func (s *search) runSrv(ctx context.Context, srv *forkServer, pid int, start time.Time, f func() (bool, error)) (bool, error) {
 	srv.conn.SetReadDeadline(start.Add(s.timeout))
 	stop := context.AfterFunc(ctx, func() { srv.conn.SetReadDeadline(time.Now()) })
 	ok, err := f()
 	if !stop() {
-		syscall.Kill(pid, syscall.SIGKILL)
-		return false, errCanceled
+		if !s.mayHang(start) {
+			syscall.Kill(pid, syscall.SIGKILL)
+			return false, errCanceled
+		}
+		err = errHung
 	}
 	srv.conn.SetReadDeadline(time.Time{})
-	if errors.Is(err, os.ErrDeadlineExceeded) {
+	if errors.Is(err, os.ErrDeadlineExceeded) || err == errHung {
 		syscall.Kill(pid, syscall.SIGQUIT)
 		go func() {
 			time.Sleep(10 * time.Second)

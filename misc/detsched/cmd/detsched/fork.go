@@ -45,8 +45,12 @@ const (
 )
 
 // forkCgo is the reason a program with runtime.iscgo set gives, for
-// every fork.
-const forkCgo = 1
+// every fork; forkFiles, the reason a program with regular files open
+// gives, which a harness that keeps a file open gives for every fork.
+const (
+	forkCgo   = 1
+	forkFiles = 9
+)
 
 var forkReasons = map[uint64]string{
 	forkCgo: "runtime.iscgo is set: the binary was built with cgo, or github.com/ebitengine/purego's internal/fakecgo sets it",
@@ -57,6 +61,8 @@ var forkReasons = map[uint64]string{
 	6:       "bad descriptors",
 	7:       "clone failed",
 	8:       "the system's certificate verifier was used, and its connection to trustd does not survive fork",
+	forkFiles: "the program has regular files open, which forked runs would share with each other; " +
+		"put them on a sim node's disk (see harness.md) for the search to fork",
 }
 
 // errRefused is returned by branch when the program cannot fork.

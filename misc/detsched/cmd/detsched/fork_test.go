@@ -207,7 +207,8 @@ func TestForkTree(t *testing.T) {
 }
 
 // TestForkRefused checks that a program with a file registered with the
-// network poller refuses to fork, and that it continues normally after.
+// network poller, or a regular file open, refuses to fork, and that it
+// continues normally after.
 func TestForkRefused(t *testing.T) {
 	bin, cleanup, err := build(config{}, "../../testdata/forkpoll")
 	if err != nil {
@@ -219,7 +220,8 @@ func TestForkRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.close()
-	var forked, refused int
+	var forked int
+	refused := map[uint64]int{}
 	for n := uint64(10); ; n += 10 {
 		ok, err := s.run(n)
 		if err != nil {
@@ -231,8 +233,8 @@ func TestForkRefused(t *testing.T) {
 		o, err := s.branchOutcome(1, 0)
 		var r errRefused
 		switch {
-		case errors.As(err, &r) && r.reason == 4:
-			refused++
+		case errors.As(err, &r) && (r.reason == 4 || r.reason == forkFiles):
+			refused[r.reason]++
 		case err != nil:
 			t.Fatalf("branch at %d: %v", n, err)
 		case o.exitCode != 0 || !strings.HasSuffix(o.stdout, "done\n"):
@@ -241,8 +243,8 @@ func TestForkRefused(t *testing.T) {
 			forked++
 		}
 	}
-	if forked == 0 || refused == 0 {
-		t.Errorf("forked %d times and refused %d times; want both", forked, refused)
+	if forked == 0 || refused[4] == 0 || refused[forkFiles] == 0 {
+		t.Errorf("forked %d times, refused %d times for a pipe and %d times for a file; want all three", forked, refused[4], refused[forkFiles])
 	}
 }
 
@@ -381,6 +383,37 @@ func TestSearchTimeout(t *testing.T) {
 	}
 	if s.arms[armCell].launches == 0 {
 		t.Errorf("no runs from cells:\n%s", searchReport(s))
+	}
+}
+
+// TestSearchHung checks that a run still going when the search ends,
+// after it may hang, is stopped for its stacks and recorded with a replay
+// line rather than dropped.
+func TestSearchHung(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	s, err := newSearch("../../testdata/hang", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.workers, s.only, s.noFork = 2, armFresh, true
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	if err := s.run(ctx, 0); err != nil {
+		t.Fatalf("%v\n%s", err, searchReport(s))
+	}
+	g := findGroup(s, "still running when the search ended")
+	if g == nil {
+		t.Fatalf("no group for runs still going:\n%s", searchReport(s))
+	}
+	if !strings.Contains(g.replay, "GODETSEED=") {
+		t.Errorf("replay line %q", g.replay)
+	}
+	log, err := os.ReadFile(g.logs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(log, []byte("main.main()")) {
+		t.Errorf("log has no stack of main.main:\n%s", log)
 	}
 }
 

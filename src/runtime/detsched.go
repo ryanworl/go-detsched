@@ -864,6 +864,42 @@ func syscall_detStartProcess(argv0 string) {
 	systemstack(func() { detStrictOS(what, gp) })
 }
 
+// os_runtime_detFileOpen counts fd, a regular file package os opened,
+// and reports whether it did: a forked child shares the file and its
+// offset with its parent and its siblings, so detForkCheck refuses to fork
+// while one is open. A simulated file is the simulation's, which forks
+// with the process.
+//
+//go:linkname os_runtime_detFileOpen os.runtime_detFileOpen
+func os_runtime_detFileOpen(fd int) bool {
+	if detsimFD(uintptr(fd)) {
+		return false
+	}
+	atomic.Xaddint32(&detFork.files, 1)
+	return true
+}
+
+// os_runtime_detOSRand returns a random number from the OS, for package
+// os to name a temporary file when the name the seed gave exists.
+//
+//go:linkname os_runtime_detOSRand os.runtime_detOSRand
+func os_runtime_detOSRand() uint64 {
+	var buf [8]byte
+	b := (*[8]byte)(noescape(unsafe.Pointer(&buf)))
+	if readRandom(b[:]) != len(b) {
+		readTimeRandom(b[:])
+	}
+	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
+		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+}
+
+// os_runtime_detFileClose uncounts a file os_runtime_detFileOpen counted.
+//
+//go:linkname os_runtime_detFileClose os.runtime_detFileClose
+func os_runtime_detFileClose() {
+	atomic.Xaddint32(&detFork.files, -1)
+}
+
 // syscall_detWrite stores p as output to fd 1 or 2 and returns len(p)
 // (or what the real write returned, after detOutputFlush). Only the
 // goroutine holding the single P calls it, so acquirem is enough to
@@ -1781,6 +1817,7 @@ var detFork struct {
 	lock     mutex  // held by the watchdog while it checks, and while forking
 	watchdog muintptr
 	pollOpen int32 // descriptors registered with the network poller
+	files    int32 // regular files package os has open (see os_runtime_detFileOpen)
 	security bool  // Security.framework was called (darwin); see detfork_darwin.go
 }
 

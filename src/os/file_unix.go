@@ -65,7 +65,15 @@ type file struct {
 	stdoutOrErr bool                    // whether this is stdout or stderr
 	appendMode  bool                    // whether file is opened for appending
 	inRoot      bool                    // whether file is opened in a Root
+	detFile     bool                    // whether the runtime counts this regular file (GOEXPERIMENT=detsched)
 }
+
+// runtime_detFileOpen counts fd, a regular file just opened, under
+// GOEXPERIMENT=detsched, and reports whether it did; the runtime does not
+// fork while a counted file is open. runtime_detFileClose uncounts one.
+// They are provided by the runtime.
+func runtime_detFileOpen(fd int) bool
+func runtime_detFileClose()
 
 // fd is the Unix implementation of Fd.
 func (f *File) fd() uintptr {
@@ -205,6 +213,15 @@ func newFile(fd int, name string, kind newFileKind, nonBlocking bool) *File {
 		}
 	}
 
+	if goexperiment.DetSched && kind == kindOpenFile {
+		var st syscall.Stat_t
+		if err := ignoringEINTR(func() error {
+			return syscall.Fstat(fd, &st)
+		}); err == nil && st.Mode&syscall.S_IFMT == syscall.S_IFREG {
+			f.detFile = runtime_detFileOpen(fd)
+		}
+	}
+
 	clearNonBlock := false
 	if pollable {
 		// The descriptor is already in non-blocking mode.
@@ -326,7 +343,11 @@ func (file *file) close() error {
 		info.close()
 	}
 	var err error
-	if e := file.pfd.Close(); e != nil {
+	e := file.pfd.Close()
+	if goexperiment.DetSched && file.detFile && e != poll.ErrFileClosing {
+		runtime_detFileClose() // the descriptor is closed, even after an error
+	}
+	if e != nil {
 		if e == poll.ErrFileClosing {
 			e = ErrClosed
 		}
