@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched13
+v=go1.27.4-detsched14
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -90,7 +90,9 @@ Flags, all optional:
   the seed itself.
 - `-exec binary` runs a prebuilt binary in the current directory instead of
   building a package, so that one job builds it and every shard runs the
-  same file, which replay lines then name. Build it as detsched does, from
+  same file. detsched runs a copy it keeps with the logs, which replay
+  lines name, so rebuilding the binary changes neither a search nor its
+  replay lines. Build it as detsched does, from
   the package's directory:
 
   ```
@@ -110,9 +112,13 @@ same arguments every time. Failing runs are grouped by their first assertion
 failure ([`sdk/assert`](#the-sdk)), panic, or fatal error, else their first
 failing test, with numbers masked and an assertion's details left out;
 detsched keeps the logs of the first ten runs of each group, group G's as
-`fail-G-1.log` to `fail-G-10.log`. Under each group, the summary lists the
-other failures its runs had (`also in N of these runs: ...`), such as the
-symptoms that followed the group's failure. A run keeps at most 16 MB of
+`fail-G-1.log` to `fail-G-10.log`. A log starts with the run's replay line
+and its failures, each after `# `. The summary's heading of a group gives
+the message without details, and the details of its first run on the next
+line. Under each group, the summary lists the other failures its runs had
+(`also in N of these runs: ... (first in fail-G-K.log)`), such as the
+symptoms that followed the group's failure, and detsched keeps the log of
+the first run with each, whose first line replays it. A run keeps at most 16 MB of
 its output, its first and last 8 MB, with a line where the rest was cut. A
 failure inside a branch of a [composer](#simulating-a-cluster) timeline is
 reported as that branch's failure: its log starts with the branch's output,
@@ -122,7 +128,10 @@ K:`), and goes on with the timeline's (`sim: fault timeline of the timeline
 
 The summary also lists the program's `assert.Sometimes` and
 `assert.Reachable` assertions with the runs each held in, those never true
-first, so that a search that passes still shows which paths it reached.
+first, so that a search that passes still shows which paths it reached,
+and on one line each, the runs that reached each fault of the nemesis and
+each feature of the composer. An assertion counts as reached in a run if
+the run or any branch it forked reached it.
 An assertion that no run reached is not listed.
 
 The first run, with seed 1, runs twice, and once more when the search
@@ -217,10 +226,10 @@ goroutine's stack there instead. It does not change the run.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched13:
+and release N's version is v0.N.0, so with go1.27.4-detsched14:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.13.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.14.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -229,8 +238,11 @@ build and pass with stock Go.
 
 - `assert`, after the Antithesis SDK: `Always`, `AlwaysOrUnreachable`,
   `Sometimes`, `Reachable`, and `Unreachable`, identified by their message.
-  Under the experiment, every failure is reported at exit as
-  `detsched: assertion failed: MESSAGE DETAILS`, a test during which an
+  Under the experiment, each failing assertion is reported once at exit,
+  with its first failure's details and how many more times it failed, as
+  `detsched: assertion failed: MESSAGE DETAILS (and N more failures)`; a
+  breakpoint on `runtime.detAssertFailed` stops at every failure. A test
+  during which an
   assertion failed fails too, so that its log is printed, and a run that
   would exit with status 0 exits with status 3. `assert.Failures` counts
   the failures so far, so a test can print its history after one.
@@ -475,8 +487,8 @@ it, so the replay command a failure prints shows the timeline again.
   disk faults (a node's syncs take 10 to 1000 times as long, or stall
   until the fault ends). It
   kills and stops nodes only with a `Restart` function. Faults come in
-  storms separated by calms, which end every fault and restart the nodes
-  the nemesis took down. Each run draws its longest storm (5s to 2m) and
+  storms separated by calms, which end every fault but clock skips, which
+  stay as an NTP step would, and restart the nodes the nemesis took down. Each run draws its longest storm (5s to 2m) and
   calm (2s to 30s), and one in 4 is a single storm. Each storm draws its
   length (from 2s), its intensity (a fault every 50ms to 5s, lasting 100ms
   to 20s, as many overlapping as that makes, with at most a minority of

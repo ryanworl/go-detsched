@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -327,6 +328,26 @@ func TestSearchSetup(t *testing.T) {
 	}
 }
 
+// TestSearchKinds checks that a search makes a group of the runs that fail
+// each assertion, whatever their details, and that a group lists another
+// assertion its runs fail with the log of the first run that failed it.
+func TestSearchKinds(t *testing.T) {
+	s := runSearch(t, "../../testdata/assertkinds", 300)
+	first := findGroup(s, "detsched: assertion failed: the first invariant holds")
+	second := findGroup(s, "detsched: assertion failed: the second invariant holds")
+	if len(s.groups) != 2 || first == nil || second == nil || first == second {
+		t.Fatalf("want a group for each invariant:\n%s", searchReport(s))
+	}
+	a := first.also[failureKey("detsched: assertion failed: the rare symptom is absent map[n:1]")]
+	if a == nil || len(first.also) != 1 || len(second.also) != 0 {
+		t.Fatalf("want the symptom in the first group only:\n%s", searchReport(s))
+	}
+	b, err := os.ReadFile(a.log)
+	if err != nil || !bytes.Contains(b, []byte("\ndetsched: assertion failed: the rare symptom is absent map[")) {
+		t.Errorf("log of the symptom's first run %s: %v\n%.2000s", a.log, err, b)
+	}
+}
+
 // TestSearchTimeout checks that a search runs on past -timeout, forking
 // stopped programs it keeps from before then.
 func TestSearchTimeout(t *testing.T) {
@@ -399,8 +420,8 @@ func TestSearchCompose(t *testing.T) {
 
 // TestSearchShard checks one shard of a search spread over machines: it
 // runs a prebuilt binary in the current directory, from fresh seeds past
-// -seed-base, and each failure's command replays it with that binary and
-// seed.
+// -seed-base, and each failure's command replays it with that seed and a
+// copy of the binary, which replays it after the binary is gone.
 func TestSearchShard(t *testing.T) {
 	t.Setenv("SIMCOMPOSE_BUG", "1")
 	t.Setenv("TMPDIR", t.TempDir())
@@ -427,12 +448,19 @@ func TestSearchShard(t *testing.T) {
 	for _, g := range s.groups {
 		m := seed.FindStringSubmatch(g.replay)
 		n, _ := strconv.ParseUint(m[1], 10, 64)
-		if n <= base+1 || n > base+100 || !strings.HasSuffix(g.replay, " "+bin) {
-			t.Errorf("%s: replay %s, want a seed from %d to %d and binary %s", g.sig, g.replay, base+2, base+100, bin)
+		if n <= base+1 || n > base+100 || !strings.HasSuffix(g.replay, " "+s.bin) || s.bin == bin {
+			t.Errorf("%s: replay %s, want a seed from %d to %d and a copy of %s", g.sig, g.replay, base+2, base+100, bin)
 		}
 		if g.status != "reproduced" {
 			t.Errorf("%s: the replay %s", g.sig, g.status)
 		}
+	}
+	if err := os.Remove(bin); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := exec.Command("sh", "-c", s.groups[0].replay).CombinedOutput()
+	if !strings.Contains(string(out), s.groups[0].sig) {
+		t.Errorf("with the binary removed, %s printed\n%s\nwant %s", s.groups[0].replay, out, s.groups[0].sig)
 	}
 }
 

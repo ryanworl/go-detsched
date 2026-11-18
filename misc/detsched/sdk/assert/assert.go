@@ -6,9 +6,11 @@
 // checks, after the Antithesis SDK's package of the same name. The message
 // identifies an assertion, so give each one a distinct, fixed message.
 //
-// With GOEXPERIMENT=detsched, the runtime reports every failure (an Always
-// that is false, an Unreachable that is reached) at exit, as a line
-// "detsched: assertion failed: MESSAGE DETAILS", by which detsched groups
+// With GOEXPERIMENT=detsched, the runtime reports each failing assertion
+// (an Always that is false, an Unreachable that is reached) once at exit,
+// with the details of its first failure and how many more times it
+// failed, as a line "detsched: assertion failed: MESSAGE DETAILS (and N
+// more failures)", by which detsched groups
 // failing runs, fails a test during which one failed, so that package
 // testing prints its log, and makes a run that would exit with status 0
 // exit with status 3. detsched's search also treats the first run that evaluates an

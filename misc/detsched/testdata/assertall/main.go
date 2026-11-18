@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Assertall fails several assertions, each with its own details, from
-// goroutines that take turns.
+// Assertall fails one assertion several times, each with its own details,
+// from goroutines that take turns, and then another.
 package main
 
 import (

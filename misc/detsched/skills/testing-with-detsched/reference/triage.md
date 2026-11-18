@@ -10,10 +10,10 @@
 
 ## What a failure gives you
 
-For each failure signature, `detsched` prints the path of the run's log, the replay line, and a `debug:` line that runs the replay under dlv, and says whether replaying it reproduced the failure. A signature is the message of a run's first assertion failure without its details, or its first panic or fatal error. Group G's logs are `fail-G-1.log` and on, in the search's directory with every other group's, and the summary lists under each group the other failures its runs had (`also in N of these runs: ...`), such as the symptoms of the group's failure. The log is the run's whole output, its first and last 8 MB if longer:
+For each failure signature, `detsched` prints the path of the run's log, the replay line, and a `debug:` line that runs the replay under dlv, and says whether replaying it reproduced the failure. A signature is the message of a run's first assertion failure without its details, or its first panic or fatal error. Group G's logs are `fail-G-1.log` and on, in the search's directory with every other group's. The group's heading has no details; the line under it gives its first run's, which other runs need not share. Under each group the summary lists the other failures its runs had, such as the symptoms of the group's failure, each with the log of the first run that had it: `also in N of these runs: MESSAGE DETAILS (first in fail-G-K.log)`. The log is the run's whole output, its first and last 8 MB if longer:
 
-- its first line, `# ` followed by the replay line;
-- the test's output, every assertion failure (`detsched: assertion failed: MESSAGE DETAILS`), and the failing branch (`detsched: branch K (GODETBRANCH=K runs it in place)`);
+- its first lines, `# ` followed by the replay line, then `# ` followed by each of the run's failures;
+- the test's output, each failing assertion once, with its first failure's details and how many more times it failed (`detsched: assertion failed: MESSAGE DETAILS (and N more failures)`), and the failing branch (`detsched: branch K (GODETBRANCH=K runs it in place)`);
 - the trace line, `detsched: trace=0x... switches=N syncs=M`, which identifies the run;
 - the fault timeline, after the output on stderr: `sim: SECONDS NODE: EVENT` lines, from `world: new` to `world: close`, with every crash, power failure, restart, partition, pause, clock skip, and disk fault (failed fsyncs, sectors that went bad, a full disk), in seconds of virtual time;
 - for a failure in a compose branch, two of each: the branch's output comes first, with its own fault timeline under `sim: fault timeline of branch K:`, then the timeline's, under `sim: fault timeline of the timeline (branch K's is above):`, which ends at the fork, before the branch's failure;

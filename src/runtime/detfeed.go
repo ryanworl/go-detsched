@@ -576,10 +576,11 @@ func detFeedEdgeLookup(a, b uintptr) *detLockEdge {
 // An assertion counts as a feedback feature, and a failure (an Always
 // that is false, an Unreachable that is reached) is reported at exit and
 // makes a run that would exit with status 0 exit with status 3. The
-// report gives every failure's message and details, one per line, each
-// cut to 512 bytes, up to 64 KiB in all, and then how many more failures
-// there were. The failures are kept in fixed buffers, so recording them
-// does not change the schedule.
+// report gives each failing assertion once, with the details of its first
+// failure, cut to 512 bytes, and how many more times it failed, up to
+// 64 KiB in all, and then how many more failures there were. The failures
+// are kept in fixed buffers, so recording them does not change the
+// schedule.
 
 // Kinds of assertion, the values detsched/sdk/assert passes.
 const (
@@ -606,12 +607,16 @@ var detSDK struct {
 	asserts  [256]detAssertion
 	failures int
 
-	// Every failure's message and details, each cut to 512 bytes, after
-	// its length in two bytes, and the failures they hold.
+	// Each failing assertion's message and first details, cut to 512
+	// bytes, after a header of detAllHeader bytes: their length and the
+	// message's in two bytes each, then how many more times it failed in
+	// four. allCount is the failures they hold, repeats included.
 	all      [64 << 10]byte
 	allN     int
 	allCount int
 }
+
+const detAllHeader = 8
 
 // detSDKFailure writes msg and details, separated by a space, to b, as
 // much as fits, and returns the length written.
@@ -631,14 +636,32 @@ func detSDKFailure(b []byte, msg, details string) int {
 //
 //go:noinline
 func detAssertFailed(msg, details string) {
-	if detSDK.allN+2 < len(detSDK.all) {
-		b := detSDK.all[detSDK.allN+2:]
-		k := detSDKFailure(b[:min(len(b), 512)], msg, details)
-		detSDK.all[detSDK.allN], detSDK.all[detSDK.allN+1] = byte(k), byte(k>>8)
-		detSDK.allN += 2 + k
-		detSDK.allCount++
-	}
 	detSDK.failures++
+	for i := 0; i < detSDK.allN; {
+		k := int(detSDK.all[i]) | int(detSDK.all[i+1])<<8
+		m := int(detSDK.all[i+2]) | int(detSDK.all[i+3])<<8
+		if m == min(len(msg), 512) && string(detSDK.all[i+detAllHeader:i+detAllHeader+m]) == msg[:m] {
+			c := detSDK.all[i+4 : i+8]
+			n := (uint32(c[0]) | uint32(c[1])<<8 | uint32(c[2])<<16 | uint32(c[3])<<24) + 1
+			c[0], c[1], c[2], c[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+			detSDK.allCount++
+			return
+		}
+		i += detAllHeader + k
+	}
+	// A failure that does not fit whole is only counted, so that no
+	// message is cut short but by the 512-byte limit.
+	need := min(len(msg)+1+len(details), 512)
+	if detSDK.allN+detAllHeader+need > len(detSDK.all) {
+		return
+	}
+	b := detSDK.all[detSDK.allN:]
+	k := detSDKFailure(b[detAllHeader:detAllHeader+need], msg, details)
+	m := min(len(msg), 512)
+	b[0], b[1], b[2], b[3] = byte(k), byte(k>>8), byte(m), byte(m>>8)
+	b[4], b[5], b[6], b[7] = 0, 0, 0, 0
+	detSDK.allN += detAllHeader + k
+	detSDK.allCount++
 }
 
 // testing_detAssertFailures returns how many assertions have failed, so
@@ -702,12 +725,21 @@ func detSDKAssert(kind int, cond bool, msg, details string) {
 func detSDKReport() {
 	for i := 0; i < detSDK.allN; {
 		k := int(detSDK.all[i]) | int(detSDK.all[i+1])<<8
+		c := detSDK.all[i+4 : i+8]
+		more := uint32(c[0]) | uint32(c[1])<<8 | uint32(c[2])<<16 | uint32(c[3])<<24
 		f := ""
 		if k > 0 {
-			f = slicebytetostringtmp(&detSDK.all[i+2], k)
+			f = slicebytetostringtmp(&detSDK.all[i+detAllHeader], k)
 		}
-		print("detsched: assertion failed: ", f, "\n")
-		i += 2 + k
+		switch more {
+		case 0:
+			print("detsched: assertion failed: ", f, "\n")
+		case 1:
+			print("detsched: assertion failed: ", f, " (and 1 more failure)\n")
+		default:
+			print("detsched: assertion failed: ", f, " (and ", more, " more failures)\n")
+		}
+		i += detAllHeader + k
 	}
 	if n := detSDK.failures - detSDK.allCount; n > 0 {
 		print("detsched: and ", n, " more assertion failures\n")

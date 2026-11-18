@@ -555,8 +555,9 @@ func TestSimBranchInline(t *testing.T) {
 	}
 }
 
-// TestAssertAll checks that the runtime reports every assertion failure of
-// testdata/assertall with its details, in order.
+// TestAssertAll checks that the runtime reports each failing assertion of
+// testdata/assertall once, in order, with its first details and how many
+// more times it failed.
 func TestAssertAll(t *testing.T) {
 	bin, cleanup, err := build(config{}, "../../testdata/assertall")
 	if err != nil {
@@ -569,7 +570,7 @@ func TestAssertAll(t *testing.T) {
 		t.Fatal(err)
 	}
 	var want []string
-	for _, w := range []string{"every item is valid map[item:0]", "every item is valid map[item:1]", "every item is valid map[item:2]", "the end is unreachable map[items:3]"} {
+	for _, w := range []string{"every item is valid map[item:0] (and 2 more failures)", "the end is unreachable map[items:3]"} {
 		want = append(want, "detsched: assertion failed: "+w)
 	}
 	if got := failed.FindAllString(o.stderr, -1); !slices.Equal(got, want) || o.exitCode != 3 || o.stdout != "done\n" {

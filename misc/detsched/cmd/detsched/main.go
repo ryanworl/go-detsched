@@ -215,6 +215,7 @@ type group struct {
 type also struct {
 	sig  string // its signature in the first run that had it
 	runs int
+	log  string // the log of that run
 }
 
 // keepLogs is how many logs of each group a search keeps.
@@ -241,13 +242,13 @@ func newSearch(pkg, bin, run string) (*search, error) {
 		only:    -1,
 	}
 	if bin != "" {
+		// Runs and replay lines use a copy, so that rebuilding the
+		// binary during or after the search changes neither.
 		s.pkg = bin
 		s.dir, err = os.Getwd()
 		if err == nil {
-			s.bin, err = filepath.Abs(bin)
-		}
-		if err == nil {
-			_, err = os.Stat(s.bin)
+			s.bin = filepath.Join(out, filepath.Base(bin))
+			err = copyFile(s.bin, bin)
 		}
 	} else {
 		s.dir, s.bin, err = buildPackage(pkg, out)
@@ -271,6 +272,15 @@ func goCmd() string {
 		}
 	}
 	return "go"
+}
+
+// copyFile copies the executable src to dst.
+func copyFile(dst, src string) error {
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, b, 0o755)
 }
 
 func isFile(name string) bool {
@@ -395,8 +405,8 @@ func (r *result) key() string { return failureKey(r.signature()) }
 
 // failureKey returns the key of a signature.
 func failureKey(sig string) string {
-	if m := assertDetails.FindStringIndex(sig); m != nil {
-		sig = sig[:m[0]]
+	if m := assertDetails.FindStringSubmatchIndex(sig); m != nil {
+		sig = sig[:m[2]]
 	}
 	return masked.ReplaceAllString(sig, "N")
 }
@@ -813,6 +823,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	g.runs++
 	counted := map[string]bool{g.key: true}
+	var news []*also // kinds no run of the group had before
 	for _, line := range r.failures() {
 		k := failureKey(line)
 		if counted[k] || branchWrapper.MatchString(line) {
@@ -821,13 +832,19 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		counted[k] = true
 		if g.also[k] == nil {
 			g.also[k] = &also{sig: line}
+			news = append(news, g.also[k])
 		}
 		g.also[k].runs++
 	}
+	// The group keeps its first runs' logs, and the log of the first run
+	// of each other kind of failure.
 	var log string
-	if len(g.logs) < keepLogs {
+	if len(g.logs) < keepLogs || len(news) > 0 {
 		log = s.temp(fmt.Sprintf("fail-%d-%d.log", g.index, len(g.logs)+1))
 		g.logs = append(g.logs, log)
+	}
+	for _, a := range news {
+		a.log = log
 	}
 	if first {
 		s.printf("FAIL %s\n\tlog:    %s\n\treplay: %s\n\tdebug:  %s\n", g.sig, log, g.replay, g.debug)
@@ -838,7 +855,12 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		s.mu.Lock()
 		line := s.replayLine(r, false)
 		s.mu.Unlock()
-		data := append([]byte("# "+line+"\n"), r.output...)
+		// The failures head the log, which may be long.
+		head := "# " + line + "\n"
+		for _, f := range r.failures() {
+			head += "# " + f + "\n"
+		}
+		data := append([]byte(head), r.output...)
 		if err := os.WriteFile(log, data, 0o666); err != nil {
 			return err
 		}
@@ -1028,7 +1050,16 @@ func (s *search) summary(w io.Writer) {
 	fmt.Fprintf(w, "detsched: slowest passing run %v, slowest failing run %v; -timeout is %v\n", s.slowPass.Round(time.Millisecond), s.slowFail.Round(time.Millisecond), s.timeout)
 	s.assertSummary(w)
 	for _, g := range s.groups {
-		fmt.Fprintf(w, "\nFAIL %d of %d runs: %s\n", g.runs, s.runs, g.sig)
+		// The heading leaves out the details, which are only the first
+		// run's.
+		msg, details := g.sig, ""
+		if m := assertDetails.FindStringSubmatchIndex(g.sig); m != nil {
+			msg, details = g.sig[:m[2]], g.sig[m[2]+1:]
+		}
+		fmt.Fprintf(w, "\nFAIL %d of %d runs: %s\n", g.runs, s.runs, msg)
+		if details != "" {
+			fmt.Fprintf(w, "\tits first run: %s\n", details)
+		}
 		more := ""
 		if len(g.logs) > 1 {
 			more = fmt.Sprintf(" (and %d more of these runs: %s)", len(g.logs)-1, filepath.Join(s.out, fmt.Sprintf("fail-%d-*.log", g.index)))
@@ -1038,61 +1069,80 @@ func (s *search) summary(w io.Writer) {
 		fmt.Fprintf(w, "\tthe replay %s\n", verdict(g.status))
 		alsos := slices.SortedFunc(maps.Values(g.also), func(a, b *also) int { return cmp.Or(b.runs-a.runs, strings.Compare(a.sig, b.sig)) })
 		for i, a := range alsos {
-			if i == 5 {
-				fmt.Fprintf(w, "\tand %d other kinds of failure\n", len(alsos)-i)
+			if i == 20 {
+				fmt.Fprintf(w, "\tand %d other kinds of failure, each first in a log above\n", len(alsos)-i)
 				break
 			}
-			fmt.Fprintf(w, "\talso in %d of these runs: %s\n", a.runs, a.sig)
+			fmt.Fprintf(w, "\talso in %d of these runs: %s (first in %s)\n", a.runs, a.sig, filepath.Base(a.log))
 		}
 	}
 }
 
 // countAsserts counts the sometimes and reachable assertions of a run's
-// report, at the end of its output, after the last trace line (a failing
-// branch's report comes first). s.mu must be held.
+// reports: the timeline's, at the end of its output, and those of the
+// branches it forked that failed, which come first. An assertion is
+// reached, or true, in the run if it was in any of them. s.mu must be
+// held.
 func (s *search) countAsserts(out []byte) {
-	if i := bytes.LastIndex(out, []byte("\ndetsched: trace=")); i >= 0 {
-		out = out[i:]
-	}
+	held := map[string]bool{}
 	for _, m := range assertCounts.FindAllSubmatch(out, -1) {
-		if bytes.HasPrefix(m[3], []byte("compose: ")) || bytes.HasPrefix(m[3], []byte("nemesis: ")) {
-			continue // the SDK's own, which the fault timeline shows
-		}
 		k := string(m[1]) + " " + string(m[3])
+		held[k] = held[k] || string(m[2]) != "0"
+	}
+	for k, h := range held {
 		c := s.asserts[k]
 		if c == nil {
-			c = &assertCount{kind: string(m[1]), msg: string(m[3])}
+			kind, msg, _ := strings.Cut(k, " ")
+			c = &assertCount{kind: kind, msg: msg}
 			s.asserts[k] = c
 		}
 		c.runs++
-		if string(m[2]) != "0" {
+		if h {
 			c.held++
 		}
 	}
 }
 
+// sdkAsserts are the prefixes of the SDK's own assertions, which say what
+// faults and composer features runs reached.
+var sdkAsserts = []string{"nemesis: ", "compose: "}
+
 // assertSummary prints the sometimes and reachable assertions, those never
-// true first. s.mu must be held.
+// true first, and then on one line those of the SDK. s.mu must be held.
 func (s *search) assertSummary(w io.Writer) {
-	if len(s.asserts) == 0 {
-		return
-	}
 	cs := slices.SortedFunc(maps.Values(s.asserts), func(a, b *assertCount) int {
 		return cmp.Or(cmp.Compare(min(a.held, 1), min(b.held, 1)), strings.Compare(a.kind, b.kind), strings.Compare(a.msg, b.msg))
 	})
-	fmt.Fprintf(w, "detsched: sometimes and reachable assertions (one no run reached is not listed; messages are cut at 56 bytes):\n")
-	for i, c := range cs {
-		if i == 40 {
-			fmt.Fprintf(w, "\t(and %d more)\n", len(cs)-i)
-			break
-		}
+	var own []string
+	sdk := make([][]string, len(sdkAsserts))
+	for _, c := range cs {
+		i := slices.IndexFunc(sdkAsserts, func(p string) bool { return strings.HasPrefix(c.msg, p) })
 		switch {
+		case i >= 0:
+			if c.held > 0 {
+				sdk[i] = append(sdk[i], fmt.Sprintf("%s %d", strings.TrimPrefix(c.msg, sdkAsserts[i]), c.held))
+			}
 		case c.kind == "reachable":
-			fmt.Fprintf(w, "\treachable %q: reached in %d runs\n", c.msg, c.held)
+			own = append(own, fmt.Sprintf("reachable %q: reached in %d runs", c.msg, c.held))
 		case c.held == 0:
-			fmt.Fprintf(w, "\tsometimes %q: NEVER TRUE, in the %d runs that reached it\n", c.msg, c.runs)
+			own = append(own, fmt.Sprintf("sometimes %q: NEVER TRUE, in the %d runs that reached it", c.msg, c.runs))
 		default:
-			fmt.Fprintf(w, "\tsometimes %q: true in %d of the %d runs that reached it\n", c.msg, c.held, c.runs)
+			own = append(own, fmt.Sprintf("sometimes %q: true in %d of the %d runs that reached it", c.msg, c.held, c.runs))
+		}
+	}
+	if len(own) > 0 {
+		fmt.Fprintf(w, "detsched: sometimes and reachable assertions (one no run reached is not listed; messages are cut at 56 bytes):\n")
+		for i, l := range own {
+			if i == 40 {
+				fmt.Fprintf(w, "\t(and %d more)\n", len(own)-i)
+				break
+			}
+			fmt.Fprintf(w, "\t%s\n", l)
+		}
+	}
+	for i, l := range sdk {
+		if len(l) > 0 {
+			fmt.Fprintf(w, "detsched: runs that reached each %s assertion: %s\n", strings.TrimSuffix(sdkAsserts[i], ": "), strings.Join(l, ", "))
 		}
 	}
 }

@@ -26,7 +26,7 @@ grep -a '^detsched: trace=' prog.err
 
 `--disable-aslr` is required on macOS: without it the program re-executes itself without ASLR at startup and none of dlv's breakpoints ever stops. The program then prints `detsched: running again without ASLR, so a debugger loses its breakpoints; start the program without ASLR (dlv exec --disable-aslr)` to stderr and runs to the end; rerun with the flag. It is harmless on Linux. The run under dlv is the same run: breakpoints, prints, and time spent stopped don't change it. Check that its trace line in `prog.err` (or `dlv.out` without `-r`) equals the log's; a replay that runs another schedule also prints `detsched: warning: this run's schedule is not the one its replay line was printed for`. Never rebuild the binary for debugging, including with `-gcflags=all=-N -l`; work with the optimized binary.
 
-In a command file, a failing command prints an error and the file goes on. dlv exits at the end of the file, so put one `continue` per breakpoint stop you want, or use tracepoints, which need a single `continue`.
+In a command file, a failing command prints an error and the file goes on. dlv exits at the end of the file, so put one `continue` per breakpoint stop you want, or use tracepoints, which need a single `continue`. The trace line is printed at exit, so a file that ends stopped at a breakpoint, or with `exit`, leaves none in `prog.err`; end with one more `continue` to check it.
 
 ## Stop at the failure
 
