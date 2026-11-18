@@ -1134,27 +1134,32 @@ func TestNoASLREnvironment(t *testing.T) {
 // TestDetGodebug checks that the runtime's own GODEBUG settings, which
 // package internal/godebug would otherwise parse and allocate for, do not
 // change the schedule, so that diagnostic settings can be added to replay
-// a seed (testdata/godebugkeys).
+// a seed (testdata/godebugkeys). dettrace=2 also looks up the function of
+// every switch, which draws from the M's random state; the caches of type
+// assertions and type switches must not, or the run allocates another
+// one (testdata/typecache).
 func TestDetGodebug(t *testing.T) {
-	bin, cleanup, err := build(config{}, "../../testdata/godebugkeys")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	var outs []outcome
-	for _, godebug := range []string{"", "dettrace=2", "dettrace=1,detxxxxx=1"} {
-		o, _, err := runBin(bin, "GODETSEED=1", "GODEBUG="+godebug)
+	for _, prog := range []string{"godebugkeys", "typecache"} {
+		bin, cleanup, err := build(config{}, "../../testdata/"+prog)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if o.exitCode != 0 {
-			t.Fatalf("GODEBUG=dettrace=1,%s: exit status %d\n%s%s", godebug, o.exitCode, o.stdout, o.stderr)
+		defer cleanup()
+		var outs []outcome
+		for _, godebug := range []string{"", "dettrace=2", "dettrace=1,detxxxxx=1"} {
+			o, _, err := runBin(bin, "GODETSEED=1", "GODEBUG="+godebug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if o.exitCode != 0 {
+				t.Fatalf("%s with GODEBUG=dettrace=1,%s: exit status %d\n%s%s", prog, godebug, o.exitCode, o.stdout, o.stderr)
+			}
+			outs = append(outs, o)
 		}
-		outs = append(outs, o)
-	}
-	for i, godebug := range []string{"dettrace=2 added", "dettrace=1,detxxxxx=1 added"} {
-		if o := outs[i+1]; o.trace != outs[0].trace || o.stdout != outs[0].stdout {
-			t.Errorf("godebugkeys with %s: got %s, %q; want %s, %q", godebug, o.trace, o.stdout, outs[0].trace, outs[0].stdout)
+		for i, godebug := range []string{"dettrace=2 added", "dettrace=1,detxxxxx=1 added"} {
+			if o := outs[i+1]; o.trace != outs[0].trace || o.stdout != outs[0].stdout {
+				t.Errorf("%s with %s: got %s, %q; want %s, %q", prog, godebug, o.trace, o.stdout, outs[0].trace, outs[0].stdout)
+			}
 		}
 	}
 }

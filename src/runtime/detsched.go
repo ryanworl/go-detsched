@@ -123,6 +123,10 @@ type detPState struct {
 	switches uint64       // number of goroutine switches
 	rand     detRandState // random state of the M holding this P
 
+	// cache is the random state behind the decisions to update a type
+	// assertion's or type switch's cache (see cacheRand).
+	cache uint32
+
 	// sched is the random state behind scheduling perturbation. It is
 	// separate from rand, so turning perturbation on or tuning it does
 	// not change the random values the program sees.
@@ -433,6 +437,32 @@ func detRand() uint64 {
 		c.Refill()
 		mp.locks--
 	}
+}
+
+// cacheRand is cheaprand for typeAssert and interfaceSwitch, which update
+// the cache of a type assertion or type switch at random calls. Optimized
+// code calls them only when the cache misses, and code built with
+// -gcflags=all=-N -l at every assertion, so in det mode the draws must not
+// shift the P's rand, or the two builds would see other random values. Nor
+// may they come from the M's state (mcheaprand), whose draws depend on
+// which M runs the goroutine, on lock contention between threads, and on
+// tracebacks such as GODEBUG=dettrace=2's: a new cache is a heap
+// allocation, which moves the heap objects allocated after it and when the
+// next GC runs, and a program sees heap addresses, for example in the
+// iteration order of a map keyed by pointers. So they come from a stream
+// of their own on the P.
+//
+//go:nosplit
+func cacheRand() uint32 {
+	if goexperiment.DetSched {
+		if pp := getg().m.p.ptr(); pp != nil {
+			c := &detP(pp).cache
+			*c += 0x53c5ca59
+			hi, lo := bits.Mul32(*c, *c^0x74743c1b)
+			return hi ^ lo
+		}
+	}
+	return cheaprand()
 }
 
 // mcheaprand, mcheaprandn, and mcheaprandu64 are cheaprand, cheaprandn,
