@@ -104,6 +104,9 @@ func runtime_busyOn(on bool)
 //go:linkname runtime_setCPU
 func runtime_setCPU(node int32, cores, speed int32)
 
+//go:linkname runtime_nodeName
+func runtime_nodeName(node int32, name string)
+
 //go:linkname runtime_busyAdd
 func runtime_busyAdd(ns int64)
 

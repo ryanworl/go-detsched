@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched12
+v=go1.27.4-detsched13
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -44,25 +44,32 @@ detsched ./pkg
 
 That is all there is to it. detsched builds the package's test binary with
 the experiment, runs it on every core with one seed after another until you
-press Ctrl-C (or `-duration` passes, or `-n` runs have run), and shows
-progress as it goes. For each distinct failure it prints the log of its
+press Ctrl-C or send it SIGTERM (or `-duration` passes, or `-n` runs have
+run), and shows progress as it goes: on a terminal, a status line updated in
+place; otherwise, a line every 30 seconds. Its counts are runs, failed runs,
+signatures (groups of failures), and features: the new states the guided
+search reached (see [the search](#the-search)), which stop growing once it
+has found most of what it can reach. For each distinct failure it prints the log of its
 first run, a command that replays it, and the same command under Delve,
 and checks that the replay reproduces the failure:
 
 ```
 $ detsched ./testdata/bugcache
 FAIL panic: computed answer twice [recovered, repanicked]
-	log:    /tmp/detsched-334332647/fail-1.log
-	replay: cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 /tmp/detsched-334332647/bugcache.test
-	debug:  cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 dlv exec --disable-aslr /tmp/detsched-334332647/bugcache.test
+	log:    /tmp/detsched-334332647/fail-1-1.log
+	replay: cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 GODETSEARCH=trace=0x5a28688c3de0741d /tmp/detsched-334332647/bugcache.test
+	debug:  cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 GODETSEARCH=trace=0x5a28688c3de0741d dlv exec --disable-aslr /tmp/detsched-334332647/bugcache.test
 ^C
 detsched: ./testdata/bugcache: 489 runs, 174 failed, 1 signatures, 0 features, 736.0 runs/s, 1s
 ...
 FAIL 174 of 489 runs: panic: computed answer twice [recovered, repanicked]
-	log:    /tmp/detsched-334332647/fail-1.log (and 9 more in /tmp/detsched-334332647)
-	replay: cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 /tmp/detsched-334332647/bugcache.test
-	debug:  cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 dlv exec --disable-aslr /tmp/detsched-334332647/bugcache.test
+	log:    /tmp/detsched-334332647/fail-1-1.log (and 9 more of these runs: /tmp/detsched-334332647/fail-1-*.log)
+	replay: cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 GODETSEARCH=trace=0x5a28688c3de0741d /tmp/detsched-334332647/bugcache.test
+	debug:  cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 GODETSEARCH=trace=0x5a28688c3de0741d dlv exec --disable-aslr /tmp/detsched-334332647/bugcache.test
 ```
+
+The `debug:` line runs Delve's `dlv`, which the release archive has in
+`bin/`, next to `go` and `detsched`.
 
 Flags, all optional:
 
@@ -91,6 +98,9 @@ Flags, all optional:
   detsched -exec ./pkg.test
   ```
 
+  It also compares two versions of the code: build a binary from each and
+  search both with the same `-n`, then compare their failure rates.
+
 detsched exits with status 1 if any run failed.
 
 ### What a run is
@@ -98,10 +108,22 @@ detsched exits with status 1 if any run failed.
 A run executes the test binary once, in the package's directory, with the
 same arguments every time. Failing runs are grouped by their first assertion
 failure ([`sdk/assert`](#the-sdk)), panic, or fatal error, else their first
-failing test, with numbers masked; detsched keeps the logs of the first ten
-runs of each group. A failure inside a branch of a
-[composer](#simulating-a-cluster) timeline is reported as that branch's
-failure.
+failing test, with numbers masked and an assertion's details left out;
+detsched keeps the logs of the first ten runs of each group, group G's as
+`fail-G-1.log` to `fail-G-10.log`. Under each group, the summary lists the
+other failures its runs had (`also in N of these runs: ...`), such as the
+symptoms that followed the group's failure. A run keeps at most 16 MB of
+its output, its first and last 8 MB, with a line where the rest was cut. A
+failure inside a branch of a [composer](#simulating-a-cluster) timeline is
+reported as that branch's failure: its log starts with the branch's output,
+which ends with the branch's fault timeline (`sim: fault timeline of branch
+K:`), and goes on with the timeline's (`sim: fault timeline of the timeline
+(branch K's is above):`).
+
+The summary also lists the program's `assert.Sometimes` and
+`assert.Reachable` assertions with the runs each held in, those never true
+first, so that a search that passes still shows which paths it reached.
+An assertion that no run reached is not listed.
 
 The first run, with seed 1, runs twice, and once more when the search
 ends, minutes later in real time. If its runs differ, the program
@@ -135,7 +157,11 @@ of fresh seeds:
 - When a run takes two mutexes in the order opposite to another goroutine's,
   the lock order predicts a deadlock, and some runs then make goroutines
   that take the first of those mutexes yield while they hold it, so that
-  the other goroutine can take the second.
+  the other goroutine can take the second. The summary lists the predicted
+  deadlocks, with how many runs were directed at them and how many of
+  those failed. A prediction can be a false alarm: mutexes are told apart
+  by address, and the memory of one freed may be reused for another, as
+  happens with `context` cancellations.
 
 detsched spends its runs on fresh seeds, cells, and directed runs in
 proportion to the new cells and failures each produced lately per second,
@@ -152,10 +178,16 @@ Run the printed command as it is. It runs the kept binary in the package's
 directory with the run's seed (`GODETSEED`), the number of the composer
 branch it failed in, or 0 for none (`GODETBRANCH`), and, for a run forked
 from another or directed at a deadlock, `GODETSEARCH`, which holds the
-points where it forked and the sites it yielded at. It also sets the variables of detsched's
-environment that change seed 1's schedule, such as one a test reads to
-plant a bug, which detsched finds before the search starts, so the command
-works in a new shell. Change nothing: another binary, other arguments
+points where it forked and the sites it yielded at, and the run's schedule
+hash (`trace=`): a replay whose schedule differs says so at exit
+(`detsched: warning: this run's schedule is not the one its replay line was
+printed for`). It also sets the variables of detsched's environment that
+change seed 1's schedule, such as one a test reads to plant a bug, or
+`NO_COLOR`, which logging libraries read at init, which detsched finds by
+running seed 1 without groups of its variables, so the command works in a
+new shell. It cannot unset a variable that your shell has and detsched's
+environment did not: when the warning says the schedule differs, compare
+the two environments and run the line with `env -u NAME`. Change nothing: another binary, other arguments
 (even `-test.v` or `-test.run`), or a line of debugging output added to the
 program changes the schedule. Code that prints diagnostics should run only
 after an assertion has failed (`assert.Failures`), and never behind an
@@ -185,10 +217,10 @@ goroutine's stack there instead. It does not change the run.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched12:
+and release N's version is v0.N.0, so with go1.27.4-detsched13:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.12.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.13.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`

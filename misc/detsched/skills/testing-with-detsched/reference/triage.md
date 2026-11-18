@@ -10,19 +10,22 @@
 
 ## What a failure gives you
 
-For each failure signature, `detsched` prints the path of the run's log, the replay line, and a `debug:` line that runs the replay under dlv, and says whether replaying it reproduced the failure. The log is the run's whole output:
+For each failure signature, `detsched` prints the path of the run's log, the replay line, and a `debug:` line that runs the replay under dlv, and says whether replaying it reproduced the failure. A signature is the message of a run's first assertion failure without its details, or its first panic or fatal error. Group G's logs are `fail-G-1.log` and on, in the search's directory with every other group's, and the summary lists under each group the other failures its runs had (`also in N of these runs: ...`), such as the symptoms of the group's failure. The log is the run's whole output, its first and last 8 MB if longer:
 
 - its first line, `# ` followed by the replay line;
 - the test's output, every assertion failure (`detsched: assertion failed: MESSAGE DETAILS`), and the failing branch (`detsched: branch K (GODETBRANCH=K runs it in place)`);
 - the trace line, `detsched: trace=0x... switches=N syncs=M`, which identifies the run;
-- the fault timeline, after the output on stderr: `sim: SECONDS NODE: EVENT` lines, from `world: new` to `world: close`, with every crash, power failure, restart, partition, pause, clock skip, and disk fault, in seconds of virtual time;
-- for a run stopped at the per-run timeout, every goroutine's stack. Goroutines of the simulation say their node and its state in the header, such as `goroutine 10 gp=0x... m=nil [waiting, node 1 crashed]:`.
+- the fault timeline, after the output on stderr: `sim: SECONDS NODE: EVENT` lines, from `world: new` to `world: close`, with every crash, power failure, restart, partition, pause, clock skip, and disk fault (failed fsyncs, sectors that went bad, a full disk), in seconds of virtual time;
+- for a failure in a compose branch, two of each: the branch's output comes first, with its own fault timeline under `sim: fault timeline of branch K:`, then the timeline's, under `sim: fault timeline of the timeline (branch K's is above):`, which ends at the fork, before the branch's failure;
+- for a run stopped at the per-run timeout, every goroutine's stack. Goroutines of the simulation say their node, by name and start, and its state in the header, such as `goroutine 10 gp=0x... m=nil [waiting, node n1 (start 2) crashed]:`.
 
 Read the first assertion failure, then the timeline around its time, before anything else. Many failures explain themselves from those two.
 
 ## Does it replay?
 
 First check `detsched`'s output for warnings, at the start and at the end. It runs seed 1 twice before searching and once more when the search ends, minutes later, and `detsched: warning: seed 1 ran two different schedules (...), so failures may not replay` means the program depends on something besides its seed. Two runs started at once read nearly the same clock, so the run at the end is the one that usually catches a clock read at init. That warning, and replays that don't reproduce, are the only signs: nothing reports reading the real clock outside a bubble (a `time.Now()` taken at package init or before `synctest.Test`) or real files. A missing warning doesn't prove the program deterministic. Fix the dependence before triaging anything else, since no failure of that binary replays reliably.
+
+The replay line carries the run's schedule hash (`trace=` in `GODETSEARCH`), and a replay that runs another schedule prints `detsched: warning: this run's schedule is not the one its replay line was printed for` at exit: then its breakpoints and prints show another run. The usual cause is a variable your shell has and the search's environment did not, such as `NO_COLOR`, which logging libraries read at init; run the line with `env -u NAME`.
 
 Variables of the environment are handled for you: `detsched` finds the ones the schedule depends on (a harness flag such as `SIMCOMPOSE_BUG=1`) and puts them on the replay line, then runs each line in a new shell's environment and prints the verdict next to the failure. `the replay reproduced the failure in a new shell` means the line is enough. `did not reproduce the failure: it ended with "..."` or `failed the same way, but ran another schedule (...)` means the run depends on something the line can't carry. `warning: seed 1 runs another schedule in a new shell` means it could not find which variables matter.
 
@@ -39,13 +42,14 @@ Decide with evidence from the replay, not from the message alone. Assume the har
 ## Signatures that are usually not SUT bugs
 
 - `a goroutine waits for a mutex that a crashed node holds` or a stall after a crash: process-global state shared between nodes (a package variable of the SUT or a dependency), or a harness lock shared between nodes.
-- A run that times out after a crash with live goroutines in `chan send (durable)` or `chan receive (durable)` inside a lock, and a goroutine labeled `node N crashed` frozen in the same lock: a lock made of a channel, shared between nodes. A crashed node's goroutine runs on to release only a `sync.Mutex` or `RWMutex`, so replace the channel lock with a `sync.Mutex`, which under the experiment counts as durably blocked as upstream synctest's channel did.
+- A run that times out after a crash with live goroutines in `chan send (durable)` or `chan receive (durable)` inside a lock, and a goroutine labeled `node NAME (start K) crashed` frozen in the same lock: a lock made of a channel, shared between nodes. A crashed node's goroutine runs on to release only a `sync.Mutex` or `RWMutex`, so replace the channel lock with a `sync.Mutex`, which under the experiment counts as durably blocked as upstream synctest's channel did.
 - A run that ends at the per-run timeout with little output: a nemesis callback (`Event`, `Restart`) waiting for a node, a harness lock held by a paused node, or an oracle that is too slow (profile it). Read the stacks in the log.
 - `concurrent map writes` in harness code: a harness map without a mutex.
 - Socket calls failing with `EPERM`: code running on a goroutine of no node.
 - synctest reporting a deadlock or blocked goroutines when the test ends: a harness goroutine not joined.
 - A failure only in runs with a backward clock skip: a check that compares wall-clock times or durations without allowing for the skip.
 - `branch K died of signal 5`: a debugger breakpoint hit inside a forked branch; replay with `GODETBRANCH=K`.
+- `detsched: predicted deadlock: ... context.(*cancelCtx).cancel ...` in the summary: likely a false alarm, two contexts whose memory was reused. The summary says how many runs were directed at the predictions and how many of those failed; a real deadlock fails them.
 
 ## After classifying
 

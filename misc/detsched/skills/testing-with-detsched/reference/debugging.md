@@ -1,6 +1,6 @@
 # Debugging a replay with dlv
 
-Run dlv non-interactively from a command file and read its saved output. The human guide, `misc/detsched/delve.md` in the detsched repository, explains each step in more depth.
+Run dlv non-interactively from a command file and read its saved output. The release archive has dlv 1.27.2 in `bin/`, next to `detsched`. The human guide, `misc/detsched/delve.md` in the release archive, explains each step in more depth.
 
 ## Contents
 
@@ -17,11 +17,14 @@ Run dlv non-interactively from a command file and read its saved output. The hum
 Take the `debug:` line `detsched` prints under the `replay:` line. It is the replay line with `dlv exec --disable-aslr` before the binary and `--` before its arguments (the log's first line has only the replay line; make that edit when starting from the log). Add dlv's flags right after the binary, before `--`:
 
 ```
-cd /abs/pkg && GODETSEED=N GODETBRANCH=K dlv exec --disable-aslr /tmp/detsched-XXXX/pkg.test --init cmds.dlv --allow-non-terminal-interactive=true -- -test.run=TestX </dev/null >dlv.out 2>&1
-sed 's/\x1b\[[0-9;]*m//g' dlv.out | grep -a -v '^>>' | grep -a -E '^> |^\t|detsched: trace'
+cd /abs/pkg && GODETSEED=N GODETBRANCH=K dlv exec --disable-aslr /tmp/detsched-XXXX/pkg.test -r stdout:prog.out -r stderr:prog.err --init cmds.dlv --allow-non-terminal-interactive=true -- -test.run=TestX </dev/null >dlv.out 2>&1
+sed 's/\x1b\[[0-9;]*m//g' dlv.out | grep -a -v '^>>' | grep -a -E $'^> |^\t'
+grep -a '^detsched: trace=' prog.err
 ```
 
-`--disable-aslr` is required on macOS: without it the program re-executes itself without ASLR at startup and none of dlv's breakpoints ever stops. The program then prints `detsched: running again without ASLR, so a debugger loses its breakpoints; start the program without ASLR (dlv exec --disable-aslr)` to stderr and runs to the end; rerun with the flag. It is harmless on Linux. The run under dlv is the same run: breakpoints, prints, and time spent stopped don't change it. Check that its trace line in `dlv.out` equals the log's. Never rebuild the binary for debugging, including with `-gcflags=all=-N -l`; work with the optimized binary.
+`-r` keeps the program's own output, which may be megabytes, out of `dlv.out`, which then holds only dlv's: a tracepoint hit is a line starting with `> `, and each of its `on` prints a line starting with a tab, more lines with deeper tabs for a struct. Write the tab in the pattern as `$'\t'`: `grep -E` reads `\t` as the letter `t` and drops every value line.
+
+`--disable-aslr` is required on macOS: without it the program re-executes itself without ASLR at startup and none of dlv's breakpoints ever stops. The program then prints `detsched: running again without ASLR, so a debugger loses its breakpoints; start the program without ASLR (dlv exec --disable-aslr)` to stderr and runs to the end; rerun with the flag. It is harmless on Linux. The run under dlv is the same run: breakpoints, prints, and time spent stopped don't change it. Check that its trace line in `prog.err` (or `dlv.out` without `-r`) equals the log's; a replay that runs another schedule also prints `detsched: warning: this run's schedule is not the one its replay line was printed for`. Never rebuild the binary for debugging, including with `-gcflags=all=-N -l`; work with the optimized binary.
 
 In a command file, a failing command prints an error and the file goes on. dlv exits at the end of the file, so put one `continue` per breakpoint stop you want, or use tracepoints, which need a single `continue`.
 
@@ -45,7 +48,7 @@ goroutines -t 30
 - Locations: `pkg/path.(*Type).Method`, a unique suffix such as `sim.(*disk).powerFail`, or `FILE:LINE` matched as a path suffix, with the module version for dependencies (`hashicorp/raft@v1.8.0/raft.go:288`). Read the `Breakpoint NAME set at ... for FUNC` line: `could not find statement` means pick another line, and `FUNC` may be a closure (`.func1`) or the caller of an inlined function.
 - A breakpoint that never stops proves nothing until a tracepoint on the function's entry has fired. Read the fault timeline instead of breaking on crash and disk-fault paths.
 - Read arguments and receivers at function entry; locals in optimized code are often unreadable. A condition on an argument of an inlined function can't be evaluated: break on the caller.
-- Expressions: no function or method calls; a package variable takes its package's name when that is unique (`sim.world`), else the quoted import path (`"github.com/ryanworl/go-detsched/misc/detsched/sdk/sim".world`); type assertions need the quoted path (`x.(*"github.com/org/mod/pkg".T)`); string comparison works; raise `config max-string-len 1000` for long values.
+- Expressions: no function or method calls; a package variable takes its package's name when that is unique (`sim.world`), else the quoted import path (`"github.com/ryanworl/go-detsched/misc/detsched/sdk/sim".world`); a type assertion takes the package's name (`x.(*pkg.T)`), never a quoted path, which does not parse there, and is rarely needed: `print x` shows an interface's dynamic type and value, and `x.Field` reads a field of the value inside; string comparison works; raise `config max-string-len 1000` for long values.
 - A condition dlv can't evaluate stops at every hit with `error evaluating expression`. Fix it before trusting the stops.
 - `runtime.curg.goid` is the current goroutine's ID, the same in every replay. `runtime.curg.bubble.now` is virtual time in nanoseconds; subtract 946684800000000000 to get the timeline's seconds.
 

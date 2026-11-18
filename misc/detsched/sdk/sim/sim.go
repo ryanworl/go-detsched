@@ -168,6 +168,7 @@ type Node struct {
 	nat            map[uint16]uint16 // with SetNAT, UDP public port by local port
 	natRev         map[uint16]uint16 // local port by public port
 	natNext        uint16            // the next public port to try
+	starts         int               // times Start started it
 }
 
 // An incarnation is a node from one start to its crash.
@@ -297,6 +298,12 @@ func (w *World) SkipClock(d time.Duration) {
 
 // ClockSkew returns the sum of the clock skips so far.
 func (w *World) ClockSkew() time.Duration { return w.skew }
+
+// Elapsed returns the simulated time since the World began, which the
+// fault timeline's lines start with and clock skips do not move. Stamp
+// harness and SUT log lines with it to line them up with the timeline;
+// the wall clock (time.Now) jumps with each skip.
+func (w *World) Elapsed() time.Duration { return time.Duration(now() - w.start) }
 
 // AddNode adds a node with the given name and IPv4 address, such as
 // "10.0.0.1". The node starts down, with an empty disk; call Start.
@@ -431,6 +438,8 @@ func (n *Node) Start(f func()) {
 		n.w.incs[inc.handle] = inc
 		n.w.netChanged()
 	})
+	n.starts++
+	runtime_nodeName(inc.handle, n.name+" (start "+strconv.Itoa(n.starts)+")")
 	n.applyCPU()
 	n.w.logEvent(n.name, "start")
 	goAs(inc, f)
@@ -794,8 +803,8 @@ func now() int64 { return runtime_now() }
 // stack, which counts no ticks, into a buffer that holds no pointers, so
 // that the timeline changes neither the schedule nor the heap.
 func (w *World) logEvent(name string, what ...string) {
-	if w.closing {
-		return // the World's nodes go down with it
+	if w == nil || w.closing {
+		return // the World's nodes go down with it, and a disk outlives it
 	}
 	runtime_call(func() {
 		var b [256]byte

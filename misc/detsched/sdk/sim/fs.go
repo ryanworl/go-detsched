@@ -7,7 +7,9 @@
 package sim
 
 import (
+	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -132,6 +134,7 @@ func (d *disk) noSpace() bool {
 	}
 	if !calm() && buggify.OnChance("sim.disk.enospc", 0.001) {
 		d.fullUntil = now() + 100e6 + int64(runtime_rand()%4900e6)
+		world.logEvent(d.nodeName(), "disk full (ENOSPC) for", strconv.FormatFloat(float64(d.fullUntil-now())/1e9, 'f', 3, 64)+"s")
 		return true
 	}
 	return false
@@ -507,6 +510,31 @@ func (d *disk) endFaults() {
 		}
 	}
 	walk(d.root)
+}
+
+// pathOf returns a path of n on d, the first in order, or "a deleted file".
+func (d *disk) pathOf(n *inode) string {
+	var walk func(dir *inode, at string) string
+	walk = func(dir *inode, at string) string {
+		names := slices.Sorted(maps.Keys(dir.ents))
+		for _, name := range names {
+			if c := dir.ents[name]; c == n {
+				return at + "/" + name
+			}
+		}
+		for _, name := range names {
+			if c := dir.ents[name]; c.dir {
+				if p := walk(c, at+"/"+name); p != "" {
+					return p
+				}
+			}
+		}
+		return ""
+	}
+	if p := walk(d.root, ""); p != "" {
+		return p
+	}
+	return "a deleted file"
 }
 
 // nodeName returns the name of d's node, for World.logEvent.
@@ -1038,7 +1066,7 @@ func (w *World) fileCall(d *fdesc, trap uintptr, a [6]uintptr) (uintptr, uintptr
 		for _, b := range bufs {
 			size += len(b)
 		}
-		if e := n.readSectors(off, min(off+int64(size), int64(len(n.data)))); e != 0 {
+		if e := f.disk.readSectors(n, off, min(off+int64(size), int64(len(n.data)))); e != 0 {
 			return 0, e
 		}
 		total := 0
@@ -1323,7 +1351,7 @@ func (n *inode) unlock(f *openFile) {
 // readSectors reports EIO if the range [off, end) covers a bad sector that
 // the read reaches the disk for, and with "sim.disk.readerror" makes a
 // sector of it go bad.
-func (n *inode) readSectors(off, end int64) uintptr {
+func (d *disk) readSectors(n *inode, off, end int64) uintptr {
 	if off >= end {
 		return 0
 	}
@@ -1334,6 +1362,7 @@ func (n *inode) readSectors(off, end int64) uintptr {
 				n.bad = map[int64]bool{}
 			}
 			n.bad[s] = true
+			world.logEvent(d.nodeName(), "sector", strconv.FormatInt(s, 10), "of", d.pathOf(n), "went bad: reads of it fail with EIO until it is written")
 		}
 	}
 	for s := off / sectorSize; s <= (end-1)/sectorSize && len(n.bad) > 0; s++ {

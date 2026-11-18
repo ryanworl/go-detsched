@@ -44,9 +44,11 @@ misc/release/gate.bash      # the checks every change must pass
 `build.bash` takes make.bash's flags and environment (`GOROOT_BOOTSTRAP`,
 `GOOS`, `GOARCH`). With `-distpack` it also writes
 `pkg/distpack/$VERSION.$GOOS-$GOARCH.tar.gz`: make.bash's distribution
-archive with `detsched` added to `bin/` and its top directory renamed to
-the version, so that unpacking it never mixes it into a stock `go/`, plus
-a `.sha256` file. To build all three release archives:
+archive with `detsched` and Delve's `dlv` added to `bin/` (dlv at the
+version the docs were tested with, built by the toolchain, which downloads
+its module, with its license in `misc/delve/LICENSE`) and its top
+directory renamed to the version, so that unpacking it never mixes it into
+a stock `go/`, plus a `.sha256` file. To build all three release archives:
 
 ```
 for t in linux/amd64 linux/arm64 darwin/arm64; do
@@ -62,7 +64,8 @@ user gets it: it checks the checksum, unpacks the archive in a new
 directory, and with an empty environment checks `go version`, runs the
 archive's own gate, runs `detsched -n 100` on the planted bug in
 `testdata/bugcache`, and runs the replay line it prints under `env -i`,
-which must fail with the same trace line.
+which must fail with the same trace line, and the `debug:` line, which on
+Linux must stop in dlv at the failure's panic.
 
 ## Publish and release
 

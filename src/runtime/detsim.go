@@ -222,15 +222,32 @@ func detsimMapAddr(addr uintptr) bool {
 //go:nosplit
 func detsimNode(gp *g) int32 { return detG(gp).node }
 
-// detsimHeader adds gp's node handle to its traceback header, and the
-// node's state if it crashed or is paused, so that the live goroutines
-// stand out among the frozen ones of crashed nodes.
+// detsimNames holds the names package sim gives node handles, such as
+// "n1 (start 2)", by handle.
+var detsimNames []string
+
+// detsimSetName names node handle node.
+func detsimSetName(node int32, name string) {
+	for int(node) >= len(detsimNames) {
+		detsimNames = append(detsimNames, "")
+	}
+	detsimNames[node] = name
+}
+
+// detsimHeader adds gp's node to its traceback header, by the name package
+// sim gave it, else by its handle, and the node's state if it crashed or
+// is paused, so that the live goroutines stand out among the frozen ones
+// of crashed nodes.
 func detsimHeader(gp *g) {
 	node := detsimNode(gp)
 	if node == 0 {
 		return
 	}
-	print(", node ", node)
+	if int(node) < len(detsimNames) && detsimNames[node] != "" {
+		print(", node ", detsimNames[node])
+	} else {
+		print(", node ", node)
+	}
 	switch detsimState(gp) {
 	case detsimDead:
 		if detG(gp).zombie != 0 {
@@ -1263,6 +1280,13 @@ func detsimSetFailLog(p *[]byte) { detsim.failLog = p }
 // status, is nonzero. Called by detExit and detPanic.
 func detsimFailLog(code int) {
 	if p := detsim.failLog; p != nil && code != 0 {
+		// A failed branch's output, with its own timeline, comes first.
+		switch {
+		case detBranchChild:
+			print("sim: fault timeline of branch ", detBranchN, ":\n")
+		case detOut.branch != 0:
+			print("sim: fault timeline of the timeline (branch ", detOut.branch, "'s is above):\n")
+		}
 		detWriteAll(2, *p)
 	}
 }

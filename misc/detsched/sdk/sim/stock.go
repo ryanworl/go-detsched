@@ -32,6 +32,7 @@ func runtime_clock(bool, int64)          {}
 func runtime_onPanic(func(int32, any))   {}
 func runtime_busyOn(bool)                {}
 func runtime_setCPU(int32, int32, int32) {}
+func runtime_nodeName(int32, string)     {}
 func runtime_busyAdd(int64)              {}
 func runtime_wait(int64)                 {}
 func runtime_wake(int32)                 {}

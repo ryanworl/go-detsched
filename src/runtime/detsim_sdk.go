@@ -34,6 +34,7 @@ import _ "unsafe" // for go:linkname
 //go:linkname detsimBranch github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_branch
 //go:linkname detsimBusyOn github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_busyOn
 //go:linkname detsimSetCPU github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_setCPU
+//go:linkname detsimSetName github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_nodeName
 //go:linkname detsimBusyAdd github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_busyAdd
 //go:linkname detsimBusyStats github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_busyStats
 //go:linkname detsimWait github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_wait

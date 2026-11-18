@@ -12,8 +12,9 @@
 # GOROOT_BOOTSTRAP, GOOS and GOARCH work as they do for make.bash. With
 # -distpack, it also writes the release archive
 # pkg/distpack/$VERSION.$GOOS-$GOARCH.tar.gz, whose top directory is named
-# $VERSION and which holds go, gofmt and detsched in bin/, and its checksum
-# in the same name plus .sha256.
+# $VERSION and which holds go, gofmt, detsched and Delve's dlv in bin/, and
+# its checksum in the same name plus .sha256. Building dlv downloads its
+# module.
 
 set -euo pipefail
 
@@ -61,6 +62,21 @@ umask 022
 tar -C "$tmp" -xzf "$archive"
 cp "$bin/detsched" "$tmp/go/bin/detsched"
 chmod 0755 "$tmp/go/bin/detsched"
+
+# Delve, which the debug: lines detsched prints run, at the version the
+# docs were tested with, built by this toolchain for the target, with its
+# license.
+delve=v1.27.2
+GOPATH=$tmp/gopath GOFLAGS='-trimpath -modcacherw' GOBIN='' CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
+	"$go" install "github.com/go-delve/delve/cmd/dlv@$delve"
+dlv=$tmp/gopath/bin/dlv
+[ "$bin" = "$root/bin" ] || dlv=$tmp/gopath/bin/${goos}_$goarch/dlv
+cp "$dlv" "$tmp/go/bin/dlv"
+chmod 0755 "$tmp/go/bin/dlv"
+mkdir -p "$tmp/go/misc/delve"
+cp "$tmp/gopath/pkg/mod/github.com/go-delve/delve@$delve/LICENSE" "$tmp/go/misc/delve/LICENSE"
+chmod 0644 "$tmp/go/misc/delve/LICENSE"
+rm -rf "$tmp/gopath"
 mv "$tmp/go" "$tmp/$version"
 tar -C "$tmp" --sort=name --owner=0 --group=0 --numeric-owner --mtime="$mtime" \
 	--format=gnu -cf - "$version" | gzip -9n >"$archive.new"

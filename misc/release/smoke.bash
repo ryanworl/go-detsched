@@ -11,7 +11,10 @@
 #   - runs the archive's own misc/release/gate.bash;
 #   - runs detsched -n 100 on the planted bug in testdata/bugcache, which
 #     must fail, and runs the replay line it prints under env -i, which must
-#     fail with the same message and trace line.
+#     fail with the same message and trace line;
+#   - checks the archive's dlv, and on Linux runs the debug line it prints,
+#     which must stop at the failure's panic. (On macOS dlv needs the
+#     developer tools' debugserver and permission to debug.)
 #
 # Usage: misc/release/smoke.bash go1.27.4-detsched1.linux-amd64.tar.gz
 
@@ -53,6 +56,7 @@ echo "smoke: detsched -n 100 in testdata/bugcache"
 cd "$goroot/misc/detsched/testdata/bugcache"
 status=0
 out=$(clean detsched -n 100 2>&1) || status=$?
+out0=$out
 printf '%s\n' "$out"
 if [ "$status" != 1 ]; then
 	echo "smoke: detsched exited with status $status, want 1 (a failure found)" >&2
@@ -77,4 +81,19 @@ if [ "$status" = 0 ] ||
 	exit 1
 fi
 echo "smoke: the replay failed again with $trace"
+
+clean dlv version | grep -q '^Version: ' || { echo "smoke: bin/dlv does not run" >&2; exit 1; }
+if [ "$(uname)" = Linux ]; then
+	debug=$(printf '%s\n' "$out0" | sed -n 's/^[[:space:]]*debug: //p' | tail -n 1)
+	printf 'continue\nexit -c\n' >"$work/tmp/smoke.dlv"
+	echo "smoke: $debug"
+	status=0
+	out=$(cd / && env -i HOME="$work/home" TMPDIR="$work/tmp" PATH="$goroot/bin:/usr/bin:/bin" /bin/sh -c "$debug --init $work/tmp/smoke.dlv --allow-non-terminal-interactive=true </dev/null" 2>&1) || status=$?
+	if ! printf '%s\n' "$out" | grep -q 'unrecovered-panic'; then
+		printf '%s\n' "$out"
+		echo "smoke: the debug line did not stop at the panic" >&2
+		exit 1
+	fi
+	echo "smoke: the debug line stopped at the panic"
+fi
 echo "smoke: $name passed"

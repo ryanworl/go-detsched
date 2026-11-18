@@ -33,17 +33,20 @@ Download a release for your platform, `linux-amd64`, `linux-arm64` or
 Each archive unpacks to a directory named after its version:
 
 ```
-v=go1.27.4-detsched12
+v=go1.27.4-detsched13
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
-go version    # go version go1.27.4-detsched12 linux/amd64
+go version    # go version go1.27.4-detsched13 linux/amd64
 ```
+
+The archive's `bin` holds `go`, `gofmt`, `detsched`, and Delve's `dlv`,
+which the `debug:` lines detsched prints run.
 
 `SHA256SUMS` in each release lists the archives' checksums. The macOS
 binaries are not notarized. Download them with curl, as above, or remove
 the quarantine that a browser adds before you unpack the archive:
-`xattr -d com.apple.quarantine go1.27.4-detsched12.darwin-arm64.tar.gz`.
+`xattr -d com.apple.quarantine go1.27.4-detsched13.darwin-arm64.tar.gz`.
 
 To build from source instead, with any Go 1.24.6 or later installed:
 
@@ -51,6 +54,7 @@ To build from source instead, with any Go 1.24.6 or later installed:
 git clone https://github.com/ryanworl/go-detsched && cd go-detsched
 misc/release/build.bash
 export PATH=$PWD/bin:$PATH
+go install github.com/go-delve/delve/cmd/dlv@v1.27.2   # the archives have it in bin
 ```
 
 The SDK (assertions, fault sites, the simulated cluster) is an ordinary
@@ -58,7 +62,7 @@ module; take the version that matches your toolchain, v0.N.0 for
 go1.27.4-detschedN. Tests that use it still build and pass with stock Go:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.12.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.13.0
 ```
 
 ## Versions

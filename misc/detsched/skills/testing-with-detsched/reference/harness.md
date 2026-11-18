@@ -1,6 +1,6 @@
 # Writing a harness with sim and compose
 
-A harness is a Go test in its own package that runs the system under test (SUT) on simulated nodes, drives a workload against it while faults happen, and checks what the SUT promises. `testdata/simcompose` in the detsched repository is a complete small example: read it before writing a new one.
+A harness is a Go test in its own package that runs the system under test (SUT) on simulated nodes, drives a workload against it while faults happen, and checks what the SUT promises. `misc/detsched/testdata/simcompose` in the release archive is a complete small example: read it before writing a new one.
 
 ## Contents
 
@@ -9,7 +9,9 @@ A harness is a Go test in its own package that runs the system under test (SUT) 
 - Locks and callbacks
 - Faults and clocks
 - Writing checks that don't raise false alarms
+- Checks that find the bug, not only its symptom
 - Before the first long search
+- Comparing the SUT before and after a fix
 
 ## Shape of a harness
 
@@ -19,7 +21,12 @@ func TestKV(t *testing.T) {
 		t.Skip("requires GOEXPERIMENT=detsched")
 	}
 	synctest.Test(t, func(t *testing.T) {
-		w := sim.NewWorld(sim.Config{})
+		w := sim.NewWorld(sim.Config{
+			OnPanic: func(n *sim.Node, msg string, stack []byte) { // a SUT panic crashes only its node
+				dump() // the harness's diagnostics, which otherwise die with the program
+				assert.Unreachable("node panicked", map[string]any{"node": n.Name(), "msg": msg})
+			},
+		})
 		defer w.Close()
 		server := w.AddNode("server", "10.0.0.1")
 		server.Start(serve)
@@ -37,6 +44,7 @@ func TestKV(t *testing.T) {
 }
 ```
 
+- Set `sim.Config.OnPanic`. Without it, a panic in the SUT, which many systems raise on a broken invariant (raft's `log not found`), ends the program at once, before any diagnostics the harness prints after a failed check, and the log holds only the stack.
 - Create the World first thing in the bubble. The fault timeline's times are seconds since the World was created, and dlv's `runtime.curg.bubble.now` lines up with them only when the bubble and the World start together.
 - Draw everything random from the seed: `sim.Intn`, `sim.Rand`, `math/rand`, or map order all come from `GODETSEED`. Draw configuration per run (cluster size, SUT options, timeouts) so the search explores it, and record what was drawn in the harness's failure dump.
 - Terminal checks (`Eventually`, `Finally`) also run on branches of the timeline: compose forks the process at random points, the branch runs the check, and the timeline goes on. A failure there names its branch, which `GODETBRANCH` replays.
@@ -62,6 +70,7 @@ func TestKV(t *testing.T) {
 - Never hold a harness lock across a call into the SUT, and never share one harness lock between nodes: when the nemesis pauses a node whose goroutine holds it, every other node that takes it stalls until the pause ends, which reads as a liveness bug in the SUT. Keep locks per node, or use atomics or lock-free rings.
 - The nemesis calls `Restart` and `Event` on its own goroutine, which alone resumes paused nodes. They must return promptly and must not take any lock a node's goroutine can hold, nor wait for a node. The runtime fails the run with the callback's stack when one does.
 - Don't log from nodes through a shared `log.Logger` or a library's global logger: a node that crashes while holding the logger's mutex wedges every node that logs. Give each node its own logger, or write to a lock-free ring.
+- Stamp log lines with `w.Elapsed()`, the fault timeline's time (for hclog, `TimeFn`), not the wall clock, which clock skips move by minutes either way, so that node logs line up with the timeline.
 
 ## Faults and clocks
 
@@ -81,10 +90,31 @@ Each overnight project lost runs to its own oracle. The recurring causes:
 - Once a known SUT bug wedges a node, liveness checks fail for the rest of the run; disarm them when the harness records that bug.
 - A check that reads state the SUT updates concurrently must read it at a consistent point (after the operation it checks has returned, or from one snapshot).
 
+## Checks that find the bug, not only its symptom
+
+- Assert the protocol's own invariants where the SUT breaks them, not only what a user would see: for a consensus system, at most one leader per term (from an observer or the SUT's state) next to "replicas apply the same commands". A broken invariant shows in every run that breaks it; its symptom, such as two replicas diverging, shows only in the few runs where the damage then reaches a client. In one evaluation, the leader check failed 10 to 100 times as often as the divergence check, and pointed straight at the cause.
+- Give each invariant its own assertion message, and put the cause in a liveness check's message ("no leader for 30s" rather than "converges"). `detsched` groups failing runs by the message of their first failed assertion, without its details, so one compose check that returns many kinds of error is one group. The summary also lists, under each group, the other failures its runs had, such as the symptoms of the group's failure.
+- Expect the SUT's own liveness bugs and the harness's mistakes to fail first: in an evaluation on a raft library, the first searches failed on snapshot and log-compaction liveness bugs unrelated to the bug sought. Triage each group, fix the harness or put the SUT's known bug behind a flag, and search again.
+- A failing `Anytime` check runs no more in that timeline. Print the harness's diagnostics once per run, not per failure: a dump on every failure makes logs of hundreds of megabytes.
+
 ## Before the first long search
 
 - Plant a bug in the SUT (drop an fsync, acknowledge before writing) and check the harness catches it within a short search. A harness that catches nothing proves nothing.
-- Count each error and timeout path you expect to exercise with `assert.Sometimes` or `assert.Reachable`, and check they fire. A missing piece of the simulation can make a feature unreachable without any failure.
+- Count each error and timeout path you expect to exercise with `assert.Sometimes` or `assert.Reachable`, and check they fire: the search's summary lists each with the runs it held in, `NEVER TRUE` first. An assertion no run reached is not listed, so prefer `Sometimes(cond)` at a place every run passes. A missing piece of the simulation can make a feature unreachable without any failure.
 - Run a short search (`detsched -duration 5m ./pkg`) after adding each workload feature, before a long one: a new feature's false alarms show up within minutes.
 - Profile a few slow seeds with `perf record -g`: quadratic oracles and expensive SUT features (compression per message, big zeroed buffers that cgo allocators would have zeroed lazily) dominate cost, and slow runs reach the per-run timeout.
 - To patch the SUT, use a local copy with a `replace` directive in go.mod; `-overlay` refuses files in the module cache.
+
+## Comparing the SUT before and after a fix
+
+Build one test binary from each version of the SUT and search each with the same number of runs. `detsched` builds with the experiment and without cgo; do the same:
+
+```
+cd /abs/harness
+GOFLAGS=-modfile=go.before.mod GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o before.test .
+GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o after.test .
+detsched -exec ./before.test -n 3000
+detsched -exec ./after.test -n 3000
+```
+
+Here `go.before.mod` is a copy of go.mod whose `replace` points at an unchanged copy of the SUT; editing the SUT in place and rebuilding works too, but then check which version a binary holds before searching it. Report failures over runs for both. A fix changes the schedule, and the guided search's runs differ between the two binaries, so compare rates, not seeds. A flag the harness reads (an environment variable that turns a workaround on) works the same way with one binary.

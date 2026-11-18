@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -780,8 +781,8 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 		return nil, 0, fmt.Errorf("collecting a fork: %w", werr)
 	}
 	hits, _ := os.ReadFile(fb.Name())
-	output, _ := os.ReadFile(out.Name())
-	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, exitCode: -1, timedOut: timedOut, wall: time.Since(start), outOfMem: untrack()}
+	output, size := readOutput(out.Name())
+	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, wall: time.Since(start), outOfMem: untrack()}
 	var novelAt uint64
 	if len(hits) == len(s.seen)+32 {
 		r.exitCode = int(int64(binary.LittleEndian.Uint64(hits[len(s.seen):])))
@@ -855,7 +856,9 @@ func (s *search) memLow() bool {
 	low := avail < total/4
 	if low && !s.lowMem {
 		s.lowMem = true
-		s.printf("detsched: memory is low, so the search keeps fewer stopped programs and starts fewer runs\n")
+		var self runtime.MemStats
+		runtime.ReadMemStats(&self)
+		s.printf("detsched: memory is low (%d of %d MB available, under a quarter; detsched itself holds %d MB, and the runs' output is up to %d MB each), so the search keeps fewer stopped programs and starts fewer runs\n", avail>>20, total>>20, self.Sys>>20, s.bigOutput>>20)
 	}
 	return low
 }

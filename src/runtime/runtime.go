@@ -239,7 +239,11 @@ func writeErrStr(s string) {
 //
 //go:nosplit
 func writeErrData(data *byte, n int32) {
-	write(2, unsafe.Pointer(data), n)
+	if goexperiment.DetSched && detOut.share != nil {
+		detOut.share.write(2, unsafe.Pointer(data), int(n)) // a forked branch's; see detsimBranch
+	} else {
+		write(2, unsafe.Pointer(data), n)
+	}
 
 	// If crashing, print a copy to the SetCrashOutput fd.
 	gp := getg()

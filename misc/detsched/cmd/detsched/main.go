@@ -39,11 +39,13 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -182,18 +184,37 @@ type search struct {
 	refused    int    // forks the program refused
 	refusal    string // why the search stopped forking, or ""
 	yieldSites []string
-	predicted  []string // deadlocks the lock order predicts
+	predicted  []string                // deadlocks the lock order predicts
+	directed   [2]int                  // runs directed at predicted deadlocks, and those that failed
+	bigOutput  int64                   // the most output a run wrote
+	asserts    map[string]*assertCount // sometimes and reachable assertions, by kind and message
+}
+
+// An assertCount counts the runs that reached an assertion, and the runs
+// in which it held.
+type assertCount struct {
+	kind, msg  string
+	runs, held int
 }
 
 // A group is the failing runs with one signature.
 type group struct {
-	key    string   // the signature with numbers masked
-	sig    string   // the signature of the first run
-	runs   int      // runs that failed this way
-	logs   []string // the kept logs
-	replay string   // the command that replays the first run
-	debug  string   // the same under Delve
-	status string   // whether running replay reproduced the failure
+	key    string           // the signature with numbers masked
+	sig    string           // the signature of the first run
+	runs   int              // runs that failed this way
+	logs   []string         // the kept logs
+	replay string           // the command that replays the first run
+	debug  string           // the same under Delve
+	status string           // whether running replay reproduced the failure
+	index  int              // its number, from 1, which its logs' names have
+	also   map[string]*also // other failures in its runs, by key
+}
+
+// An also is a failure of another kind in a group's runs, such as a
+// symptom of the failure the runs fail with first.
+type also struct {
+	sig  string // its signature in the first run that had it
+	runs int
 }
 
 // keepLogs is how many logs of each group a search keeps.
@@ -215,6 +236,7 @@ func newSearch(pkg, bin, run string) (*search, error) {
 		roots:   map[int]bool{},
 		running: map[*liveRun]bool{},
 		claimed: map[int]bool{},
+		asserts: map[string]*assertCount{},
 		rng:     rand.New(rand.NewPCG(1, 2)),
 		only:    -1,
 	}
@@ -312,11 +334,15 @@ type result struct {
 	exitCode    int
 	timedOut    bool
 	wall        time.Duration
-	outOfMem    bool // stopped because memory ran out
+	outOfMem    bool  // stopped because memory ran out
+	outputSize  int64 // the bytes of output it wrote, which may be more than output holds
 }
 
 var (
 	traceLine     = regexp.MustCompile(`(?m)^detsched: trace=0x[0-9a-f]+ switches=\d+ syncs=\d+$`)
+	traceHash     = regexp.MustCompile(`(?m)^detsched: trace=(0x[0-9a-f]+) `)
+	branchWrapper = regexp.MustCompile(`\(GODETBRANCH=\d+ runs it in place\)$`)
+	assertCounts  = regexp.MustCompile(`(?m)^detsched: assert (sometimes|reachable) true=(\d+) false=\d+ (.*)$`)
 	switchesField = regexp.MustCompile(` switches=(\d+) `)
 	syncsField    = regexp.MustCompile(` syncs=(\d+)$`)
 	setupLine     = regexp.MustCompile(`(?m)^detsched: setup complete at switch (\d+)$`)
@@ -365,12 +391,26 @@ func (r *result) signature() string {
 // bug makes one group.
 // An assertion failure's key is its message, without its details or the
 // count of other failures.
-func (r *result) key() string {
-	sig := r.signature()
+func (r *result) key() string { return failureKey(r.signature()) }
+
+// failureKey returns the key of a signature.
+func failureKey(sig string) string {
 	if m := assertDetails.FindStringIndex(sig); m != nil {
 		sig = sig[:m[0]]
 	}
 	return masked.ReplaceAllString(sig, "N")
+}
+
+// failures returns the run's assertion failures, panics, and fatal
+// errors, each once.
+func (r *result) failures() []string {
+	var lines []string
+	for _, line := range failureLine.FindAll(r.output, -1) {
+		if l := truncate(string(line), 200); !slices.Contains(lines, l) {
+			lines = append(lines, l)
+		}
+	}
+	return lines
 }
 
 // branch returns the number of the composer branch the failure happened
@@ -425,6 +465,10 @@ func (s *search) replayLine(r *result, debug bool) string {
 		env = addSearch(env, "tape="+r.tape)
 	}
 	env = addSearch(env, yieldField(r.yield)...)
+	// The schedule the line replays, which the run checks its own against.
+	if m := traceHash.FindSubmatch(r.output); m != nil {
+		env = addSearch(env, "trace="+string(m[1]))
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "cd %s && ", quote(s.dir))
 	for _, e := range slices.Concat(env, r.env, s.vars) {
@@ -541,6 +585,60 @@ func quote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// maxOutput is the most of a run's output detsched keeps: its first and
+// last halves, with a line where the rest was, so that a run that writes
+// gigabytes does not run the search out of memory. The failure lines and
+// the fault timeline come at the end of the output.
+const maxOutput = 16 << 20
+
+// A cappedOutput keeps the first and the last maxOutput/2 bytes written to
+// it.
+type cappedOutput struct {
+	head, tail []byte // tail is a ring once full, starting at at
+	at         int
+	n          int64 // bytes written
+}
+
+func (c *cappedOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	c.n += int64(n)
+	k := min(len(p), maxOutput/2-len(c.head))
+	c.head = append(c.head, p[:k]...)
+	for p = p[k:]; len(p) > 0; {
+		if len(c.tail) < maxOutput/2 {
+			k := min(len(p), maxOutput/2-len(c.tail))
+			c.tail = append(c.tail, p[:k]...)
+			p = p[k:]
+			continue
+		}
+		k := copy(c.tail[c.at:], p)
+		c.at = (c.at + k) % len(c.tail)
+		p = p[k:]
+	}
+	return n, nil
+}
+
+func (c *cappedOutput) bytes() []byte {
+	if c.n <= maxOutput {
+		return append(c.head, c.tail...)
+	}
+	cut := fmt.Sprintf("\n[detsched: %d bytes of the run's output cut here]\n", c.n-maxOutput)
+	return slices.Concat(c.head, []byte(cut), c.tail[c.at:], c.tail[:c.at])
+}
+
+// readOutput reads a run's output from the file named name, as a
+// cappedOutput keeps it, and returns it and its size.
+func readOutput(name string) ([]byte, int64) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, 0
+	}
+	defer f.Close()
+	var c cappedOutput
+	io.Copy(&c, f)
+	return c.bytes(), c.n
+}
+
 // errCanceled reports a run stopped because the search ended.
 var errCanceled = errors.New("canceled")
 
@@ -548,7 +646,7 @@ var errCanceled = errors.New("canceled")
 // forks, and stops the group when the run takes longer than s.timeout or
 // ctx is done.
 func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
-	var out bytes.Buffer
+	var out cappedOutput
 	cmd.Stdout, cmd.Stderr = &out, &out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = time.Second // a branch left behind may hold the output open
@@ -584,7 +682,7 @@ func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
 	}
 	r.wall = time.Since(start)
 	r.outOfMem = untrack()
-	r.output = out.Bytes()
+	r.output, r.outputSize = out.bytes(), out.n
 	if ee, ok := err.(*exec.ExitError); ok {
 		r.exitCode = ee.ExitCode()
 	} else if err != nil && !errors.Is(err, exec.ErrWaitDelay) {
@@ -646,7 +744,10 @@ func (s *search) run(ctx context.Context, n uint64) error {
 		}()
 	}
 	wg.Wait()
-	if firstErr == nil {
+	// Stopped by a signal, the search ends at once, before what the
+	// sender may kill it for (as a tool's stop often follows SIGTERM
+	// with SIGKILL a second later).
+	if firstErr == nil && !errors.Is(ctx.Err(), context.Canceled) {
 		s.recheck()
 	}
 	return firstErr
@@ -675,7 +776,15 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	s.mu.Lock()
 	s.predict(r.output)
+	s.countAsserts(r.output)
+	s.bigOutput = max(s.bigOutput, r.outputSize)
 	s.runs++
+	if a == armDirected {
+		s.directed[0]++
+		if r.failed() && !r.tooLong() && !r.outOfMem {
+			s.directed[1]++
+		}
+	}
 	if r.tooLong() {
 		s.tooLong++
 		s.mu.Unlock()
@@ -698,14 +807,26 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	g := s.byKey[r.key()]
 	first := g == nil
 	if first {
-		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying"}
+		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}}
 		s.byKey[g.key] = g
 		s.groups = append(s.groups, g)
 	}
 	g.runs++
+	counted := map[string]bool{g.key: true}
+	for _, line := range r.failures() {
+		k := failureKey(line)
+		if counted[k] || branchWrapper.MatchString(line) {
+			continue // the timeline's report of its failed branch, whose failure comes first
+		}
+		counted[k] = true
+		if g.also[k] == nil {
+			g.also[k] = &also{sig: line}
+		}
+		g.also[k].runs++
+	}
 	var log string
 	if len(g.logs) < keepLogs {
-		log = s.temp(fmt.Sprintf("fail-%d.log", s.failed))
+		log = s.temp(fmt.Sprintf("fail-%d-%d.log", g.index, len(g.logs)+1))
 		g.logs = append(g.logs, log)
 	}
 	if first {
@@ -892,6 +1013,9 @@ func (s *search) summary(w io.Writer) {
 	if s.refusal != "" {
 		fmt.Fprintf(w, "detsched: the program refused to fork (%s), so the search ran fresh seeds only\n", s.refusal)
 	}
+	if len(s.predicted) > 0 {
+		fmt.Fprintf(w, "detsched: lock pairs that runs took in both orders, which predict a deadlock, or a false alarm when a lock's memory was freed and reused for another lock; %d runs were directed at them, holding the first lock longer, and %d of those failed:\n", s.directed[0], s.directed[1])
+	}
 	for _, p := range s.predicted {
 		fmt.Fprintf(w, "detsched: predicted deadlock: %s\n", p)
 	}
@@ -902,15 +1026,74 @@ func (s *search) summary(w io.Writer) {
 		fmt.Fprintf(w, "detsched: %d runs made 1000 times the switches of the first and were stopped, not counted as failures\n", s.tooLong)
 	}
 	fmt.Fprintf(w, "detsched: slowest passing run %v, slowest failing run %v; -timeout is %v\n", s.slowPass.Round(time.Millisecond), s.slowFail.Round(time.Millisecond), s.timeout)
+	s.assertSummary(w)
 	for _, g := range s.groups {
 		fmt.Fprintf(w, "\nFAIL %d of %d runs: %s\n", g.runs, s.runs, g.sig)
 		more := ""
 		if len(g.logs) > 1 {
-			more = fmt.Sprintf(" (and %d more in %s)", len(g.logs)-1, s.out)
+			more = fmt.Sprintf(" (and %d more of these runs: %s)", len(g.logs)-1, filepath.Join(s.out, fmt.Sprintf("fail-%d-*.log", g.index)))
 		}
 		fmt.Fprintf(w, "\tlog:    %s%s\n", g.logs[0], more)
 		fmt.Fprintf(w, "\treplay: %s\n\tdebug:  %s\n", g.replay, g.debug)
 		fmt.Fprintf(w, "\tthe replay %s\n", verdict(g.status))
+		alsos := slices.SortedFunc(maps.Values(g.also), func(a, b *also) int { return cmp.Or(b.runs-a.runs, strings.Compare(a.sig, b.sig)) })
+		for i, a := range alsos {
+			if i == 5 {
+				fmt.Fprintf(w, "\tand %d other kinds of failure\n", len(alsos)-i)
+				break
+			}
+			fmt.Fprintf(w, "\talso in %d of these runs: %s\n", a.runs, a.sig)
+		}
+	}
+}
+
+// countAsserts counts the sometimes and reachable assertions of a run's
+// report, at the end of its output, after the last trace line (a failing
+// branch's report comes first). s.mu must be held.
+func (s *search) countAsserts(out []byte) {
+	if i := bytes.LastIndex(out, []byte("\ndetsched: trace=")); i >= 0 {
+		out = out[i:]
+	}
+	for _, m := range assertCounts.FindAllSubmatch(out, -1) {
+		if bytes.HasPrefix(m[3], []byte("compose: ")) || bytes.HasPrefix(m[3], []byte("nemesis: ")) {
+			continue // the SDK's own, which the fault timeline shows
+		}
+		k := string(m[1]) + " " + string(m[3])
+		c := s.asserts[k]
+		if c == nil {
+			c = &assertCount{kind: string(m[1]), msg: string(m[3])}
+			s.asserts[k] = c
+		}
+		c.runs++
+		if string(m[2]) != "0" {
+			c.held++
+		}
+	}
+}
+
+// assertSummary prints the sometimes and reachable assertions, those never
+// true first. s.mu must be held.
+func (s *search) assertSummary(w io.Writer) {
+	if len(s.asserts) == 0 {
+		return
+	}
+	cs := slices.SortedFunc(maps.Values(s.asserts), func(a, b *assertCount) int {
+		return cmp.Or(cmp.Compare(min(a.held, 1), min(b.held, 1)), strings.Compare(a.kind, b.kind), strings.Compare(a.msg, b.msg))
+	})
+	fmt.Fprintf(w, "detsched: sometimes and reachable assertions (one no run reached is not listed; messages are cut at 56 bytes):\n")
+	for i, c := range cs {
+		if i == 40 {
+			fmt.Fprintf(w, "\t(and %d more)\n", len(cs)-i)
+			break
+		}
+		switch {
+		case c.kind == "reachable":
+			fmt.Fprintf(w, "\treachable %q: reached in %d runs\n", c.msg, c.held)
+		case c.held == 0:
+			fmt.Fprintf(w, "\tsometimes %q: NEVER TRUE, in the %d runs that reached it\n", c.msg, c.runs)
+		default:
+			fmt.Fprintf(w, "\tsometimes %q: true in %d of the %d runs that reached it\n", c.msg, c.held, c.runs)
+		}
 	}
 }
 

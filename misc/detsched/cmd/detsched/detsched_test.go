@@ -518,6 +518,29 @@ func TestSimBranchInline(t *testing.T) {
 	if inline.trace != forked.trace { // the first trace line, the branch's
 		t.Errorf("%s: trace %q, want the forked branch's %q", m[2], inline.trace, forked.trace)
 	}
+	// A process forked from the timeline after the branch failed, as a
+	// search forks a cell's stopped program, writes the branch's output
+	// too: here, a child that goes on as the run did, from the timeline's
+	// last switch, writes what the run wrote.
+	traces := switchesField.FindAllStringSubmatch(forked.stderr, -1)
+	if len(traces) == 0 {
+		t.Fatalf("no trace line of the timeline:\n%s", forked.stderr)
+	}
+	srv, err := startForkServer(command(bin, env...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+	if ok, err := srv.run(atou(traces[len(traces)-1][1]) - 1); !ok || err != nil {
+		t.Fatalf("run to the timeline's last switch: %v, %v", ok, err)
+	}
+	child, err := srv.branchOutcome(1|detBranchGoesOn, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.stdout != forked.stdout || child.exitCode != forked.exitCode {
+		t.Errorf("forked after the branch failed: exit status %d, stdout\n%s\nwant %d and the run's\n%s", child.exitCode, child.stdout, forked.exitCode, forked.stdout)
+	}
 	passing := []string{"GODETSEED=1"}
 	a, _, err := runBin(bin, passing...)
 	if err != nil {

@@ -517,9 +517,11 @@ func detRandInit(pp *p) {
 //	maxswitches=N         fail after N switches since the last branch
 //	perturb=off|walk|pct  use one strategy instead of drawing one per run
 //	quantum=N             ticks per quantum without perturbation (see detQuantum)
+//	trace=0xH             the schedule hash the run should have (see detExpectTrace)
 //
 // Replaying a run needs the fields that change what it does: all but
-// fork, feedback, and cover.
+// fork, feedback, cover, and trace, which a replay line adds to check the
+// replay.
 func detSearchInit() {
 	s := gogetenv("GODETSEARCH")
 	for s != "" {
@@ -545,6 +547,8 @@ func detSearchInit() {
 			detFeedYieldInit(v)
 		case "maxswitches":
 			detMaxSwitches, ok = atoi64u(v)
+		case "trace":
+			detExpectTrace, ok = detParseHex(v)
 		case "quantum":
 			var n uint64
 			n, ok = atoi64u(v)
@@ -569,6 +573,33 @@ func detSearchInit() {
 			fatal("GODETSEARCH has an unknown field or a bad value")
 		}
 	}
+}
+
+// detExpectTrace is the schedule hash of the run a replay line replays,
+// or 0. A replay that runs another schedule says so at exit, as it may not
+// do what the run did, which only its trace line shows otherwise.
+var detExpectTrace uint64
+
+// detParseHex parses a hexadecimal number with a 0x prefix.
+func detParseHex(s string) (uint64, bool) {
+	s, ok := stringslite.CutPrefix(s, "0x")
+	if !ok || s == "" || len(s) > 16 {
+		return 0, false
+	}
+	var h uint64
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case '0' <= c && c <= '9':
+			c -= '0'
+		case 'a' <= c && c <= 'f':
+			c -= 'a' - 10
+		default:
+			return 0, false
+		}
+		h = h<<4 | uint64(c)
+	}
+	return h, true
 }
 
 // detSeedStreams seeds pp's random state and sched stream from the key
@@ -638,6 +669,9 @@ func detTraceReport() {
 		unlock(&allpLock)
 	}
 	print("detsched: trace=", hex(h), " switches=", n, " syncs=", detSyncStep(), "\n")
+	if detExpectTrace != 0 && h != detExpectTrace {
+		print("detsched: warning: this run's schedule is not the one its replay line was printed for (trace=", hex(detExpectTrace), "), so it may not do what that run did. Its environment, the files it reads, or the binary differ from the search's: a variable set here that the search's environment did not have, such as NO_COLOR, can change the schedule; unset it with env -u NAME\n")
+	}
 	if detBranchChild {
 		print("detsched: branch ", detBranchN, " (GODETBRANCH=", detBranchN, " runs it in place)\n")
 	}
@@ -681,9 +715,115 @@ type detChunk struct {
 }
 
 var detOut struct {
+	detChunks
+	flushed   bool // output has been written; write directly from now on
+	onFailure bool // write it only if the exit status is nonzero; see detsimBranch
+
+	// share, in a forked branch, is memory shared with the timeline,
+	// which takes the branch's output from it if the branch fails (see
+	// detsimBranch): everything the branch writes to fds 1 and 2 goes
+	// there instead.
+	share *detShare
+	// branch is the number of the branch whose output the timeline took,
+	// which heads the buffered output, or 0.
+	branch int
+}
+
+// detChunks is a list of chunks of buffered output.
+type detChunks struct {
 	head, tail *detChunk
-	flushed    bool // output has been written; write directly from now on
-	onFailure  bool // write it only if the exit status is nonzero; see detsimBranch
+}
+
+// add appends a record of p, written to fd, to l. It does not allocate
+// from the heap.
+func (l *detChunks) add(fd byte, p []byte) {
+	for rest := p; len(rest) > 0; {
+		c := l.tail
+		if c == nil || len(c.data)-c.n < 6 {
+			c = (*detChunk)(persistentalloc(unsafe.Sizeof(detChunk{}), 8, &memstats.other_sys))
+			if c == nil {
+				throw("detsched: out of memory for the buffered output")
+			}
+			if l.tail == nil {
+				l.head = c
+			} else {
+				l.tail.next = c
+			}
+			l.tail = c
+		}
+		n := min(len(rest), len(c.data)-c.n-5)
+		c.data[c.n] = fd
+		c.data[c.n+1] = byte(n)
+		c.data[c.n+2] = byte(n >> 8)
+		c.data[c.n+3] = byte(n >> 16)
+		c.data[c.n+4] = byte(n >> 24)
+		copy(c.data[c.n+5:], rest[:n])
+		c.n += 5 + n
+		rest = rest[n:]
+	}
+}
+
+// A detShare holds a forked branch's output for the timeline that forked
+// it, in records as in a detChunk: the first n bytes of data, or all of
+// data if n is larger, as when cut is set because a record did not fit.
+// It is mapped shared before the fork (see detsimBranch).
+type detShare struct {
+	n    atomic.Uint64
+	cut  atomic.Uint32
+	data [detShareSize - 16]byte
+}
+
+// detShareSize is the size of a branch's output the timeline takes, at
+// most. Only the pages the branch writes take memory.
+const detShareSize = 64 << 20
+
+// write appends a record of n bytes at p, written to fd, to s.
+//
+//go:nosplit
+func (s *detShare) write(fd uintptr, p unsafe.Pointer, n int) {
+	need := uint64(5 + n)
+	off := s.n.Add(int64(need)) - need
+	if off+need > uint64(len(s.data)) {
+		s.cut.Store(1)
+		return
+	}
+	b := s.data[off : off+need]
+	b[0] = byte(fd)
+	b[1] = byte(n)
+	b[2] = byte(n >> 8)
+	b[3] = byte(n >> 16)
+	b[4] = byte(n >> 24)
+	memmove(unsafe.Pointer(&b[5]), p, uintptr(n))
+}
+
+// detOutTakeBranch puts the output that failing branch n left in s at the
+// head of the buffered output, as it would have come first had the branch
+// written it, so that every process forked later, such as a cell of a
+// search, writes it with the failure the branch left.
+func detOutTakeBranch(s *detShare, n int) {
+	var l detChunks
+	end := min(s.n.Load(), uint64(len(s.data)))
+	for i := uint64(0); i+5 <= end; {
+		fd := s.data[i]
+		k := uint64(s.data[i+1]) | uint64(s.data[i+2])<<8 | uint64(s.data[i+3])<<16 | uint64(s.data[i+4])<<24
+		if fd != 1 && fd != 2 || i+5+k > end {
+			break // a write the branch did not finish, or room it did not fill
+		}
+		l.add(fd, s.data[i+5:i+5+k])
+		i += 5 + k
+	}
+	if s.cut.Load() != 0 {
+		l.add(2, []byte("detsched: the branch's output was cut at 64 MiB\n"))
+	}
+	if l.head == nil {
+		return
+	}
+	l.tail.next = detOut.head
+	detOut.head = l.head
+	if detOut.tail == nil {
+		detOut.tail = l.tail
+	}
+	detOut.branch = n
 }
 
 // syscall_detStartProcess reports that the running goroutine starts the
@@ -713,32 +853,13 @@ func syscall_detWrite(fd int, p []byte) int {
 	mp := acquirem()
 	defer releasem(mp)
 	if detOut.flushed {
+		if detOut.share != nil {
+			detOut.share.write(uintptr(fd), unsafe.Pointer(&p[0]), len(p))
+			return len(p)
+		}
 		return int(write1(uintptr(fd), unsafe.Pointer(&p[0]), int32(len(p))))
 	}
-	for rest := p; len(rest) > 0; {
-		c := detOut.tail
-		if c == nil || len(c.data)-c.n < 6 {
-			c = (*detChunk)(persistentalloc(unsafe.Sizeof(detChunk{}), 8, &memstats.other_sys))
-			if c == nil {
-				throw("detsched: out of memory for the buffered output")
-			}
-			if detOut.tail == nil {
-				detOut.head = c
-			} else {
-				detOut.tail.next = c
-			}
-			detOut.tail = c
-		}
-		n := min(len(rest), len(c.data)-c.n-5)
-		c.data[c.n] = byte(fd)
-		c.data[c.n+1] = byte(n)
-		c.data[c.n+2] = byte(n >> 8)
-		c.data[c.n+3] = byte(n >> 16)
-		c.data[c.n+4] = byte(n >> 24)
-		copy(c.data[c.n+5:], rest[:n])
-		c.n += 5 + n
-		rest = rest[n:]
-	}
+	detOut.add(byte(fd), p)
 	return len(p)
 }
 
@@ -764,8 +885,15 @@ func detOutputFlush(code int) {
 }
 
 // detWriteAll writes all of b to fd, retrying for a while if fd is
-// nonblocking and full. It does not allocate.
+// nonblocking and full, or in a forked branch, to the memory it shares
+// with the timeline. It does not allocate.
 func detWriteAll(fd uintptr, b []byte) {
+	if detOut.share != nil {
+		if len(b) > 0 {
+			detOut.share.write(fd, unsafe.Pointer(&b[0]), len(b))
+		}
+		return
+	}
 	for j, retries := 0, 0; j < len(b) && retries < 1000; {
 		w := write1(fd, unsafe.Pointer(&b[j]), int32(len(b)-j))
 		if w <= 0 {

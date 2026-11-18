@@ -19,9 +19,11 @@
 //     other and with copies of themselves, up to a limit drawn for the
 //     timeline. A Serial command runs alone: the composer stops starting
 //     parallel ones and waits for those running to return first.
-//     Anytime commands run alongside any driver. In a timeline with
-//     Singleton commands, half the time one of them runs as the only
-//     driver, and the drive phase ends when it returns. The drive phase
+//     Anytime commands run alongside any driver, until one fails: it
+//     does not run again in that timeline, as it would only report the
+//     same failure again. In a timeline with Singleton commands, half
+//     the time one of them runs as the only driver, and the drive phase
+//     ends when it returns. The drive phase
 //     lasts from 15 seconds (or half of Config.Budget, if less) to all of
 //     Config.Budget, drawn log-uniformly, and starts over
 //     after each branch of a guided search (lifecycle.Branches).
@@ -150,6 +152,7 @@ type command struct {
 	faultsOn bool
 	weight   int
 	index    int
+	failed   bool // an anytime check that failed, which runs no more
 }
 
 // A run is one execution of a command.
@@ -226,7 +229,7 @@ func (c *Composer) Singleton(name string, f func(*Ctx) error) { c.add(singleton,
 
 // Anytime registers a check that runs now and then during the drive
 // phase, alongside any driver, such as that a read reflects the last
-// acknowledged write.
+// acknowledged write. Once it fails, it runs no more in the timeline.
 func (c *Composer) Anytime(name string, f func(*Ctx) error, opts ...Option) {
 	c.add(anytime, name, f, opts)
 }
@@ -463,6 +466,7 @@ func (c *Composer) finished(r *run) {
 	c.running = slices.DeleteFunc(c.running, func(x *run) bool { return x == r })
 	assert.Always(r.err == nil, "compose: "+kindNames[r.cmd.kind]+" "+r.cmd.name+" succeeds", map[string]any{"err": fmt.Sprint(r.err)})
 	if r.err != nil {
+		r.cmd.failed = true
 		c.failures = append(c.failures, fmt.Sprintf("%s %s: %v", kindNames[r.cmd.kind], r.cmd.name, r.err))
 	}
 }
@@ -577,7 +581,7 @@ func (c *Composer) drive() {
 		}
 		var idleAnys []*command
 		for _, a := range anys {
-			if !slices.ContainsFunc(c.running, func(r *run) bool { return r.cmd == a }) {
+			if !a.failed && !slices.ContainsFunc(c.running, func(r *run) bool { return r.cmd == a }) {
 				idleAnys = append(idleAnys, a)
 			}
 		}

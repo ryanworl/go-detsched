@@ -12,13 +12,17 @@ Delve 1.27.2, on linux/amd64 and darwin/arm64.
 
 ## Install Delve
 
+The release archive has Delve 1.27.2 in `bin/`, next to `go` and
+`detsched`, so the `debug:` lines run it once that directory is on your
+`PATH` (Delve's license is in `misc/delve/LICENSE`). To use another
+version, install it with any Go toolchain; it needs to be 1.27.2 or later
+to read Go 1.27 binaries:
+
 ```
 go install github.com/go-delve/delve/cmd/dlv@latest
 ```
 
-Any Go toolchain can build it; it needs to be 1.27.2 or later to read Go
-1.27 binaries. On macOS, Delve uses `debugserver` from the Xcode command
-line tools.
+On macOS, Delve uses `debugserver` from the Xcode command line tools.
 
 ## Replay first
 
@@ -307,8 +311,11 @@ refused anyway on optimized functions (`can not call optimized function`).
   quotes:
   `print "github.com/ryanworl/go-detsched/misc/detsched/sdk/sim".world`.
   An unquoted path does not parse (`expected operand, found 'go'`).
-- Type assertions need the quoted path too:
-  `print x.(*"github.com/twmb/franz-go/pkg/kmsg".OffsetCommitRequest)`.
+- Type assertions take the package's name, `print x.(*kmsg.OffsetCommitRequest)`;
+  a quoted path does not parse there (`expected type, found
+  "github.com/twmb/franz-go/pkg/kmsg"`). You rarely need one: Delve looks
+  through an interface by itself, so `print x` shows the dynamic type and
+  value, and `print x.Field` reads a field of the value inside.
 - Expressions cannot call functions or methods. Read fields instead.
 - Long values are cut; raise `config max-string-len 1000`,
   `config max-array-values 1000`, or `config max-variable-recurse 3`.
@@ -474,13 +481,20 @@ Delve without a terminal, saving everything it prints:
 
 ```
 cd /home/me/kv && GODETSEED=7 GODETBRANCH=10 \
-  dlv exec --disable-aslr /tmp/detsched-1234/kv.test --init cmds.dlv --allow-non-terminal-interactive=true </dev/null >dlv.out 2>&1
-sed 's/\x1b\[[0-9;]*m//g' dlv.out | grep -a -v '^>>' | grep -a -E '^> |^\t'
+  dlv exec --disable-aslr /tmp/detsched-1234/kv.test -r stdout:prog.out -r stderr:prog.err --init cmds.dlv --allow-non-terminal-interactive=true </dev/null >dlv.out 2>&1
+sed 's/\x1b\[[0-9;]*m//g' dlv.out | grep -a -v '^>>' | grep -a -E $'^> |^\t'
 ```
 
 - A command that fails prints an error and the script goes on.
 - Delve runs out of commands at the end of the file and exits; with
   breakpoints rather than tracepoints, add a `continue` per stop you want.
-- The program's own output is interleaved with Delve's in `dlv.out`.
+- `-r` sends the program's own output, including its trace line, to
+  `prog.out` and `prog.err`, so that `dlv.out` holds only what Delve
+  prints. Without it the two are interleaved in `dlv.out`, and a program
+  that prints a lot buries the tracepoints.
+- A tracepoint's hit is a line starting with `> `, and each `on` print
+  under it starts with a tab, a real one: `$'...'` makes the shell put it
+  in the pattern, as `grep -E` reads `\t` as a plain `t`. A printed
+  struct takes several lines, each indented with tabs.
 - `goroutines`, `stack`, and `print` after the last `continue` read the
   state where the run stopped.

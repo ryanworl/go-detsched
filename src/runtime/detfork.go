@@ -306,9 +306,11 @@ func detForkProcess() (pid int64, child bool) {
 // timeline, as Antithesis does, so that the timeline goes on: the child
 // runs the check and exits, and the parent waits for it, then continues as
 // if it had not forked. Only the goroutine holding the P runs while the
-// parent waits, so its schedule does not change. A branch writes its
-// output only if it fails, and then before the parent's buffered output,
-// so a driver sees its failure first.
+// parent waits, so its schedule does not change. A branch's output shows
+// only if it fails: the branch writes it to memory it shares with the
+// parent, which puts it at the head of its own buffered output, so that a
+// driver sees the branch's failure first, and a process forked from the
+// parent later, such as a search's cell, has the output with the failure.
 
 // detsimBranch forks a branch that ends the timeline. In the child it
 // returns the branch's number, from 1, which GODETBRANCH takes to run
@@ -334,6 +336,10 @@ func detsimBranch(msg string) int {
 		detBranchChild = true
 		return detBranchN
 	}
+	var share *detShare
+	if p, err := mmap(nil, detShareSize, _PROT_READ|_PROT_WRITE, _MAP_ANON|detMAP_SHARED, -1, 0); err == 0 {
+		share = (*detShare)(p)
+	}
 	pid, child := detForkProcess()
 	if child {
 		detBranchChild = true
@@ -347,7 +353,11 @@ func detsimBranch(msg string) int {
 		detFeed.out, detFeed.seen = 0, nil
 		detOut.head, detOut.tail = nil, nil // the parent writes what came before
 		detOut.onFailure = true
+		detOut.share = share // without it, the branch writes its output itself
 		return detBranchN
+	}
+	if share != nil {
+		defer munmap(unsafe.Pointer(share), detShareSize)
 	}
 	if pid < 0 {
 		return 0
@@ -368,6 +378,9 @@ func detsimBranch(msg string) int {
 		what := " exited with status "
 		if sig := status & 0x7f; sig != 0 {
 			code, what = uint64(sig), " died of signal "
+		}
+		if share != nil {
+			detOutTakeBranch(share, detBranchN)
 		}
 		n := string(itoa(nbuf[:], uint64(detBranchN)))
 		detSDKAssert(detAssertAlways, false, msg, "branch "+n+what+string(itoa(buf[:], code))+" (GODETBRANCH="+n+" runs it in place)")
