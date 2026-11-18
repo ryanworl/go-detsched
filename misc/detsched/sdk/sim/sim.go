@@ -607,7 +607,11 @@ func (n *Node) Stop(grace time.Duration) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if n.inc == inc {
-		n.crash(true)
+		ev := "process exit after stop"
+		if runtime_count(inc.handle) > 0 {
+			ev = "stop's grace ran out: process crash"
+		}
+		n.crashAs(true, ev)
 	}
 }
 
@@ -741,6 +745,15 @@ func (n *Node) endThrottle() {
 func (n *Node) Throttled() bool { return n.throttled && n.inc != nil }
 
 func (n *Node) crash(process bool) {
+	ev := "power failure"
+	if process {
+		ev = "process crash"
+	}
+	n.crashAs(process, ev)
+}
+
+// crashAs is crash, with ev for the fault timeline.
+func (n *Node) crashAs(process bool, ev string) {
 	// End the throttle first: the goroutine running crash may yield on
 	// the way, and must not leave the node half crashed meanwhile, with
 	// its memory unmapped and its descriptors closed but its goroutines
@@ -752,11 +765,7 @@ func (n *Node) crash(process bool) {
 		return
 	}
 	self := runtime_node() == inc.handle
-	if process {
-		n.w.logEvent(n.name, "process crash")
-	} else {
-		n.w.logEvent(n.name, "power failure")
-	}
+	n.w.logEvent(n.name, ev)
 	runtime_call(func() {
 		n.w.crash(inc, process)
 		n.inc = nil

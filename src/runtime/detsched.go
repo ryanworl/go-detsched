@@ -229,7 +229,7 @@ func detExecute(pp *p, gp *g, inheritTime bool) {
 	if detBusy.on {
 		detBusyClamp(gp)
 	}
-	if len(detStops.points) > 0 {
+	if detStops.on {
 		detStopsCheck(pp, gp)
 	}
 }
@@ -306,6 +306,9 @@ var detTicks int32
 //
 //go:nosplit
 func detPreempt() {
+	if detDebug.nwatch > 0 && detWatchEntry(sys.GetCallerPC()) && detTicks > 0 {
+		return
+	}
 	gp := getg()
 	if detTicks <= 0 && detTickNow() >= detStops.next {
 		// A stop is due (see detstop.go). On a system stack it waits

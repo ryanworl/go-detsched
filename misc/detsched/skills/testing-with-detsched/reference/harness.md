@@ -1,9 +1,10 @@
 # Writing a harness with sim and compose
 
-A harness is a Go test in its own package that runs the system under test (SUT) on simulated nodes, drives a workload against it while faults happen, and checks what the SUT promises. `misc/detsched/testdata/simcompose` in the release archive is a complete small example: read it before writing a new one.
+A harness is a Go test in its own package that runs the system under test (SUT) on simulated nodes, drives a workload against it while faults happen, and checks what the SUT promises. `misc/detsched/testdata/simcompose` in the release archive is a complete small example: read it before writing a new one. For a library used inside one process, such as an embedded store, a cache, or a queue, see "A harness for a library in one process" first: it needs neither nodes nor compose.
 
 ## Contents
 
+- A harness for a library in one process
 - Shape of a harness
 - Nodes, goroutines, and shared state
 - Locks and callbacks
@@ -12,6 +13,38 @@ A harness is a Go test in its own package that runs the system under test (SUT) 
 - Checks that find the bug, not only its symptom
 - Before the first long search
 - Comparing the SUT before and after a fix
+
+## A harness for a library in one process
+
+When the SUT is a library the program calls in one process, with no network, a plain `synctest.Test` with goroutines is the whole harness: every goroutine in the bubble is scheduled by detsched and every seed draws another interleaving. Use `sdk/assert` for the checks, so that `detsched` groups failures by message, and draw the workload from the seed with `math/rand` or `sim.Intn` (both work without a World).
+
+```go
+func TestStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		db := store.Open(store.Options{Shards: 1 + rand.IntN(4)}) // draw options per run
+		var wg sync.WaitGroup
+		for w := range 4 {
+			wg.Go(func() {
+				for i := range 200 {
+					key, val := fmt.Sprintf("w%d-k%d", w, rand.IntN(8)), fmt.Sprint(i)
+					if err := db.Put(key, val); err != nil {
+						assert.Unreachable("put failed", map[string]any{"err": err.Error()})
+						return
+					}
+					got, _ := db.Get(key) // a goroutine reads its own write
+					assert.Always(got == val, "read returns own latest write", map[string]any{"key": key, "want": val, "got": got})
+				}
+			})
+		}
+		wg.Wait()
+		db.Close()
+	})
+}
+```
+
+- Keep assertion messages constant and put values in the details: the message is the failure's group, so a value in it splits one bug into many groups.
+- To crash the library's process and reopen its files, and to inject disk faults (failed fsyncs, power failures, a full disk), run it on one sim node instead: `w := sim.NewWorld(...)`, `n := w.AddNode("db", "10.0.0.1")`, open the store in `n.Start(f)`, and crash it with `n.Kill()` or `n.KillProcess()` from the test body. Files the library opens on the node live on the node's simulated disk. sim's disk faults (a full disk, read errors, failed fsyncs, slow syncs) can start at time 0, during the library's first open: wrap setup in `w.SetCalm(true)` and `w.SetCalm(false)`, as compose's `First` does, unless setup under faults is what you test.
+- A goroutine the library starts and its `Close` does not wait for, such as an idle timer, stays blocked when the test body returns, and synctest fails the run with `deadlock: main bubble goroutine has exited but blocked goroutines remain`. That is the SUT's behavior, not a harness bug: the summary names the goroutines left over. Wait in the harness for it to exit (sleep past its timer after `Close`), so that the search counts the bug you are looking for.
 
 ## Shape of a harness
 

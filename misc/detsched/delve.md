@@ -8,19 +8,38 @@ how to do that and lists the traps that cost time.
 
 Every command here was run against `testdata/simcompose` (with
 `SIMCOMPOSE_BUG=1`) and an unpublished hashicorp/raft harness, with
-Delve 1.27.2, on linux/amd64 and darwin/arm64.
+the Delve the release bundles, on linux/amd64 and darwin/arm64.
+
+In short, with the bundled Delve:
+
+- every stop and every tracepoint line ends with the run's position,
+  ` at t25.380001899 s4265 k128779 node server (start 3)`, and
+  `detsched.time`, `detsched.tick`, `detsched.switches` and
+  `detsched.node` read it in expressions
+  ([Where the run is](#where-the-run-is));
+- `goroutines -with node server` lists one node's goroutines;
+- `restart t9.4`, `restart s4400` or `restart k128779` runs the replay
+  again to a point, `checkpoint` and `restart c1` go back to a stop, and
+  `rewind` to the previous one ([Go back](#go-back));
+- `cond -hitcount NAME == 1000000` on a hot function stops at that hit in
+  a fraction of a second, since the runtime counts the hits
+  ([Many hits](#many-hits-conditions-and-tracepoints));
+- `dlv --json` prints one JSON object per line, and `exit` lets the
+  program print its trace line ([Script Delve](#script-delve)).
 
 ## Install Delve
 
 The release archive has Delve 1.27.2 in `bin/`, next to `go` and
 `detsched`, so the `debug:` lines run it once that directory is on your
-`PATH` (Delve's license is in `misc/delve/LICENSE`). To use another
-version, install it with any Go toolchain; it needs to be 1.27.2 or later
-to read Go 1.27 binaries:
+`PATH` (Delve's license is in `misc/delve/LICENSE`). It is built with the
+patches in `misc/delve/`, which add what this guide calls the bundled
+Delve's: positions, going back, runtime-counted hit counts, JSON output,
+and the trace line at exit, and fix a few bugs. To build it from a source
+tree, run `misc/release/delve.bash bin/dlv` after `misc/release/build.bash`.
 
-```
-go install github.com/go-delve/delve/cmd/dlv@latest
-```
+A stock Delve 1.27.2 or later also debugs replays, without those
+features; the [Stock Delve](#stock-delve) section says what to do
+instead.
 
 On macOS, Delve uses `debugserver` from the Xcode command line tools.
 
@@ -121,7 +140,17 @@ On Linux the flag changes nothing; use the same command on both.
 Set breakpoints, then `continue`. When the process exits, its trace line
 is the same as without Delve, whatever you did on the way: Delve's stops
 run no program code, and the program's clock is virtual, so time spent
-stopped does not exist for it.
+stopped does not exist for it. Delve prints it in its exit message:
+
+```
+Process 130547 has exited with status 1 (detsched: trace=0x210a7c6e992190e7 switches=7924 syncs=34387)
+```
+
+`exit` while the program still runs, or the end of an `--init` script,
+first runs it to its end with every breakpoint cleared, so that you see
+the trace line, and says so; `exit -k` kills it instead. A program that
+does not end within 5 minutes is killed with a message that it printed
+no trace line.
 
 The binary is optimized, and Delve says `Warning: debugging optimized
 function` at every stop. Do not rebuild it with `-gcflags=all=-N -l` to
@@ -139,6 +168,46 @@ binary as described below.
   (`unrecovered-panic` and `runtime-fatal-throw`).
 - A run that hangs: see
   [Attach to a spinning or hung run](#attach-to-a-spinning-or-hung-run).
+
+## Where the run is
+
+The bundled Delve ends every stop line, tracepoint line and return line
+with the run's position, written as the runtime's `GODETSTOP` stop lines
+write it:
+
+```
+> goroutine(16): [pf] github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.(*disk).powerFail(...) at t25.380001899 s4265 k128779
+> [s] github.com/ryanworl/go-detsched/misc/detsched/testdata/simcompose.serve() ./simcompose_test.go:40 (hits goroutine(149):1 total:2) (PC: 0x5ef6d3) at t1.078676089 s2307 k93341 node server (start 2)
+```
+
+- `t25.380001899`: the goroutine's virtual time in seconds, as the fault
+  timeline counts them; `t-` for a goroutine outside a synctest bubble.
+- `s4265`: the goroutine switches so far, as `GODEBUG=dettrace=2` numbers
+  them.
+- `k128779`: the tick, the run's finest clock (see
+  [Stop at a point of the run](#stop-at-a-point-of-the-run)). A
+  breakpoint at a function's entry stops before the function's own tick:
+  `GODETSTOP=k128779` stops just before that entry, and `k128780` in it.
+- `node server (start 2)`: the simulated node the goroutine runs on, with
+  which start of the node it belongs to; nothing for a goroutine on no
+  node.
+
+The same values are pseudo-variables of expressions, for `print`, `on`
+and `cond`: `detsched.time` (seconds, -1 outside a bubble),
+`detsched.tick`, `detsched.switches` and `detsched.node` (`""` on no
+node). Unlike `runtime.curg.bubble.now`, they work on system stacks too.
+
+`goroutines` shows each goroutine's node, and whether the node crashed or
+is paused: goroutines of a crashed node are frozen where they were.
+
+```
+  Goroutine 42 - User: .../src/net/fd_unix.go:149 net.(*netFD).accept (0x5a30c8) [node server (start 3) crashed] [IO wait (simulated)]
+```
+
+`goroutines -with node server` lists the goroutines of every start of
+node `server`, and `goroutines -with node "server (start 3)"` those of
+one start; `-without node` and `-group node` work too. A filter Delve
+does not know answers with the list of filters it takes.
 
 ## Read the fault timeline first
 
@@ -158,27 +227,28 @@ sim: 19.800543570 nemesis: start clog stopped server out
 Read it before setting any breakpoint on a crash, restart, or disk fault:
 it answers "did the node lose power, and when" without a debugger.
 
-In Delve, `print runtime.curg.bubble.now` gives the current goroutine's
-virtual time in nanoseconds. A synctest bubble starts at 2000-01-01 UTC,
-which is 946684800000000000, and harnesses create the `World` as the
-bubble starts, so 9.408758544 in the timeline is 946684809408758544 in
-Delve. To look only at a window of the timeline, don't put that in a
-breakpoint's condition: stop the run at the window's ends instead, as the
-next section shows.
+Harnesses create the `World` as the bubble starts, so the timeline's
+times are the `t` of the positions Delve prints, and `detsched.time` in
+expressions: the power failure at 9.408758544 is at `t9.408758544`. (With
+a stock Delve, `print runtime.curg.bubble.now` gives the time in
+nanoseconds since the Unix epoch; a bubble starts at 2000-01-01 UTC,
+946684800000000000.) To look only at a window of the timeline, don't put
+the time in a breakpoint's condition, which costs a trap at every hit:
+stop the run at the window's ends instead, as the next section shows.
 
 ## Stop at a point of the run
 
 Every hit of a breakpoint stops the process and switches to Delve, also
-when its condition is false: about 1ms a hit on Linux, more on macOS.
+when its condition is false: about 1ms a hit on Linux, more on macOS
+(13ms on an arm64 Mac).
 On testdata/simcompose, a tracepoint on `time.Now` turns a 0.04s run into
 37s, and the same tracepoint with a condition that is never true still
-takes 29s. A condition on `runtime.curg.bubble.now` also fails with
-`curg has no member bubble` at the first hit on a system stack, which
-stops the script. Instead, let the run stop where you want to start
-looking, and set breakpoints only then.
+takes 29s. So don't condition a breakpoint on the time to look at a
+window of the run: let the run stop where you want to start looking, and
+set breakpoints only then. (A hit count is the exception: see
+[Many hits](#many-hits-conditions-and-tracepoints).)
 
-`GODETSTOP` lists points, separated by commas, at which the program
-stops:
+A point of the run is one of
 
 - `t9.4`: 9.4 seconds of virtual time, as the fault timeline counts them
   (since the bubble of the goroutine about to run started);
@@ -187,9 +257,22 @@ stops:
   compiler counts one at every function entry and loop back edge in your
   code, so every hit of a breakpoint there has its own tick.
 
-The program stops at the first tick, in a goroutine's own code, at or
-after each point. It prints the position there, and calls
-`runtime.detStop`, where Delve can break:
+In the bundled Delve, `restart` with a point runs the replay again from
+its start to that point, with the breakpoints disabled on the way, so
+that it costs a replay at native speed:
+
+```
+(dlv) restart t25.38
+> time.Now() .../src/time/time.go:1348 (PC: 0x4bd229) at t25.380001899 s4265 k128732
+```
+
+It stops where the runtime's `GODETSTOP` (below) stops, in the code of
+the goroutine that runs there, and works after the program exited too.
+
+`GODETSTOP` lists points, separated by commas, at which the program
+stops without a debugger's help. The program stops at the first tick, in
+a goroutine's own code, at or after each point. It prints the position
+there, and calls `runtime.detStop`, where Delve can break:
 
 ```
 detsched: stop 1 at t10.025092087 s1822 k90267 goroutine 10
@@ -197,7 +280,7 @@ detsched: stop 1 at t10.025092087 s1822 k90267 goroutine 10
 
 Then it runs on as if it had not stopped: `GODETSTOP` does not change the
 run, and costs nothing without a debugger. Put it among the replay
-line's variables, after the `cd`:
+line's variables, after the `cd`. Two points make a window:
 
 ```
 cd /home/me/kv && GODETSTOP=t9.4,t10.2 GODETSEED=7 GODETBRANCH=10 dlv exec --disable-aslr /tmp/detsched-1234/kv.test --init window.dlv ...
@@ -210,7 +293,7 @@ at the second:
 break stop runtime.detStop
 continue
 trace cand github.com/hashicorp/raft.(*Raft).runCandidate
-on cand print runtime.detTickEnd-int64(runtime.detTicks)
+on cand print detsched.tick
 continue
 clearall
 continue
@@ -225,16 +308,51 @@ returns, which `clear` leaves behind.
 
 At a stop, `stack` shows `runtime.detStop`, `runtime.detStopFire`, and
 `runtime.detPreempt` on top of the code of the goroutine the stop line
-names.
+names. (`restart` with a point steps out of them for you.)
 
 ### Go back
 
 The run is the same every time, so going back is running it again to an
-earlier point. `print runtime.detTickEnd-int64(runtime.detTicks)` at a
-breakpoint gives the tick of the hit, as the `on` line above records for
-every hit. Run again with `GODETSTOP=k` and that tick, break on the
-function at the stop, and the next `continue` stops at that same hit.
-Running again costs a replay up to the point, which runs at native speed.
+earlier point, as rr does with a recording. The bundled Delve has rr's
+commands for it:
+
+- `checkpoint [note]` records where the run is stopped: its tick, the
+  goroutine and instruction, and the breakpoints' hit counts.
+  `checkpoints` lists them, `clear-checkpoint cN` deletes one.
+- `restart c1` runs the replay again to checkpoint c1, with the
+  breakpoints disabled on the way, and stops at the same instruction of
+  the same goroutine at the same tick, with the same hit counts, so that
+  every value reads as it did.
+- `rewind` (`rw`) goes back to the previous breakpoint stop of this
+  session, or to the program's start when there is none. Each `rewind`
+  goes one stop further back; tracepoint hits do not count as stops.
+- `restart t9.4`, `restart s12345`, `restart k812345678` run to a point,
+  as above; the position of any stop or tracepoint line is one.
+
+```
+(dlv) break d runtime.detAssertFailed
+(dlv) continue
+> [d] runtime.detAssertFailed() .../src/runtime/detfeed.go:639 (hits goroutine(10):1 total:1) (PC: 0x418c0e) at t36.353801885 s7202 k375635
+(dlv) checkpoint failed
+Checkpoint c1 created.
+(dlv) restart t25.38
+> time.Now() .../src/time/time.go:1348 (PC: 0x4bd229) at t25.380001899 s4265 k128732
+(dlv) checkpoints
+ID  When                                      Note
+c1  t36.353801885 s7202 k375635 goroutine 10  failed
+(dlv) restart c1
+> runtime.detAssertFailed() .../src/runtime/detfeed.go:639 (PC: 0x418c0e) at t36.353801885 s7202 k375635
+```
+
+`restart` without arguments runs the program again from its start with
+its breakpoints, as in stock Delve. Checkpoints last for the session.
+Going back costs a replay up to the point, which runs at native speed:
+under a second for testdata/simcompose.
+
+With a stock Delve, record the tick of a hit with
+`print runtime.detTickEnd-int64(runtime.detTicks)`, run again with
+`GODETSTOP=k` and that tick, break on the function at the stop, and the
+next `continue` stops at that same hit.
 
 ### Look without a debugger
 
@@ -249,6 +367,8 @@ These leave the run unchanged (its trace line stays the same):
 
 - breakpoints, tracepoints, conditions, `print`, `stack`, `goroutines`,
   and staying stopped for any length of time;
+- hit counts the runtime counts, `checkpoint`, `restart` to a checkpoint
+  or a point, and `rewind`;
 - attaching Delve to a running process, and detaching;
 - environment variables the program does not read;
 - `GODEBUG=dettrace=2`;
@@ -319,8 +439,10 @@ refused anyway on optimized functions (`can not call optimized function`).
 - Expressions cannot call functions or methods. Read fields instead.
 - Long values are cut; raise `config max-string-len 1000`,
   `config max-array-values 1000`, or `config max-variable-recurse 3`.
-- `runtime.curg` is the current goroutine: `runtime.curg.goid` its ID,
-  `runtime.curg.bubble.now` its bubble's virtual time.
+- `runtime.curg` is the current goroutine: `runtime.curg.goid` its ID.
+  `detsched.time`, `detsched.node`, `detsched.tick` and
+  `detsched.switches` give the run's position (see
+  [Where the run is](#where-the-run-is)).
 
 ## Many hits: conditions and tracepoints
 
@@ -329,7 +451,7 @@ whole replay and prints every hit:
 
 ```
 trace pf sim.(*disk).powerFail
-on pf print runtime.curg.bubble.now
+on pf print detsched.node
 trace cand github.com/hashicorp/raft.(*Raft).runCandidate
 cond cand r.localID == "node-2"
 on cand print runtime.curg.goid
@@ -337,16 +459,16 @@ on cand stack 6
 continue
 ```
 
-Each hit prints a line `> goroutine(16): [pf] github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.(*disk).powerFail(...)`
+Each hit prints a line
+`> goroutine(16): [pf] github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.(*disk).powerFail(...) at t25.380001899 s4265 k128779`
 followed by one line per `on` action; lines starting with `>>` are the
 function's returns.
 
 - `on` takes one expression; add one `on` line per value.
 - Goroutine IDs are the same in every replay. Find the goroutine in one
   run, then condition on it in the next: `cond NAME runtime.curg.goid == 1354`.
-- `cond -hitcount NAME == 361` stops at the 361st hit, and `> 1000` after
-  it: count hits in one replay, stop at the right one in the next.
-- String comparisons work: `cond NAME c.name == "TestCompose"`.
+- String comparisons work: `cond NAME c.name == "TestCompose"`, and
+  `cond NAME detsched.node == "server (start 3)"`.
 - A condition Delve cannot evaluate (a misspelled or optimized-out
   variable) stops at every hit with `error evaluating expression`. Fix the
   expression before relying on what the breakpoint shows.
@@ -354,7 +476,53 @@ function's returns.
 - Each hit costs about a millisecond, also with a false condition, so a
   breakpoint on a function that runs millions of times makes a replay
   take hours. Set it only between two stops (see
-  [Stop at a point of the run](#stop-at-a-point-of-the-run)).
+  [Stop at a point of the run](#stop-at-a-point-of-the-run)), or stop at
+  a hit by its number, below.
+
+### Stop at the Nth hit for free
+
+`cond -hitcount NAME == 361` stops at the 361st hit, `>= 361` or `> 360`
+at every hit from then on, and `% 1000` at every 1000th: count hits in
+one replay, or take a tracepoint's count, and stop at the right one in
+the next. In the bundled Delve, the runtime counts those hits when it can,
+so the hits before the one wanted cost nothing: the breakpoint is not
+written in the program until the hit before it, and Delve does not stop.
+`breakpoints` says when it does:
+
+```
+Breakpoint n (enabled, hits counted by the runtime) at 0x4bd20b for time.Now() .../src/time/time.go:1347 (0)
+	cond -hitcount == 3796
+```
+
+The runtime counts a breakpoint's hits when
+
+- it is on a function, as in `break n time.Now`, not on a line inside
+  it, and the function is compiled code that counts ticks (code of your
+  module and of the standard library outside the runtime, `os` and
+  `syscall`);
+- its hit condition is on the total count (not `-per-g-hitcount`), and it
+  has no other condition;
+- it sets one breakpoint, not one per inlined copy, and at most 16
+  breakpoints are counted at once.
+
+Otherwise it is an ordinary breakpoint, as in stock Delve. The count is
+the same either way, and the run's schedule too. The per-goroutine hit
+counts Delve prints count only the hits that stopped.
+
+Stopping at `time.Now` == N, counted by the runtime and by Delve (a
+condition `1 == 1` forces Delve's counting):
+
+| Replay | N | Runtime | Delve |
+| --- | --- | --- | --- |
+| testdata/simcompose, linux/amd64 | 3796 | 0.29s | 4.6s |
+| testdata/simbusy, linux/amd64 | 20000 | 0.51s | 20s |
+| testdata/simbusy, linux/amd64 | 1000000 | 0.49s | 838s |
+| testdata/simcompose, darwin/arm64 | 3000 | 0.30s | 39s |
+| testdata/simbusy, darwin/arm64 | 20000 | 0.27s | 283s |
+
+Both stop at the same tick. A condition on anything else, including
+`detsched.time`, still costs a trap at every hit; for a point in time use
+`restart t9.4` or `GODETSTOP`.
 
 ## Where two runs diverge
 
@@ -450,8 +618,9 @@ in the header, such as
 crashed nodes are frozen where they were, so read the live ones first.
 
 `goroutines -t 30` shows 30 frames of each stack; the default 10 often
-hides the frame that tells whose goroutine it is. Delve 1.27.2 does not
-know Go 1.27's wait reasons and prints them as `[unknown wait reason N]`:
+hides the frame that tells whose goroutine it is. The bundled Delve names
+every wait reason of the detsched runtime; a stock Delve 1.27.2 does not
+know Go 1.27's and prints them as `[unknown wait reason N]`:
 
 | N | Wait reason |
 | --- | --- |
@@ -482,19 +651,79 @@ Delve without a terminal, saving everything it prints:
 ```
 cd /home/me/kv && GODETSEED=7 GODETBRANCH=10 \
   dlv exec --disable-aslr /tmp/detsched-1234/kv.test -r stdout:prog.out -r stderr:prog.err --init cmds.dlv --allow-non-terminal-interactive=true </dev/null >dlv.out 2>&1
+```
+
+- A command that fails prints `cmds.dlv:LINE: ERROR` and the script goes
+  on.
+- Delve runs out of commands at the end of the file and exits; with
+  breakpoints rather than tracepoints, add a `continue` per stop you want.
+  The exit runs the program to its end with its breakpoints cleared, so
+  the last line is `Process N has exited with status S (detsched:
+  trace=...)`; compare it with the log's.
+- `-r` sends the program's own output to `prog.out` and `prog.err`, so
+  that `dlv.out` holds only what Delve prints. Without it the two are
+  interleaved in `dlv.out`, and a program that prints a lot buries the
+  tracepoints.
+- Output that is not a terminal has no color escapes.
+- `goroutines`, `stack`, and `print` after the last `continue` read the
+  state where the run stopped.
+
+### JSON output
+
+`dlv --json` (or `config output json` in a session) prints everything
+Delve prints as one JSON object per line, so a script reads it with `jq`
+or a JSON parser instead of patterns over text. Each record has an
+`event`, and `cmd` and `src` (`FILE:LINE`) name the command of the script
+that printed it:
+
+```
+{"cmd":"continue","event":"trace","bp":"pf","goroutine":16,"hits":2,"func":"github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.(*disk).powerFail","file":".../sdk/sim/fs.go","line":553,"pc":"0x5c39d3","pos":{"t":"25.380001899","s":4265,"k":128779},"args":[{"name":"d","type":"*.../sim.disk","value":"..."}],"vars":[{"expr":"detsched.time","type":"","value":"25.380001899"}],"src":"cmds.dlv:5"}
+{"cmd":"continue","event":"break","bp":"d","goroutine":10,"hits":1,"func":"runtime.detAssertFailed","file":".../src/runtime/detfeed.go","line":639,"pc":"0x418c0e","pos":{"t":"36.353801885","s":7202,"k":375635},"src":"cmds.dlv:5"}
+{"cmd":"args","event":"args","vars":[{"name":"msg","type":"string","value":"\"compose: anytime read-acked succeeds\""}],"src":"cmds.dlv:6"}
+{"cmd":"print size","event":"error","error":"could not find symbol value for size","src":"cmds.dlv:8"}
+{"cmd":"exit","event":"exit","pid":131544,"status":1,"trace":"detsched: trace=0x210a7c6e992190e7 switches=7924 syncs=34387","src":"cmds.dlv:10"}
+```
+
+| event | printed by | fields besides `cmd` and `src` |
+| --- | --- | --- |
+| `trace` | a tracepoint hit | `bp`, `hits`, `goroutine`, `func`, `file`, `line`, `pc`, `pos`, and `args`, `vars` (one per `on ... print`), `stack`, `locals`, `goroutine_info` as its `on` actions ask |
+| `return` | a tracepoint's return | the same, with `ret` |
+| `break` | a stop at a breakpoint | as `trace` |
+| `watch` | a stop at a watchpoint | as `trace`, with `expr` |
+| `stop` | a stop elsewhere (`next`, `step`, `restart` to a point, `rewind`) | `goroutine`, `func`, `file`, `line`, `pc`, `pos` |
+| `value` | `print` | `expr`, `type`, `value` |
+| `args`, `locals` | `args`, `locals` | `vars`: `name`, `type`, `value` |
+| `stack` | `stack` | `frames`: `n`, `func`, `file`, `line`, `pc` |
+| `goroutines` | `goroutines` | `goroutines`: `id`, `user`, `current`, `go`, `start` locations, `node`, `node_state`, `wait`, `thread`, `labels` |
+| `exit` | the program's exit | `pid`, `status`, `trace` |
+| `error` | a command that failed | `error` |
+| `output` | any other text Delve prints | `text` |
+| `ok` | a command that printed nothing | |
+
+`pos` is the run's position: `t` (a string, `-` outside a bubble), `s`,
+`k`, and `node` on a sim node. Every line of `dlv.out` is a record once
+`-r` keeps the program's output out of it.
+
+## Stock Delve
+
+A stock Delve 1.27.2 or later debugs replays the same way, without the
+bundled one's additions. Instead of each:
+
+- positions: `print runtime.detTickEnd-int64(runtime.detTicks)` for the
+  tick, `print runtime.curg.bubble.now` for the time in nanoseconds since
+  the Unix epoch (a bubble starts at 946684800000000000), which fails on a
+  system stack with `curg has no member bubble`;
+- going back: run again with `GODETSTOP` (see [Go back](#go-back));
+- hit counts on hot functions: arm the breakpoint only between two
+  `GODETSTOP` stops;
+- the trace line: end the script with one more `continue`, since a stock
+  `exit` kills the program before it prints the line;
+- JSON: filter the text, removing color escapes first:
+
+```
 sed 's/\x1b\[[0-9;]*m//g' dlv.out | grep -a -v '^>>' | grep -a -E $'^> |^\t'
 ```
 
-- A command that fails prints an error and the script goes on.
-- Delve runs out of commands at the end of the file and exits; with
-  breakpoints rather than tracepoints, add a `continue` per stop you want.
-- `-r` sends the program's own output, including its trace line, to
-  `prog.out` and `prog.err`, so that `dlv.out` holds only what Delve
-  prints. Without it the two are interleaved in `dlv.out`, and a program
-  that prints a lot buries the tracepoints.
-- A tracepoint's hit is a line starting with `> `, and each `on` print
-  under it starts with a tab, a real one: `$'...'` makes the shell put it
-  in the pattern, as `grep -E` reads `\t` as a plain `t`. A printed
-  struct takes several lines, each indented with tabs.
-- `goroutines`, `stack`, and `print` after the last `continue` read the
-  state where the run stopped.
+  A tracepoint's hit is a line starting with `> `, and each `on` print
+  under it starts with a tab; at a breakpoint stop, `print`, `stack` and
+  `args` print lines that start without one, which this filter drops.

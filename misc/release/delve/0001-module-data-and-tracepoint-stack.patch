@@ -1,3 +1,5 @@
+pkg/proc, pkg/terminal: module data of register variables; tracepoint stacks once
+
 Delve 1.27.2 loads the runtime's module data, which it needs to name the
 dynamic type of an interface, through the memory of the variable it is
 printing. For a variable held in registers, such as an argument of struct
@@ -10,9 +12,13 @@ twice on each hit: printBreakpointInfo prints it, and printTracepoint
 printed it again for any breakpoint without return values. Print it there
 only for the breakpoints on a function's returns.
 
+Both are generic fixes for upstream Delve.
+
+diff --git a/pkg/proc/bininfo.go b/pkg/proc/bininfo.go
+index 502ca9b..3722f87 100644
 --- a/pkg/proc/bininfo.go
 +++ b/pkg/proc/bininfo.go
-@@ -1564,6 +1564,11 @@
+@@ -1564,6 +1564,11 @@ func (bi *BinaryInfo) parseDebugFrameGeneral(image *Image, debugFrameBytes []byt
  }
  
  func (bi *BinaryInfo) getModuleData(mem MemoryReadWriter) ([]ModuleData, error) {
@@ -24,9 +30,11 @@ only for the breakpoints on a function's returns.
  	if bi.moduleDataCache == nil {
  		var err error
  		bi.moduleDataCache, err = LoadModuleData(bi, mem)
+diff --git a/pkg/terminal/command.go b/pkg/terminal/command.go
+index 8f4282c..718dd13 100644
 --- a/pkg/terminal/command.go
 +++ b/pkg/terminal/command.go
-@@ -3095,7 +3095,8 @@
+@@ -3095,7 +3095,8 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, a
  		// As of now traceFollowCalls and Stacktrace are mutually exclusive options
  		return
  	}

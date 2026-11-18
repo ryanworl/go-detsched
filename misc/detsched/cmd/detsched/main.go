@@ -129,11 +129,12 @@ func main() {
 	if len(s.groups) > 0 {
 		os.Exit(1)
 	}
-	// Nothing to replay: keep only the summary, whose path the search
-	// printed at its start.
+	// No failure: keep only the summary, whose path the search printed
+	// at its start, and the binary when the summary has replay lines.
+	keep := s.summaryReplays()
 	entries, _ := os.ReadDir(s.out)
 	for _, e := range entries {
-		if e.Name() != "summary" {
+		if e.Name() != "summary" && !(keep && filepath.Join(s.out, e.Name()) == s.bin) {
 			os.RemoveAll(filepath.Join(s.out, e.Name()))
 		}
 	}
@@ -225,6 +226,7 @@ type group struct {
 	status string           // whether running replay reproduced the failure
 	index  int              // its number, from 1, which its logs' names have
 	also   map[string]*also // other failures in its runs, by key
+	left   string           // for a deadlock at the end of the test, the goroutines left
 }
 
 // An also is a failure of another kind in a group's runs, such as a
@@ -939,6 +941,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	first := g == nil
 	if first {
 		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}}
+		if strings.Contains(g.sig, "blocked goroutines remain") {
+			g.left = leftGoroutines(r.output)
+		}
 		s.byKey[g.key] = g
 		s.groups = append(s.groups, g)
 	}
@@ -1015,7 +1020,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 				}
 			}
 			g.replay, g.debug = s.replayLine(r, false), s.replayLine(r, true)
-			s.printf("detsched: the replay of %q needs %s:\n\treplay: %s\n\tdebug:  %s\n", g.sig, strings.Join(vars, " "), g.replay, g.debug)
+			s.printf("detsched: the replay of %q needs %s:\n\treplay: %s\n\tdebug:  %s\n", g.msg(), strings.Join(vars, " "), g.replay, g.debug)
 			s.mu.Unlock()
 			if log != "" {
 				if err := os.WriteFile(log, append([]byte("# "+g.replay+"\n"), r.output...), 0o666); err != nil {
@@ -1032,7 +1037,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	s.mu.Lock()
 	g.status = status
-	s.printf("detsched: the replay of %q %s\n", g.sig, verdict(status))
+	s.printf("detsched: the replay of %q %s\n", g.msg(), verdict(status))
 	s.mu.Unlock()
 	return nil
 }
@@ -1083,6 +1088,9 @@ func (s *search) printf(format string, args ...any) {
 func (s *search) status() string {
 	d := time.Since(s.start)
 	line := fmt.Sprintf("%d runs, %d failed, %d signatures, %d features, %.1f runs/s, %v", s.runs, s.failed, len(s.groups), s.features, float64(s.runs)/d.Seconds(), d.Round(time.Second))
+	if s.slowPass >= 5*time.Second {
+		line += fmt.Sprintf("; slowest passing run %v", s.slowPass.Round(time.Second))
+	}
 	limit, why := 10*s.slowPass, " (10 times the slowest pass)"
 	if limit < 10*time.Second {
 		limit, why = 10*time.Second, ""
@@ -1202,7 +1210,11 @@ func (s *search) summary(w io.Writer) {
 	if s.tooLong > 0 {
 		fmt.Fprintf(w, "detsched: %d runs made 1000 times the switches of the first and were stopped, not counted as failures; one of them, which may loop forever:\n\treplay: %s\n", s.tooLong, s.replayLine(s.tooLongRun, false))
 	}
-	fmt.Fprintf(w, "detsched: slowest passing run %v, slowest failing run %v; -timeout is %v\n", s.slowPass.Round(time.Millisecond), s.slowFail.Round(time.Millisecond), s.timeout)
+	if s.slowFail > 0 {
+		fmt.Fprintf(w, "detsched: slowest passing run %v, slowest failing run %v; -timeout is %v\n", s.slowPass.Round(time.Millisecond), s.slowFail.Round(time.Millisecond), s.timeout)
+	} else {
+		fmt.Fprintf(w, "detsched: slowest passing run %v; -timeout is %v\n", s.slowPass.Round(time.Millisecond), s.timeout)
+	}
 	if r := s.slowPassRun; r != nil && s.slowPass >= 5*time.Second {
 		fmt.Fprintf(w, "detsched: the slowest passing run, to replay when runs are slower than the program's work explains:\n\treplay: %s\n", s.replayLine(r, false))
 	}
@@ -1215,6 +1227,9 @@ func (s *search) summary(w io.Writer) {
 		fmt.Fprintf(w, "\nFAIL %d of %d runs: %s\n", g.runs, s.runs, msg)
 		if details != "" {
 			fmt.Fprintf(w, "\tits first run: %s\n", details)
+		}
+		if g.left != "" {
+			fmt.Fprintf(w, "\tthe goroutines left in the bubble, by where they wait and what created them: %s\n", g.left)
 		}
 		more := ""
 		if len(g.logs) > 1 {
@@ -1325,4 +1340,67 @@ func (s *search) assertSummary(w io.Writer) {
 func isTerminal(f *os.File) bool {
 	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0 && os.Getenv("TERM") != "dumb"
+}
+
+// msg returns the group's signature without the first run's details.
+func (g *group) msg() string {
+	msg, _ := splitSignature(g.sig)
+	return msg
+}
+
+// summaryReplays reports whether the summary prints a replay line of a
+// run that did not fail, which names the kept binary.
+func (s *search) summaryReplays() bool {
+	return s.tooLong > 0 || s.outOfMem > 0 && s.bigStopped != nil && s.bigStopped.memAtStop > 0 || s.slowPassRun != nil && s.slowPass >= 5*time.Second
+}
+
+// goroutineHeader matches a goroutine's header in a traceback, with its
+// state.
+var goroutineHeader = regexp.MustCompile(`(?m)^goroutine \d+ \[([^\]]*)\]:\n`)
+
+// leftGoroutines describes the goroutines of a synctest bubble in the
+// output of a run whose test body returned while they were blocked: the
+// function each waits in and the one that created it, most common first.
+func leftGoroutines(out []byte) string {
+	counts := map[string]int{}
+	locs := goroutineHeader.FindAllSubmatchIndex(out, -1)
+	for i, l := range locs {
+		if !bytes.Contains(out[l[2]:l[3]], []byte("synctest bubble")) {
+			continue
+		}
+		end := len(out)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		block := out[l[1]:end]
+		if j := bytes.Index(block, []byte("\n\n")); j >= 0 {
+			block = block[:j]
+		}
+		var top, creator string
+		for _, line := range strings.Split(string(block), "\n") {
+			switch {
+			case strings.HasPrefix(line, "created by "):
+				creator = strings.Fields(strings.TrimPrefix(line, "created by "))[0]
+			case top == "" && line != "" && !strings.HasPrefix(line, "\t") && !strings.HasPrefix(line, "runtime.") && !strings.HasPrefix(line, "internal/") && !strings.HasPrefix(line, "sync.") && !strings.HasPrefix(line, "time."):
+				top = line
+				if k := strings.LastIndex(top, "("); k > 0 {
+					top = top[:k]
+				}
+			}
+		}
+		if top == "" && creator == "" {
+			continue
+		}
+		counts[top+" (created by "+creator+")"]++
+	}
+	keys := slices.SortedFunc(maps.Keys(counts), func(a, b string) int { return cmp.Or(counts[b]-counts[a], strings.Compare(a, b)) })
+	for i, k := range keys {
+		if counts[k] > 1 {
+			keys[i] = fmt.Sprintf("%d × %s", counts[k], k)
+		}
+	}
+	if len(keys) > 5 {
+		keys = append(keys[:5], fmt.Sprintf("and %d more", len(keys)-5))
+	}
+	return strings.Join(keys, ", ")
 }

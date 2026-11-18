@@ -1,0 +1,2228 @@
+all: debug detsched replays: positions, checkpoints, JSON output
+
+For a program built with GOEXPERIMENT=detsched by the detsched
+toolchain, whose runs are the same every time:
+
+Every stop, breakpoint, tracepoint and return line ends with the run's
+position as the runtime's stop lines write it, " at tD sN kN node X":
+virtual time, switches, tick and, on a sim node, the node's name. The
+expression evaluator has detsched.time, detsched.tick,
+detsched.switches and detsched.node, which work on system stacks too,
+for conditions. goroutines lists each goroutine's node and whether it
+crashed or is paused, and -with/-without/-group take "node NAME".
+api.Thread.Position and api.Goroutine.Node carry them to clients.
+
+checkpoint records the run's position (tick, goroutine, PC and the
+breakpoints' hit counts), and "restart cN" runs the program again to
+it with the user's breakpoints disabled on the way: the runtime stops
+the run at the checkpoint's tick through runtime.detDebug, a
+GODETSTOP point that prints nothing, and the debugger continues to the
+checkpoint's goroutine and PC. "restart tD", "restart sN" and
+"restart kN" run to a point as GODETSTOP names one. rewind goes back
+to the previous breakpoint stop of the session. These reuse the
+commands rr recordings have.
+
+dlv --json and "config output json" print one JSON object per line for
+each command's output (print, stack, args, locals, goroutines, trace
+and breakpoint hits, exits), so scripts need no filter over the text.
+
+exit, and the end of an --init script, run a detsched program that is
+still running to its end with its breakpoints cleared, so that it
+prints its trace line, which says whether the run was the one
+replayed; exit -k kills it instead. Exit messages carry the trace
+line.
+
+The wait reasons table for Go 1.27 has the two the detsched runtime
+adds.
+
+All of this is specific to detsched, except the JSON output mode, which
+would suit upstream Delve without its detsched fields.
+
+diff --git a/cmd/dlv/cmds/commands.go b/cmd/dlv/cmds/commands.go
+index 848f03d..3bddc3e 100644
+--- a/cmd/dlv/cmds/commands.go
++++ b/cmd/dlv/cmds/commands.go
+@@ -53,6 +53,9 @@ var (
+ 	addr string
+ 	// initFile is the path to initialization file.
+ 	initFile string
++
++	// jsonOutput makes the terminal client print JSON records.
++	jsonOutput bool
+ 	// buildFlags is the flags passed during compiler invocation.
+ 	buildFlags string
+ 	// workingDir is the working directory for running the program.
+@@ -167,6 +170,7 @@ func New(docCall bool) *cobra.Command {
+ 	must(rootCommand.MarkPersistentFlagFilename("redirect"))
+ 	rootCommand.PersistentFlags().BoolVar(&allowNonTerminalInteractive, "allow-non-terminal-interactive", false, "Allows interactive sessions of Delve that don't have a terminal as stdin, stdout and stderr")
+ 	rootCommand.PersistentFlags().BoolVar(&disableASLR, "disable-aslr", false, "Disables address space randomization")
++	rootCommand.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Print one JSON object per line instead of text, for scripts (the terminal client's 'config output json')")
+ 
+ 	// 'attach' subcommand.
+ 	attachCommand := &cobra.Command{
+@@ -1055,6 +1059,12 @@ func connect(addr string, clientConn net.Conn, conf *config.Config, isAttachCmd
+ 			}
+ 		}
+ 	}
++	if jsonOutput {
++		if conf == nil {
++			conf = &config.Config{}
++		}
++		conf.Output = "json"
++	}
+ 	term := terminal.New(client, conf, isAttachCmd)
+ 	term.InitFile = initFile
+ 	status, err := term.Run()
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 8a0849b..4ede5d2 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -117,6 +117,10 @@ type Config struct {
+ 	// output.
+ 	TraceShowTimestamp bool `yaml:"trace-show-timestamp"`
+ 
++	// Output is "json" to print one JSON object per line, for scripts,
++	// rather than text; see dlv --json.
++	Output string `yaml:"output"`
++
+ 	// ShowRawStrings controls whether string values are printed as-is with %s
+ 	// (no quoting or escaping) rather than with Go's %q (quoted and escaped).
+ 	ShowRawStrings bool `yaml:"show-raw-strings"`
+diff --git a/pkg/proc/bininfo.go b/pkg/proc/bininfo.go
+index 3722f87..46213cb 100644
+--- a/pkg/proc/bininfo.go
++++ b/pkg/proc/bininfo.go
+@@ -123,6 +123,11 @@ type BinaryInfo struct {
+ 	cancelDownloadsMu sync.Mutex
+ 	cancelDownloads   func()
+ 	downloadsCtx      context.Context
++
++	// det is what a detsched program's runtime keeps for the debugger, when
++	// detDone; see detsched.go.
++	det     *detInfo
++	detDone bool
+ }
+ 
+ var (
+diff --git a/pkg/proc/breakpoints.go b/pkg/proc/breakpoints.go
+index 3530056..d36a62b 100644
+--- a/pkg/proc/breakpoints.go
++++ b/pkg/proc/breakpoints.go
+@@ -164,6 +164,11 @@ const (
+ 	// notification function to detect shared library loading/unloading.
+ 	SharedLibBreakpoint
+ 
++	// DetschedBreakpoint is an internal breakpoint on the runtime of a
++	// detsched program, which stops when its callback says so; see
++	// detsched.go.
++	DetschedBreakpoint
++
+ 	steppingMask = NextBreakpoint | NextDeferBreakpoint | StepBreakpoint | StepIntoNewProcBreakpoint | NextInactivatedBreakpoint | StepIntoRangeOverFuncBodyBreakpoint
+ )
+ 
+@@ -340,7 +345,7 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
+ 			}
+ 		}
+ 
+-	case StackResizeBreakpoint, PluginOpenBreakpoint, StepIntoNewProcBreakpoint, StepIntoRangeOverFuncBodyBreakpoint, SharedLibBreakpoint:
++	case StackResizeBreakpoint, PluginOpenBreakpoint, StepIntoNewProcBreakpoint, StepIntoRangeOverFuncBodyBreakpoint, SharedLibBreakpoint, DetschedBreakpoint:
+ 		// no further checks
+ 
+ 	case NextInactivatedBreakpoint:
+diff --git a/pkg/proc/detsched.go b/pkg/proc/detsched.go
+new file mode 100644
+index 0000000..15bd82b
+--- /dev/null
++++ b/pkg/proc/detsched.go
+@@ -0,0 +1,435 @@
++package proc
++
++// Support for programs built with GOEXPERIMENT=detsched, the deterministic
++// scheduler of the detsched Go toolchain. Such a program runs one
++// goroutine at a time, and a run is fully determined by its binary, its
++// environment and its arguments, so a debugger can name a point of the run
++// by its position and run the program again to that point.
++//
++// The position of a run is read from the runtime's variables:
++//
++//   - the tick, runtime.detTickEnd-int64(runtime.detTicks): the compiler
++//     counts one at every function entry and loop back edge in user code;
++//   - the switch, allp[0].det[0].switches: goroutine switches so far;
++//   - the virtual time of the goroutine's synctest bubble, g.bubble.now,
++//     counted from the bubble's start, 2000-01-01 UTC;
++//   - the simulated node of the goroutine (package sim of the detsched
++//     SDK), g.det[0].node, named by runtime.detsimNames.
++//
++// The runtime's variable runtime.detDebug lets the debugger stop the run at
++// a position: the runtime calls runtime.detDebugStop there.
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"go/constant"
++	"strconv"
++	"strings"
++
++	"github.com/go-delve/delve/pkg/dwarf/godwarf"
++)
++
++// detBubbleStart is the time at which every synctest bubble starts,
++// midnight UTC 2000-01-01, in nanoseconds since the Unix epoch.
++const detBubbleStart = 946684800000000000
++
++// DetPos is the position of a detsched run.
++type DetPos struct {
++	Tick      int64  // ticks counted since the program started
++	Switches  uint64 // goroutine switches so far
++	Time      int64  // nanoseconds of the goroutine's bubble since it started, -1 outside a bubble
++	Node      string // the goroutine's simulated node, "" for none
++	Goroutine int64
++}
++
++// TimeString returns p's virtual time in seconds, as GODETSTOP and the
++// fault timeline of package sim write it, or "-" outside a bubble.
++func (p *DetPos) TimeString() string {
++	if p.Time < 0 {
++		return "-"
++	}
++	return fmt.Sprintf("%d.%09d", p.Time/1e9, p.Time%1e9)
++}
++
++// String returns p as the runtime's stop lines write a position, followed
++// by the node, if any: "t9.408758544 s1822 k90267 node n1 (start 2)".
++func (p *DetPos) String() string {
++	s := fmt.Sprintf("t%s s%d k%d", p.TimeString(), p.Switches, p.Tick)
++	if p.Node != "" {
++		s += " node " + p.Node
++	}
++	return s
++}
++
++// detInfo holds the addresses and offsets of what the debugger reads and
++// writes in a detsched program.
++type detInfo struct {
++	tickEnd, ticks, allp, names, debug, simState uint64
++
++	gBubble, gDet, detGSize, detGNode, bubbleNow, pDet, detPSwitches int64
++
++	stopKind, stopN, nwatch, watch, watchSize, watchPC, watchCount, watchAt int64
++	nslots                                                                  int
++
++	stopFn, watchFn, preemptFn uint64
++}
++
++var errNotDetsched = errors.New("not a detsched program (built without GOEXPERIMENT=detsched, or by a detsched toolchain older than this dlv)")
++
++// detInfo returns t's detInfo, or nil if t is not a detsched program.
++func (t *Target) detInfo() *detInfo {
++	bi := t.BinInfo()
++	if bi.detDone {
++		return bi.det
++	}
++	bi.detDone = true
++	di, err := loadDetInfo(t)
++	if err != nil {
++		bi.logger.Debugf("detsched: %v", err)
++		return nil
++	}
++	bi.det = di
++	return di
++}
++
++// IsDetsched reports whether t was built with GOEXPERIMENT=detsched by a
++// toolchain whose runtime this debugger can drive.
++func (t *Target) IsDetsched() bool {
++	return t.detInfo() != nil
++}
++
++func loadDetInfo(t *Target) (*detInfo, error) {
++	bi := t.BinInfo()
++	if len(bi.Images) == 0 {
++		return nil, errNotDetsched
++	}
++	fns := bi.LookupFunc()
++	fnEntry := func(name string) uint64 {
++		if f := fns[name]; len(f) > 0 {
++			return f[0].Entry
++		}
++		return 0
++	}
++	di := &detInfo{
++		stopFn:    fnEntry("runtime.detDebugStop"),
++		watchFn:   fnEntry("runtime.detDebugWatch"),
++		preemptFn: fnEntry("runtime.detPreempt"),
++	}
++	if di.stopFn == 0 || di.watchFn == 0 || di.preemptFn == 0 {
++		return nil, errNotDetsched
++	}
++	scope := globalScope(t, bi, bi.Images[0], t.Memory())
++	global := func(name string) (*Variable, error) {
++		v, err := scope.findGlobal("runtime", name)
++		if err != nil {
++			return nil, err
++		}
++		return v, nil
++	}
++	var debugType, simType godwarf.Type
++	for _, x := range []struct {
++		name string
++		addr *uint64
++	}{
++		{"detTickEnd", &di.tickEnd},
++		{"detTicks", &di.ticks},
++		{"allp", &di.allp},
++		{"detsimNames", &di.names},
++		{"detDebug", &di.debug},
++		{"detsim", &di.simState},
++	} {
++		v, err := global(x.name)
++		if err != nil {
++			return nil, err
++		}
++		*x.addr = v.Addr
++		switch x.name {
++		case "detDebug":
++			debugType = v.RealType
++		case "detsim":
++			simType = v.RealType
++		}
++	}
++	field := func(typ godwarf.Type, name string) (*godwarf.StructField, error) {
++		st, ok := godwarf.ResolveTypedef(typ).(*godwarf.StructType)
++		if !ok {
++			return nil, fmt.Errorf("%s is not a struct", typ)
++		}
++		for _, f := range st.Field {
++			if f.Name == name {
++				return f, nil
++			}
++		}
++		return nil, fmt.Errorf("%s has no field %s", typ, name)
++	}
++	typ := func(name string) (godwarf.Type, error) { return bi.findType(name) }
++	var err error
++	off := func(t godwarf.Type, name string) int64 {
++		if err != nil {
++			return 0
++		}
++		var f *godwarf.StructField
++		f, err = field(t, name)
++		if err != nil {
++			return 0
++		}
++		return f.ByteOffset
++	}
++	gT, err1 := typ("runtime.g")
++	pT, err2 := typ("runtime.p")
++	bT, err3 := typ("runtime.synctestBubble")
++	dgT, err4 := typ("runtime.detGState")
++	dpT, err5 := typ("runtime.detPState")
++	wT, err6 := typ("runtime.detWatch")
++	spT, err7 := typ("runtime.detStopPoint")
++	if err := errors.Join(err1, err2, err3, err4, err5, err6, err7); err != nil {
++		return nil, err
++	}
++	di.gBubble = off(gT, "bubble")
++	di.gDet = off(gT, "det")
++	di.detGSize = dgT.Size()
++	di.detGNode = off(dgT, "node")
++	di.bubbleNow = off(bT, "now")
++	di.pDet = off(pT, "det")
++	di.detPSwitches = off(dpT, "switches")
++	stop := off(debugType, "stop")
++	di.stopKind = stop + off(spT, "kind")
++	di.stopN = stop + off(spT, "n")
++	di.nwatch = off(debugType, "nwatch")
++	di.watch = off(debugType, "watch")
++	di.watchSize = wT.Size()
++	di.watchPC = off(wT, "pc")
++	di.watchCount = off(wT, "count")
++	di.watchAt = off(wT, "at")
++	di.simState += uint64(off(simType, "state"))
++	if err != nil {
++		return nil, err
++	}
++	if f, err := field(debugType, "watch"); err == nil {
++		if at, ok := godwarf.ResolveTypedef(f.Type).(*godwarf.ArrayType); ok {
++			di.nslots = int(at.Count)
++		}
++	}
++	return di, nil
++}
++
++// DetPosition returns the position of t's run, with g's time and node, or
++// those of the selected goroutine if g is nil.
++func DetPosition(t *Target, g *G) (*DetPos, error) {
++	di := t.detInfo()
++	if di == nil {
++		return nil, errNotDetsched
++	}
++	if g == nil {
++		g = t.SelectedGoroutine()
++	}
++	return di.position(t.BinInfo(), t.Memory(), g)
++}
++
++func (di *detInfo) position(bi *BinaryInfo, mem MemoryReadWriter, g *G) (*DetPos, error) {
++	if cm, ok := mem.(*compositeMemory); ok {
++		mem = cm.realmem
++	}
++	ptr := int64(bi.Arch.PtrSize())
++	end, err := readIntRaw(mem, di.tickEnd, 8)
++	if err != nil {
++		return nil, err
++	}
++	ticks, err := readIntRaw(mem, di.ticks, 4)
++	if err != nil {
++		return nil, err
++	}
++	pos := &DetPos{Tick: end - ticks, Time: -1}
++	if allp, err := readUintRaw(mem, di.allp, ptr); err == nil && allp != 0 {
++		if p, err := readUintRaw(mem, allp, ptr); err == nil && p != 0 {
++			pos.Switches, _ = readUintRaw(mem, p+uint64(di.pDet+di.detPSwitches), 8)
++		}
++	}
++	if g == nil || g.variable == nil {
++		return pos, nil
++	}
++	pos.Goroutine = g.ID
++	gaddr := g.variable.Addr
++	if b, err := readUintRaw(mem, gaddr+uint64(di.gBubble), ptr); err == nil && b != 0 {
++		if now, err := readIntRaw(mem, b+uint64(di.bubbleNow), 8); err == nil {
++			pos.Time = now - detBubbleStart
++		}
++	}
++	pos.Node, _ = di.node(bi, mem, gaddr)
++	return pos, nil
++}
++
++// node returns the name of the node of the goroutine at gaddr, as package
++// sim named it, else its handle, and its state, "crashed" or "paused" if
++// it is not live.
++func (di *detInfo) node(bi *BinaryInfo, mem MemoryReadWriter, gaddr uint64) (name, state string) {
++	ptr := int64(bi.Arch.PtrSize())
++	node, err := readIntRaw(mem, gaddr+uint64(di.gDet+di.detGNode), 4)
++	if err != nil || node == 0 {
++		return "", ""
++	}
++	if data, err := readUintRaw(mem, di.simState, ptr); err == nil {
++		if n, err := readIntRaw(mem, di.simState+uint64(ptr), ptr); err == nil && node < n {
++			if s, err := readUintRaw(mem, data+uint64(node), 1); err == nil {
++				switch s { // detsimLive, detsimPaused, detsimDead
++				case 1:
++					state = "paused"
++				case 2:
++					state = "crashed"
++				}
++			}
++		}
++	}
++	name = strconv.FormatInt(node, 10)
++	data, err1 := readUintRaw(mem, di.names, ptr)
++	n, err2 := readIntRaw(mem, di.names+uint64(ptr), ptr)
++	if err1 != nil || err2 != nil || node >= n {
++		return name, state
++	}
++	s, err1 := readUintRaw(mem, data+uint64(node*2*ptr), ptr)
++	l, err2 := readIntRaw(mem, data+uint64(node*2*ptr+ptr), ptr)
++	if err1 != nil || err2 != nil || l <= 0 || l > 1024 {
++		return name, state
++	}
++	buf := make([]byte, l)
++	if _, err := mem.ReadMemory(buf, s); err != nil {
++		return name, state
++	}
++	return string(buf), state
++}
++
++// DetNode returns the name of g's simulated node, "" for none, and its
++// state, "crashed" or "paused" if it is not live.
++func DetNode(t *Target, g *G) (name, state string) {
++	di := t.detInfo()
++	if di == nil || g == nil || g.variable == nil {
++		return "", ""
++	}
++	return di.node(t.BinInfo(), t.Memory(), g.variable.Addr)
++}
++
++// evalDetsched evaluates detsched.NAME in scope.
++func evalDetsched(scope *EvalScope, name string) (*Variable, error) {
++	if scope.target == nil {
++		return nil, errNotDetsched
++	}
++	di := scope.target.detInfo()
++	if di == nil {
++		return nil, errNotDetsched
++	}
++	pos, err := di.position(scope.BinInfo, scope.Mem, scope.g)
++	if err != nil {
++		return nil, err
++	}
++	var v constant.Value
++	switch name {
++	case "time":
++		if pos.Time < 0 {
++			v = constant.MakeFloat64(-1)
++		} else {
++			v = constant.MakeFloat64(float64(pos.Time) / 1e9)
++		}
++	case "tick":
++		v = constant.MakeInt64(pos.Tick)
++	case "switches":
++		v = constant.MakeUint64(pos.Switches)
++	case "node":
++		v = constant.MakeString(pos.Node)
++	default:
++		return nil, fmt.Errorf("unknown detsched.%s (detsched.time, detsched.tick, detsched.switches and detsched.node are known)", name)
++	}
++	return newConstant(v, scope.BinInfo, scope.Mem), nil
++}
++
++// ParseDetPoint parses a position as GODETSTOP writes a point: tD for D
++// seconds of virtual time, sN for switch N, kN for tick N.
++func ParseDetPoint(s string) (kind byte, n uint64, err error) {
++	bad := fmt.Errorf("%q is not a position: tD (seconds of virtual time), sN (switch) or kN (tick)", s)
++	if len(s) < 2 {
++		return 0, 0, bad
++	}
++	kind = s[0]
++	switch kind {
++	case 's', 'k':
++		n, err = strconv.ParseUint(s[1:], 10, 62)
++	case 't':
++		whole, frac, _ := strings.Cut(s[1:], ".")
++		if len(frac) > 9 {
++			return 0, 0, bad
++		}
++		var w, f uint64
++		if whole != "" {
++			w, err = strconv.ParseUint(whole, 10, 32)
++		}
++		if err == nil && frac != "" {
++			f, err = strconv.ParseUint((frac + "000000000")[:9], 10, 64)
++		}
++		n = w*1e9 + f
++	default:
++		return 0, 0, bad
++	}
++	if err != nil {
++		return 0, 0, bad
++	}
++	return kind, n, nil
++}
++
++// DetSetStop makes the run stop at a position, a point as of GODETSTOP of
++// the given kind ('t', 's' or 'k'), by calling runtime.detDebugStop there.
++// It must be called before the program starts. DetStopPC returns the
++// address to break at.
++func (t *Target) DetSetStop(kind byte, n uint64) error {
++	di := t.detInfo()
++	if di == nil {
++		return errNotDetsched
++	}
++	mem := t.Memory()
++	if _, err := mem.WriteMemory(di.debug+uint64(di.stopN), le64(n)); err != nil {
++		return err
++	}
++	_, err := mem.WriteMemory(di.debug+uint64(di.stopKind), []byte{kind})
++	return err
++}
++
++// DetStopPC returns the address of runtime.detDebugStop, where a run
++// stops at the position DetSetStop gave it.
++func (t *Target) DetStopPC() uint64 {
++	if di := t.detInfo(); di != nil {
++		return di.stopFn
++	}
++	return 0
++}
++
++// DetSetBreakpoint sets an internal breakpoint at addr, which stops when
++// cb returns true.
++func (t *Target) DetSetBreakpoint(addr uint64, cb func(Thread, *Target) (bool, error)) (*Breakpoint, error) {
++	bp, err := t.SetBreakpoint(0, addr, DetschedBreakpoint, nil)
++	if err != nil {
++		return nil, err
++	}
++	bp.Breaklets[len(bp.Breaklets)-1].callback = cb
++	return bp, nil
++}
++
++// DetClearBreakpoint clears the internal breakpoint DetSetBreakpoint set
++// at addr, and leaves any other breakpoint there.
++func (t *Target) DetClearBreakpoint(addr uint64) error {
++	bp := t.Breakpoints().M[addr]
++	if bp == nil {
++		return nil
++	}
++	for i, b := range bp.Breaklets {
++		if b.Kind == DetschedBreakpoint {
++			bp.Breaklets[i] = nil
++		}
++	}
++	_, err := t.finishClearBreakpoint(bp)
++	return err
++}
++
++func le64(n uint64) []byte {
++	b := make([]byte, 8)
++	binary.LittleEndian.PutUint64(b, n)
++	return b
++}
+diff --git a/pkg/proc/eval.go b/pkg/proc/eval.go
+index 73748c2..b7248b8 100644
+--- a/pkg/proc/eval.go
++++ b/pkg/proc/eval.go
+@@ -1135,6 +1135,14 @@ func (stack *evalStack) executeOp() {
+ 			stack.push(newConstant(constant.MakeInt64(0), scope.BinInfo, scope.Mem))
+ 		}
+ 
++	case *evalop.PushDetsched:
++		v, err := evalDetsched(scope, op.Name)
++		if err != nil {
++			stack.err = err
++			return
++		}
++		stack.push(v)
++
+ 	case *evalop.PushThreadID:
+ 		stack.push(newConstant(constant.MakeInt64(int64(scope.threadID)), scope.BinInfo, scope.Mem))
+ 
+diff --git a/pkg/proc/evalop/evalcompile.go b/pkg/proc/evalop/evalcompile.go
+index 078a524..f694049 100644
+--- a/pkg/proc/evalop/evalcompile.go
++++ b/pkg/proc/evalop/evalcompile.go
+@@ -331,6 +331,9 @@ func (ctx *compileCtx) compileAST(t ast.Expr, toplevel bool) error {
+ 			case x.Name == "runtime" && node.Sel.Name == "rangeParentOffset":
+ 				ctx.pushOp(&PushRangeParentOffset{})
+ 
++			case x.Name == "detsched" && (node.Sel.Name == "time" || node.Sel.Name == "tick" || node.Sel.Name == "switches" || node.Sel.Name == "node"):
++				ctx.pushOp(&PushDetsched{Name: node.Sel.Name})
++
+ 			case x.Name == DelvePackage && node.Sel.Name == BreakpointHitCountVarName:
+ 				ctx.pushOp(&PushBreakpointHitCount{})
+ 
+diff --git a/pkg/proc/evalop/ops.go b/pkg/proc/evalop/ops.go
+index 947b965..b0c4ba8 100644
+--- a/pkg/proc/evalop/ops.go
++++ b/pkg/proc/evalop/ops.go
+@@ -24,6 +24,14 @@ type PushFrameoff struct {
+ 
+ func (*PushFrameoff) depthCheck() (npop, npush int) { return 0, 1 }
+ 
++// PushDetsched pushes detsched.Name, part of the position of a detsched
++// run, on the stack.
++type PushDetsched struct {
++	Name string
++}
++
++func (*PushDetsched) depthCheck() (npop, npush int) { return 0, 1 }
++
+ // PushThreadID pushes the ID of the current thread on the stack.
+ type PushThreadID struct {
+ }
+diff --git a/pkg/terminal/command.go b/pkg/terminal/command.go
+index 718dd13..594894d 100644
+--- a/pkg/terminal/command.go
++++ b/pkg/terminal/command.go
+@@ -180,6 +180,15 @@ For live targets the command takes the following forms:
+ 
+ 	restart [newargv...] [redirects...]	restarts the process
+ 
++For a program built with GOEXPERIMENT=detsched, whose run is the same every time, it also runs the program again to a position, with the breakpoints disabled on the way:
++
++	restart cN	to checkpoint N (see "help checkpoint")
++	restart tD	to D seconds of virtual time, as GODETSTOP and the fault timeline write it
++	restart sN	to goroutine switch N
++	restart kN	to tick N
++
++At a position it stops in the code of the goroutine that runs there.
++
+ If newargv is omitted the process is restarted (or re-recorded) with the same argument vector.
+ If -noargs is specified instead, the argument vector is cleared.
+ 
+@@ -308,6 +317,11 @@ To only display user (or runtime) goroutines, use:
+ 	goroutines -with user
+ 	goroutines -without user
+ 
++To only display the goroutines of a simulated node in a detsched program (GOEXPERIMENT=detsched with the SDK's package sim), use its name, which matches every start of the node, or its full name in quotes:
++
++	goroutines -with node n1
++	goroutines -with node "n1 (start 2)"
++
+ CHANNELS
+ 
+ To only show goroutines waiting to send to or receive from a specific channel use:
+@@ -318,7 +332,7 @@ Note that 'expr' must not contain spaces.
+ 
+ GROUPING
+ 
+-	goroutines -group (userloc|curloc|goloc|startloc|running|user)
++	goroutines -group (userloc|curloc|goloc|startloc|running|user|node)
+ 
+ 	Where:
+ 	userloc: groups goroutines by the location of the topmost stackframe in user code
+@@ -327,6 +341,7 @@ GROUPING
+ 	startloc: groups goroutines by the location of the start function
+ 	running: groups goroutines by whether they are running or not
+ 	user: groups goroutines by whether they are user or runtime goroutines
++	node: groups goroutines by their simulated node in a detsched program
+ 
+ 
+ Groups goroutines by the given location, running status or user classification, up to 5 goroutines per group will be displayed as well as the total number of goroutines in the group.
+@@ -416,11 +431,13 @@ If regex is specified only package variables with a name matching it will be ret
+ Argument -a shows more registers. Individual registers can also be displayed by 'print' and 'display'. See Documentation/cli/expr.md.`},
+ 		{aliases: []string{"exit", "quit", "q"}, cmdFn: exitCommand, helpMsg: `Exit the debugger.
+ 
+-	exit [-c] [-d]
++	exit [-c] [-d] [-k]
+ 
+ When connected to a headless instance started with the --accept-multiclient, pass -c to resume the execution of the target process before disconnecting.
+ 
+-Pass -d to detach from the target process, leaving it running, without being prompted whether to kill it.`},
++Pass -d to detach from the target process, leaving it running, without being prompted whether to kill it.
++
++A program built with GOEXPERIMENT=detsched that the debugger started and that is still running is first run to its end with every breakpoint cleared, so that it prints its trace line, for at most 5 minutes; this also happens when a script or the input ends. Pass -k to kill it at once instead.`},
+ 		{aliases: []string{"list", "ls", "l"}, cmdFn: listCommand, helpMsg: `Show source code.
+ 
+ 	[goroutine <n>] [frame <m>] list [<locspec>]
+@@ -638,15 +655,21 @@ Switches to the specified process.`},
+ 	}
+ 
+ 	addrecorded := client == nil
++	adddetsched := false
+ 	if !addrecorded {
+ 		if state, err := client.GetStateNonBlocking(); err == nil {
+ 			addrecorded = state.Recording
+ 			if !addrecorded {
+ 				addrecorded = client.Recorded()
+ 			}
++			adddetsched = state.CurrentThread != nil && state.CurrentThread.Position != nil
+ 		}
+ 	}
+ 
++	if adddetsched && !addrecorded {
++		c.cmds = append(c.cmds, detschedCommands(c)...)
++	}
++
+ 	if addrecorded {
+ 		c.cmds = append(c.cmds,
+ 			command{
+@@ -945,6 +968,25 @@ func (c *Commands) goroutines(t *Term, ctx callContext, argstr string) error {
+ 		if err != nil {
+ 			return err
+ 		}
++		if t.jsonOn() {
++			if len(groups) > 0 {
++				for i := range groups {
++					list := []map[string]any{}
++					for _, g := range gs[groups[i].Offset:][:groups[i].Count] {
++						list = append(list, t.jsonGoroutine(g))
++					}
++					t.jsonEmit(map[string]any{"event": "goroutines", "group": groups[i].Name, "total": groups[i].Total, "goroutines": list})
++				}
++			} else {
++				slices.SortFunc(gs, func(a, b *api.Goroutine) int { return cmp.Compare(a.ID, b.ID) })
++				list := []map[string]any{}
++				for _, g := range gs {
++					list = append(list, t.jsonGoroutine(g))
++				}
++				t.jsonEmit(map[string]any{"event": "goroutines", "goroutines": list})
++			}
++			continue
++		}
+ 		if len(groups) > 0 {
+ 			for i := range groups {
+ 				fmt.Fprintf(t.stdout, "%s\n", groups[i].Name)
+@@ -1145,6 +1187,13 @@ func (t *Term) formatGoroutine(g *api.Goroutine, fgl api.FormatGoroutineLoc) str
+ 	if g.ThreadID != 0 {
+ 		fmt.Fprintf(buf, " (thread %d)", g.ThreadID)
+ 	}
++	if g.Node != "" {
++		fmt.Fprintf(buf, " [node %s", g.Node)
++		if g.NodeState != "" {
++			fmt.Fprintf(buf, " %s", g.NodeState)
++		}
++		fmt.Fprintf(buf, "]")
++	}
+ 
+ 	if (g.Status == api.GoroutineWaiting || g.Status == api.GoroutineSyscall) && g.WaitReason != 0 {
+ 		fmt.Fprintf(buf, " [%s", api.WaitReasonString(t.goVersion(), g.WaitReason))
+@@ -1164,6 +1213,9 @@ func writeGoroutineLong(t *Term, w io.Writer, g *api.Goroutine, prefix string) {
+ 		prefix, t.formatLocation(g.UserCurrentLoc),
+ 		prefix, t.formatLocation(g.GoStatementLoc),
+ 		prefix, t.formatLocation(g.StartLoc))
++	if g.Node != "" {
++		fmt.Fprintf(w, "%s\tNode: %s %s\n", prefix, g.Node, g.NodeState)
++	}
+ 	writeGoroutineLabels(w, g, prefix+"\t")
+ }
+ 
+@@ -1255,6 +1307,9 @@ func parseOptionalCount(arg string) (int64, error) {
+ }
+ 
+ func restartLive(t *Term, ctx callContext, args string) error {
++	if detPositionRegexp.MatchString(args) && t.isDetsched() {
++		return restartDetsched(t, args)
++	}
+ 	t.oldPid = 0
+ 	resetArgs, newArgv, newRedirects, err := parseNewArgv(args)
+ 	if err != nil {
+@@ -1385,6 +1440,9 @@ func (c *Commands) cont(t *Term, ctx callContext, args string) error {
+ 	stateChan := t.client.Continue()
+ 	var state *api.DebuggerState
+ 	for state = range stateChan {
++		if state.Exited {
++			return t.exitError(state)
++		}
+ 		if state.Err != nil {
+ 			printcontextNoState(t)
+ 			return state.Err
+@@ -2215,6 +2273,15 @@ func (c *Commands) printVar(t *Term, ctx callContext, args string) error {
+ 		return err
+ 	}
+ 
++	if t.jsonOn() {
++		rec := t.jsonVar(val, "")
++		rec["event"] = "value"
++		rec["expr"] = args
++		rec["value"] = val.StringWithOptions("", fmtstr, t.rawStringFlag())
++		t.jsonEmit(rec)
++		return nil
++	}
++
+ 	t.stdout.pw.PageMaybe(nil)
+ 
+ 	fmt.Fprintln(t.stdout, val.StringWithOptions("", fmtstr, api.PrettyNewlines|t.rawStringFlag()))
+@@ -2395,6 +2462,9 @@ func args(t *Term, ctx callContext, args string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if t.jsonOn() {
++		return t.jsonFilteredVariables("args", vars, filter)
++	}
+ 	return t.printFilteredVariables("args", vars, filter, cfg)
+ }
+ 
+@@ -2411,6 +2481,9 @@ func locals(t *Term, ctx callContext, args string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if t.jsonOn() {
++		return t.jsonFilteredVariables("locals", locals, filter)
++	}
+ 	return t.printFilteredVariables("locals", locals, filter, cfg)
+ }
+ 
+@@ -2459,6 +2532,10 @@ func stackCommand(t *Term, ctx callContext, args string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if t.jsonOn() && sa.ancestors == 0 {
++		t.jsonEmit(map[string]any{"event": "stack", "frames": t.jsonFrames(stack)})
++		return nil
++	}
+ 	t.stdout.pw.PageMaybe(nil)
+ 	printStack(t, t.stdout, stack, "", sa.offsets)
+ 	if sa.ancestors > 0 {
+@@ -2756,6 +2833,17 @@ func printStack(t *Term, out io.Writer, stack []api.Stackframe, ind string, offs
+ }
+ 
+ func printcontext(t *Term, state *api.DebuggerState) {
++	if t.jsonOn() && !t.IsTraceNonInteractive() {
++		for _, th := range state.Threads {
++			if th.Breakpoint != nil && (state.CurrentThread == nil || th.ID != state.CurrentThread.ID) {
++				t.jsonThread(th)
++			}
++		}
++		if state.CurrentThread != nil {
++			t.jsonThread(state.CurrentThread)
++		}
++		return
++	}
+ 	if t.IsTraceNonInteractive() {
+ 		// If we're just running the `trace` subcommand there isn't any need
+ 		// to print out the rest of the state below.
+@@ -2802,7 +2890,7 @@ func printcontext(t *Term, state *api.DebuggerState) {
+ 			}
+ 		}
+ 		if th == nil {
+-			printcontextLocation(t, state.SelectedGoroutine.CurrentLoc)
++			printcontextLocation(t, state.SelectedGoroutine.CurrentLoc, "")
+ 			return
+ 		}
+ 	}
+@@ -2824,8 +2912,8 @@ func printcontext(t *Term, state *api.DebuggerState) {
+ 	}
+ }
+ 
+-func printcontextLocation(t *Term, loc api.Location) {
+-	fmt.Fprintf(t.stdout, "> %s() %s:%d (PC: %#v)\n", loc.Function.Name(), t.formatPath(loc.File), loc.Line, loc.PC)
++func printcontextLocation(t *Term, loc api.Location, pos string) {
++	fmt.Fprintf(t.stdout, "> %s() %s:%d (PC: %#v)%s\n", loc.Function.Name(), t.formatPath(loc.File), loc.Line, loc.PC, pos)
+ 	if loc.Function != nil && loc.Function.Optimized {
+ 		fmt.Fprintln(t.stdout, optimizedFunctionWarning)
+ 	}
+@@ -2843,10 +2931,14 @@ func printReturnValues(t *Term, th *api.Thread) {
+ }
+ 
+ func printcontextThread(t *Term, th *api.Thread) {
++	if t.jsonOn() {
++		t.jsonThread(th)
++		return
++	}
+ 	fn := th.Function
+ 
+ 	if th.Breakpoint == nil {
+-		printcontextLocation(t, api.Location{PC: th.PC, File: th.File, Line: th.Line, Function: th.Function})
++		printcontextLocation(t, api.Location{PC: th.PC, File: th.File, Line: th.Line, Function: th.Function}, posSuffix(th))
+ 		printReturnValues(t, th)
+ 		return
+ 	}
+@@ -2886,7 +2978,7 @@ func printcontextThread(t *Term, th *api.Thread) {
+ 	}
+ 
+ 	if hitCount, ok := th.Breakpoint.HitCount[strconv.FormatInt(th.GoroutineID, 10)]; ok {
+-		fmt.Fprintf(t.stdout, "> %s%s(%s) %s:%d (hits goroutine(%d):%d total:%d) (PC: %#v)\n",
++		fmt.Fprintf(t.stdout, "> %s%s(%s) %s:%d (hits goroutine(%d):%d total:%d) (PC: %#v)%s\n",
+ 			bpname,
+ 			fn.Name(),
+ 			args,
+@@ -2895,16 +2987,18 @@ func printcontextThread(t *Term, th *api.Thread) {
+ 			th.GoroutineID,
+ 			hitCount,
+ 			th.Breakpoint.TotalHitCount,
+-			th.PC)
++			th.PC,
++			posSuffix(th))
+ 	} else {
+-		fmt.Fprintf(t.stdout, "> %s%s(%s) %s:%d (hits total:%d) (PC: %#v)\n",
++		fmt.Fprintf(t.stdout, "> %s%s(%s) %s:%d (hits total:%d) (PC: %#v)%s\n",
+ 			bpname,
+ 			fn.Name(),
+ 			args,
+ 			t.formatPath(th.File),
+ 			th.Line,
+ 			th.Breakpoint.TotalHitCount,
+-			th.PC)
++			th.PC,
++			posSuffix(th))
+ 	}
+ 	if th.Function != nil && th.Function.Optimized {
+ 		fmt.Fprintln(t.stdout, optimizedFunctionWarning)
+@@ -3074,7 +3168,7 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, a
+ 				// Levels 3-4: Multi-line format - params on separate lines
+ 				fmt.Fprintf(t.stdout, "\n")
+ 			}
+-			fmt.Fprintf(t.stdout, "%s)\n", paramStr)
++			fmt.Fprintf(t.stdout, "%s)%s\n", paramStr, posSuffix(th))
+ 
+ 		}
+ 
+@@ -3088,7 +3182,7 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, a
+ 			for _, v := range th.ReturnValues {
+ 				retVals = append(retVals, api.FormatTraceVariable(v, verbosity))
+ 			}
+-			fmt.Fprintf(t.stdout, "%s>> %s %s => (%s)\n", depthPrefix, tracePrefix, fn.Name(), strings.Join(retVals, ","))
++			fmt.Fprintf(t.stdout, "%s>> %s %s => (%s)%s\n", depthPrefix, tracePrefix, fn.Name(), strings.Join(retVals, ","), posSuffix(th))
+ 		}
+ 	}
+ 	if th.Breakpoint.TraceFollowCalls > 0 {
+@@ -3112,6 +3206,9 @@ const (
+ )
+ 
+ func printPos(t *Term, th *api.Thread, flags printPosFlags) error {
++	if t.jsonOn() {
++		return nil
++	}
+ 	if flags&printPosStepInstruction != 0 {
+ 		if t.conf.Position == config.PositionSource {
+ 			return printfile(t, th.File, th.Line, flags&printPosShowArrow != 0)
+@@ -3212,6 +3309,8 @@ func exitCommand(t *Term, ctx callContext, args string) error {
+ 		t.quitContinue = true
+ 	case "-d":
+ 		t.detachNoKill = true
++	case "-k":
++		t.killNow = true
+ 	case "":
+ 		// no arguments
+ 	default:
+@@ -3378,7 +3477,12 @@ func (c *Commands) executeFile(t *Term, name string) error {
+ 			continue
+ 		}
+ 
+-		if err := c.Call(line, t); err != nil {
++		call := func() error { return c.Call(line, t) }
++		if t.jsonOn() {
++			jcall := call
++			call = func() error { return t.jsonCall(line, fmt.Sprintf("%s:%d", name, lineno), jcall) }
++		}
++		if err := call(); err != nil {
+ 			if _, isExitRequest := err.(ExitRequestError); isExitRequest {
+ 				return err
+ 			}
+@@ -3394,9 +3498,13 @@ func (c *Commands) rewind(t *Term, ctx callContext, args string) error {
+ 	stateChan := t.client.Rewind()
+ 	var state *api.DebuggerState
+ 	for state = range stateChan {
++		if state.Exited {
++			return t.exitError(state)
++		}
+ 		if state.Err != nil {
+ 			return state.Err
+ 		}
++		t.oldPid = state.Pid
+ 		printcontext(t, state)
+ 	}
+ 	printPos(t, state.CurrentThread, printPosShowArrow)
+diff --git a/pkg/terminal/detsched.go b/pkg/terminal/detsched.go
+new file mode 100644
+index 0000000..b3bfe69
+--- /dev/null
++++ b/pkg/terminal/detsched.go
+@@ -0,0 +1,184 @@
++package terminal
++
++// Support for detsched programs (GOEXPERIMENT=detsched): the run's position
++// at every stop, restarting to a checkpoint or position, and running the
++// program to its end at exit so that it prints its trace line.
++
++import (
++	"errors"
++	"fmt"
++	"regexp"
++	"time"
++
++	"github.com/go-delve/delve/service/api"
++)
++
++// posSuffix returns " at POSITION" for a thread stopped in a detsched
++// program, or "".
++func posSuffix(th *api.Thread) string {
++	if th == nil || th.Position == nil {
++		return ""
++	}
++	return " at " + th.Position.String()
++}
++
++// detPositionRegexp matches the positions restart takes in a detsched
++// program: a checkpoint, or a point as of GODETSTOP.
++var detPositionRegexp = regexp.MustCompile(`^(c[0-9]+|t[0-9]*\.?[0-9]+|[sk][0-9]+)$`)
++
++// isDetsched reports whether the target is a detsched program, whose
++// stops have a position, also once it exited.
++func (t *Term) isDetsched() bool {
++	if !t.detSeen {
++		state, err := t.client.GetStateNonBlocking()
++		t.detSeen = err == nil && state.CurrentThread != nil && state.CurrentThread.Position != nil
++	}
++	return t.detSeen
++}
++
++// restartDetsched runs the program again to pos.
++func restartDetsched(t *Term, pos string) error {
++	if err := restartIntl(t, false, pos, false, nil, [3]string{}); err != nil {
++		return err
++	}
++	state, err := t.client.GetState()
++	if err != nil {
++		return err
++	}
++	t.oldPid = state.Pid
++	printcontext(t, state)
++	printPos(t, state.CurrentThread, printPosShowArrow)
++	t.onStop()
++	return nil
++}
++
++// detExitTimeout bounds the run to the end that exit makes.
++var detExitTimeout = 5 * time.Minute
++
++// detRunToEnd runs a detsched program that is still running to its end,
++// with every breakpoint cleared, so that it prints its trace line, which
++// says whether the run was the one replayed. It returns false if the
++// program did not end.
++func (t *Term) detRunToEnd() bool {
++	state, err := t.client.GetState()
++	if err != nil || state.Exited || state.CurrentThread == nil || state.CurrentThread.Position == nil || t.client.AttachedToExistingProcess() {
++		return true
++	}
++	t.detSay("running the program to its end without breakpoints, so that it prints its trace line (exit -k kills it instead)")
++	bps, err := t.client.ListBreakpoints(false)
++	if err == nil {
++		for _, bp := range bps {
++			t.client.ClearBreakpoint(bp.ID)
++		}
++	}
++	timer := time.AfterFunc(detExitTimeout, func() { t.client.Halt() })
++	defer timer.Stop()
++	for state = range t.client.Continue() {
++		if state.Exited {
++			if t.jsonOn() {
++				rec := map[string]any{"event": "exit", "pid": state.Pid, "status": state.ExitStatus}
++				if state.Trace != "" {
++					rec["trace"] = state.Trace
++				}
++				t.jsonEmit(rec)
++			} else {
++				fmt.Fprintln(t.stdout, exitMessage(state))
++			}
++			return true
++		}
++		if state.Err != nil {
++			break
++		}
++	}
++	t.detSay(fmt.Sprintf("the program did not end within %v, so it printed no trace line; killing it", detExitTimeout))
++	return false
++}
++
++// detSay prints a message of the debugger's own.
++func (t *Term) detSay(msg string) {
++	if t.jsonOn() {
++		t.jsonEmit(map[string]any{"event": "output", "text": msg})
++		return
++	}
++	fmt.Fprintln(t.stdout, msg)
++}
++
++// exitMessage describes the exit in state, with the program's trace line.
++func exitMessage(state *api.DebuggerState) string {
++	msg := fmt.Sprintf("Process %d has exited with status %d", state.Pid, state.ExitStatus)
++	if state.Trace != "" {
++		msg += " (" + state.Trace + ")"
++	}
++	return msg
++}
++
++// exitError returns the error a command returns when the program exited,
++// with the program's trace line, or prints the exit record and returns
++// nil in the JSON mode.
++func (t *Term) exitError(state *api.DebuggerState) error {
++	if t.jsonOn() {
++		rec := map[string]any{"event": "exit", "pid": state.Pid, "status": state.ExitStatus}
++		if state.Trace != "" {
++			rec["trace"] = state.Trace
++		}
++		t.jsonEmit(rec)
++		return nil
++	}
++	return errors.New(exitMessage(state))
++}
++
++// detschedCommands returns the commands for going back in a detsched
++// program, which a recording has too.
++func detschedCommands(c *Commands) []command {
++	return []command{
++		{
++			aliases: []string{"rewind", "rw"},
++			group:   runCmds,
++			cmdFn:   c.rewind,
++			helpMsg: `Goes back to the previous breakpoint stop of a detsched run.
++
++	rewind
++
++In a program built with GOEXPERIMENT=detsched, the run is the same every time, so rewind runs the program again from its start to the last stop at a breakpoint (not a tracepoint) before the current position in this session, with the breakpoints disabled on the way, or to the start of the program if there is none. Each rewind goes back one more stop.
++
++See also: "help checkpoint", "help restart".`,
++		},
++		{
++			aliases: []string{"check", "checkpoint"},
++			cmdFn:   checkpoint,
++			helpMsg: `Creates a checkpoint at the current position of a detsched run.
++
++	checkpoint [note]
++
++In a program built with GOEXPERIMENT=detsched, a checkpoint records the run's position: the tick, the goroutine and instruction where it is stopped, and the hit counts of the breakpoints. "restart cN" runs the program again to it, which, as the run is the same every time, has the same state there. The note defaults to the current function and line.`,
++		},
++		{
++			aliases: []string{"checkpoints"},
++			cmdFn:   checkpoints,
++			helpMsg: "Print out info for existing checkpoints.",
++		},
++		{
++			aliases: []string{"clear-checkpoint", "clearcheck"},
++			cmdFn:   clearCheckpoint,
++			helpMsg: `Deletes checkpoint.
++
++	clear-checkpoint <id>`,
++		},
++	}
++}
++
++// jsonFilteredVariables prints the record of the args or locals command.
++func (t *Term) jsonFilteredVariables(kind string, vars []api.Variable, filter string) error {
++	reg, err := regexp.Compile(filter)
++	if err != nil {
++		return err
++	}
++	var match []api.Variable
++	for _, v := range vars {
++		if reg.MatchString(v.Name) {
++			match = append(match, v)
++		}
++	}
++	t.jsonEmit(map[string]any{"event": kind, "vars": t.jsonVars(match, 0)})
++	return nil
++}
+diff --git a/pkg/terminal/json.go b/pkg/terminal/json.go
+new file mode 100644
+index 0000000..4df6b3f
+--- /dev/null
++++ b/pkg/terminal/json.go
+@@ -0,0 +1,251 @@
++package terminal
++
++// The JSON output mode (dlv --json, or "config output json"): every line
++// Delve prints is one JSON object, for scripts and agents that read
++// Delve's output without filtering text. Each command of a script or of
++// the prompt prints at least one record:
++//
++//	{"cmd":"print x","event":"value","expr":"x","type":"int","value":"3"}
++//	{"cmd":"continue","event":"trace","bp":"pf","goroutine":16,...}
++//	{"cmd":"continue","event":"exit","status":0,"trace":"detsched: trace=..."}
++//	{"cmd":"break pf sim.(*disk).powerFail","event":"output","text":"Breakpoint pf set at ..."}
++//	{"cmd":"print y","event":"error","error":"could not find symbol value for y"}
++//
++// Commands without a record of their own print their text in an "output"
++// record, and a command that printed nothing prints {"event":"ok"}. A
++// command read from a file has "src":"FILE:LINE". The program's own output
++// is not Delve's: send it elsewhere with -r stdout:FILE -r stderr:FILE, or
++// skip the lines that do not start with "{".
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"io"
++	"regexp"
++	"strconv"
++	"strings"
++
++	"github.com/go-delve/delve/service/api"
++)
++
++// jsonOut is the state of the JSON output mode.
++type jsonOut struct {
++	w       io.Writer // where records go
++	cmd     string    // the command running
++	src     string    // its file and line, if it came from a file
++	emitted bool      // the command printed a record
++	depth   int
++}
++
++// jsonOn reports whether the terminal prints JSON records.
++func (t *Term) jsonOn() bool { return t != nil && t.json != nil }
++
++// jsonEmit prints rec, with the command that printed it.
++func (t *Term) jsonEmit(rec map[string]any) {
++	j := t.json
++	if j.cmd != "" {
++		rec["cmd"] = j.cmd
++	}
++	if j.src != "" {
++		rec["src"] = j.src
++	}
++	b, err := json.Marshal(rec)
++	if err != nil {
++		b, _ = json.Marshal(map[string]any{"event": "error", "error": err.Error()})
++	}
++	b = append(b, '\n')
++	j.w.Write(b)
++	j.emitted = true
++}
++
++var exitedRegexp = regexp.MustCompile(`^Process (\d+) has exited with status (-?\d+)`)
++
++// jsonCall runs the command cmdstr, from src if not "", and prints its
++// records: what it printed as text, or its error, or ok.
++func (t *Term) jsonCall(cmdstr, src string, call func() error) error {
++	j := t.json
++	saved := *j
++	j.cmd, j.src, j.emitted = strings.TrimSpace(cmdstr), src, false
++	j.depth++
++	var buf bytes.Buffer
++	pw := t.stdout.pw
++	t.stdout.pw = &pagingWriter{w: &buf}
++	err := call()
++	t.stdout.pw = pw
++	j.depth--
++	if text := strings.TrimRight(buf.String(), "\n"); text != "" {
++		t.jsonEmit(map[string]any{"event": "output", "text": text})
++	}
++	emitted := j.emitted
++	if err != nil {
++		if _, ok := err.(ExitRequestError); ok {
++			// The records of the exit, such as the trace line, are the
++			// command's.
++			return err
++		}
++		if m := exitedRegexp.FindStringSubmatch(err.Error()); m != nil {
++			pid, _ := strconv.Atoi(m[1])
++			status, _ := strconv.Atoi(m[2])
++			t.jsonEmit(map[string]any{"event": "exit", "pid": pid, "status": status})
++		} else {
++			t.jsonEmit(map[string]any{"event": "error", "error": err.Error()})
++		}
++		emitted = true
++	}
++	if !emitted {
++		t.jsonEmit(map[string]any{"event": "ok"})
++	}
++	emitted = emitted || saved.emitted
++	*j = saved
++	j.emitted = emitted
++	if j.depth == 0 && t.conf.Output != "json" {
++		// config output text, which takes effect after the command.
++		t.json = nil
++	}
++	return nil
++}
++
++func jsonPos(p *api.Position) map[string]any {
++	if p == nil {
++		return nil
++	}
++	r := map[string]any{"t": p.Time, "s": p.Switch, "k": p.Tick}
++	if p.Node != "" {
++		r["node"] = p.Node
++	}
++	return r
++}
++
++func (t *Term) jsonVar(v *api.Variable, name string) map[string]any {
++	r := map[string]any{"type": v.Type, "value": v.StringWithOptions("", "", t.rawStringFlag())}
++	if name != "" {
++		r["name"] = name
++	}
++	if v.Unreadable != "" {
++		r["unreadable"] = v.Unreadable
++	}
++	return r
++}
++
++func (t *Term) jsonVars(vs []api.Variable, flags api.VariableFlags) []map[string]any {
++	r := []map[string]any{}
++	for i := range vs {
++		if flags != 0 && vs[i].Flags&flags == 0 {
++			continue
++		}
++		r = append(r, t.jsonVar(&vs[i], vs[i].Name))
++	}
++	return r
++}
++
++func (t *Term) jsonFrames(stack []api.Stackframe) []map[string]any {
++	r := []map[string]any{}
++	for i := range stack {
++		f := &stack[i]
++		fr := map[string]any{"n": i, "func": f.Function.Name(), "file": t.formatPath(f.File), "line": f.Line, "pc": fmt.Sprintf("%#x", f.PC)}
++		if f.Err != "" {
++			fr["error"] = f.Err
++		}
++		r = append(r, fr)
++	}
++	return r
++}
++
++func (t *Term) jsonGoroutine(g *api.Goroutine) map[string]any {
++	if g.Unreadable != "" {
++		return map[string]any{"id": g.ID, "unreadable": g.Unreadable}
++	}
++	loc := func(l api.Location) map[string]any {
++		return map[string]any{"func": l.Function.Name(), "file": t.formatPath(l.File), "line": l.Line}
++	}
++	r := map[string]any{"id": g.ID, "user": loc(g.UserCurrentLoc), "current": loc(g.CurrentLoc), "go": loc(g.GoStatementLoc), "start": loc(g.StartLoc)}
++	if g.Node != "" {
++		r["node"] = g.Node
++	}
++	if g.NodeState != "" {
++		r["node_state"] = g.NodeState
++	}
++	if g.ThreadID != 0 {
++		r["thread"] = g.ThreadID
++	}
++	if (g.Status == api.GoroutineWaiting || g.Status == api.GoroutineSyscall) && g.WaitReason != 0 {
++		r["wait"] = api.WaitReasonString(t.goVersion(), g.WaitReason)
++	}
++	if len(g.Labels) > 0 {
++		r["labels"] = g.Labels
++	}
++	return r
++}
++
++// jsonThread prints the record of a thread stopped at a breakpoint, a
++// tracepoint, or elsewhere.
++func (t *Term) jsonThread(th *api.Thread) {
++	rec := map[string]any{
++		"event":     "stop",
++		"goroutine": th.GoroutineID,
++		"func":      th.Function.Name(),
++		"file":      t.formatPath(th.File),
++		"line":      th.Line,
++		"pc":        fmt.Sprintf("%#x", th.PC),
++	}
++	if th.Position != nil {
++		rec["pos"] = jsonPos(th.Position)
++	}
++	if bp := th.Breakpoint; bp != nil {
++		switch {
++		case bp.TraceReturn:
++			rec["event"] = "return"
++		case bp.Tracepoint:
++			rec["event"] = "trace"
++		case bp.WatchExpr != "":
++			rec["event"] = "watch"
++			rec["expr"] = bp.WatchExpr
++		default:
++			rec["event"] = "break"
++		}
++		if bp.Name != "" {
++			rec["bp"] = bp.Name
++		} else {
++			rec["bp"] = strconv.Itoa(bp.ID)
++		}
++		rec["hits"] = bp.TotalHitCount
++		if bpi := th.BreakpointInfo; bpi != nil {
++			if bp.TraceReturn {
++				var ret []api.Variable
++				for _, v := range bpi.Arguments {
++					if v.Flags&api.VariableReturnArgument != 0 {
++						ret = append(ret, v)
++					}
++				}
++				rec["ret"] = t.jsonVars(ret, 0)
++			} else {
++				if len(bpi.Arguments) > 0 {
++					rec["args"] = t.jsonVars(bpi.Arguments, api.VariableArgument)
++				}
++				if len(bpi.Variables) > 0 {
++					vs := []map[string]any{}
++					for i := range bpi.Variables {
++						v := t.jsonVar(&bpi.Variables[i], "")
++						v["expr"] = bpi.Variables[i].Name
++						vs = append(vs, v)
++					}
++					rec["vars"] = vs
++				}
++				if len(bpi.Locals) > 0 {
++					rec["locals"] = t.jsonVars(bpi.Locals, 0)
++				}
++				if bpi.Stacktrace != nil {
++					rec["stack"] = t.jsonFrames(bpi.Stacktrace)
++				}
++				if bpi.Goroutine != nil {
++					rec["goroutine_info"] = t.jsonGoroutine(bpi.Goroutine)
++				}
++			}
++		}
++	}
++	if len(th.ReturnValues) > 0 && (th.Breakpoint == nil || !th.Breakpoint.TraceReturn) {
++		rec["ret"] = t.jsonVars(th.ReturnValues, 0)
++	}
++	t.jsonEmit(rec)
++}
+diff --git a/pkg/terminal/terminal.go b/pkg/terminal/terminal.go
+index ca04161..8b4c38a 100644
+--- a/pkg/terminal/terminal.go
++++ b/pkg/terminal/terminal.go
+@@ -85,6 +85,16 @@ type Term struct {
+ 	// the target process should be left running, without prompting.
+ 	detachNoKill bool
+ 
++	// killNow is set to true by exitCommand when passed -k to signal that a
++	// detsched program should be killed rather than run to its end.
++	killNow bool
++
++	// json is the state of the JSON output mode, nil in the text mode.
++	json *jsonOut
++
++	// detSeen is set once the target showed it is a detsched program.
++	detSeen bool
++
+ 	longCommandMu         sync.Mutex
+ 	longCommandCancelFlag bool
+ 
+@@ -144,6 +154,7 @@ func New(client service.Client, conf *config.Config, isAttachCmd bool) *Term {
+ 		if state, err := client.GetState(); err == nil {
+ 			t.oldPid = state.Pid
+ 		}
++		t.isDetsched()
+ 		firstEventBinaryInfoDownload := true
+ 		client.SetEventsFn(func(event *api.Event) {
+ 			switch event.Kind {
+@@ -194,6 +205,13 @@ func (t *Term) updateConfig() {
+ 	// These are always called together.
+ 	t.updateColorScheme()
+ 	t.updateTab()
++	switch {
++	case t.conf.Output == "json" && t.json == nil:
++		t.json = &jsonOut{w: t.stdout.pw}
++		t.stdout.colorEscapes = nil
++	case t.conf.Output != "json" && t.json != nil && t.json.depth == 0:
++		t.json = nil
++	}
+ }
+ 
+ func (t *Term) updateColorScheme() {
+@@ -406,7 +424,9 @@ func (t *Term) Run() (int, error) {
+ 		fmt.Printf("Unable to read history file %s: %v\n", fullHistoryFile, err)
+ 	}
+ 
+-	fmt.Println("Type 'help' for list of commands.")
++	if !t.jsonOn() {
++		fmt.Println("Type 'help' for list of commands.")
++	}
+ 
+ 	if t.InitFile != "" {
+ 		err := t.cmds.executeFile(t, t.InitFile)
+@@ -439,7 +459,9 @@ func (t *Term) Run() (int, error) {
+ 		cmdstr, err := t.promptForInput(prompt)
+ 		if err != nil {
+ 			if err == io.EOF {
+-				fmt.Fprintln(t.stdout, "exit")
++				if !t.jsonOn() {
++					fmt.Fprintln(t.stdout, "exit")
++				}
+ 				return t.handleExit()
+ 			}
+ 			return 1, errors.New("Prompt for input failed.\n")
+@@ -452,7 +474,12 @@ func (t *Term) Run() (int, error) {
+ 
+ 		lastCmd = cmdstr
+ 
+-		if err := t.cmds.Call(cmdstr, t); err != nil {
++		call := func() error { return t.cmds.Call(cmdstr, t) }
++		if t.jsonOn() {
++			jcall := call
++			call = func() error { return t.jsonCall(cmdstr, "", jcall) }
++		}
++		if err := call(); err != nil {
+ 			if _, ok := err.(ExitRequestError); ok {
+ 				return t.handleExit()
+ 			}
+@@ -608,6 +635,10 @@ func (t *Term) handleExit() (int, error) {
+ 			doDetach = answer
+ 		}
+ 
++		if doDetach && !t.killNow && !t.detachNoKill && !t.client.IsMulticlient() {
++			t.detRunToEnd()
++		}
++
+ 		if doDetach {
+ 			kill := true
+ 			if t.client.AttachedToExistingProcess() && !t.detachNoKill {
+diff --git a/service/api/command.go b/service/api/command.go
+index 484e997..e62443c 100644
+--- a/service/api/command.go
++++ b/service/api/command.go
+@@ -123,7 +123,7 @@ func ParseGoroutineArgs(argstr string) ([]ListGoroutinesFilter, GoroutineGroupin
+ 
+ // goroutineFilterHelp lists the filters of goroutines -with, -without and
+ // -group.
+-const goroutineFilterHelp = "curloc, userloc, goloc or startloc and a substring of the location, label and key or key=value, running, user, as in: goroutines -with userloc mypkg.(*T).F"
++const goroutineFilterHelp = "curloc, userloc, goloc or startloc and a substring of the location, label and key or key=value, running, user, or node and a node name, as in: goroutines -with userloc mypkg.(*T).F, goroutines -with node n1"
+ 
+ func readGoroutinesFilterKind(args []string, i int) (GoroutineField, error) {
+ 	if i >= len(args) || args[i] == "" {
+@@ -145,6 +145,8 @@ func readGoroutinesFilterKind(args []string, i int) (GoroutineField, error) {
+ 		return GoroutineRunning, nil
+ 	case "user":
+ 		return GoroutineUser, nil
++	case "node":
++		return GoroutineNode, nil
+ 	default:
+ 		return GoroutineFieldNone, fmt.Errorf("unrecognized argument to %s: %s; it takes %s", args[i-1], args[i], goroutineFilterHelp)
+ 	}
+@@ -167,6 +169,17 @@ func readGoroutinesFilter(args []string, pi *int) (*ListGoroutinesFilter, error)
+ 	}
+ 	r.Arg = args[*pi+1]
+ 	*pi++
++	if r.Kind == GoroutineNode && strings.HasPrefix(r.Arg, `"`) {
++		// A node name with spaces, such as "n1 (start 2)".
++		for !strings.HasSuffix(r.Arg, `"`) || r.Arg == `"` {
++			if *pi+1 >= len(args) {
++				return nil, fmt.Errorf("unterminated node name %s", r.Arg)
++			}
++			r.Arg += " " + args[*pi+1]
++			*pi++
++		}
++		r.Arg = r.Arg[1 : len(r.Arg)-1]
++	}
+ 
+ 	return r, nil
+ }
+diff --git a/service/api/conversions.go b/service/api/conversions.go
+index ed18c8c..d5ab836 100644
+--- a/service/api/conversions.go
++++ b/service/api/conversions.go
+@@ -298,6 +298,7 @@ func ConvertGoroutine(tgt *proc.Target, g *proc.G) *Goroutine {
+ 	if g.Unreadable != nil {
+ 		return &Goroutine{Unreadable: g.Unreadable.Error()}
+ 	}
++	node, nodeState := proc.DetNode(tgt, g)
+ 	return &Goroutine{
+ 		ID:             g.ID,
+ 		CurrentLoc:     ConvertLocation(g.CurrentLoc),
+@@ -309,9 +310,19 @@ func ConvertGoroutine(tgt *proc.Target, g *proc.G) *Goroutine {
+ 		WaitReason:     g.WaitReason,
+ 		Labels:         g.Labels(),
+ 		Status:         g.Status,
++		Node:           node,
++		NodeState:      nodeState,
+ 	}
+ }
+ 
++// ConvertPosition converts from proc.DetPos to api.Position.
++func ConvertPosition(p *proc.DetPos) *Position {
++	if p == nil {
++		return nil
++	}
++	return &Position{Time: p.TimeString(), Switch: p.Switches, Tick: p.Tick, Node: p.Node, Goroutine: p.Goroutine}
++}
++
+ // ConvertGoroutines converts from []*proc.G to []*api.Goroutine.
+ func ConvertGoroutines(tgt *proc.Target, gs []*proc.G) []*Goroutine {
+ 	goroutines := make([]*Goroutine, len(gs))
+diff --git a/service/api/types.go b/service/api/types.go
+index 6659d93..69b1e59 100644
+--- a/service/api/types.go
++++ b/service/api/types.go
+@@ -54,6 +54,9 @@ type DebuggerState struct {
+ 	// StopReason describes why the process is stopped (e.g., "breakpoint",
+ 	// "shared library loaded"). Empty when the stop reason is unknown.
+ 	StopReason string `json:"stopReason,omitempty"`
++	// Trace is the "detsched: trace=" line that a detsched program that
++	// exited printed to the file its standard error was redirected to.
++	Trace string `json:"trace,omitempty"`
+ 	// Filled by RPCClient.Continue, indicates an error
+ 	Err error `json:"-"`
+ }
+@@ -198,6 +201,34 @@ type Thread struct {
+ 	ReturnValues []Variable
+ 	// CallReturn is true if ReturnValues are the return values of an injected call.
+ 	CallReturn bool
++
++	// Position is the position of a detsched run (GOEXPERIMENT=detsched)
++	// where the thread stopped, set for the current thread and the threads
++	// stopped at a breakpoint.
++	Position *Position `json:"position,omitempty"`
++}
++
++// Position is the position of a detsched run: the virtual time of the
++// goroutine's synctest bubble, the goroutine switch, and the tick, as the
++// runtime's stop lines write them, and the goroutine's simulated node.
++type Position struct {
++	// Time is the seconds of virtual time since the goroutine's bubble
++	// started, such as "9.408758544", or "-" outside a bubble.
++	Time      string `json:"t"`
++	Switch    uint64 `json:"s"`
++	Tick      int64  `json:"k"`
++	Node      string `json:"node,omitempty"`
++	Goroutine int64  `json:"goroutine"`
++}
++
++// String returns p as "t9.408758544 s1822 k90267", followed by
++// " node NAME" on a simulated node.
++func (p *Position) String() string {
++	s := fmt.Sprintf("t%s s%d k%d", p.Time, p.Switch, p.Tick)
++	if p.Node != "" {
++		s += " node " + p.Node
++	}
++	return s
+ }
+ 
+ // Location holds program location information.
+@@ -433,6 +464,10 @@ type Goroutine struct {
+ 	Unreadable string `json:"unreadable"`
+ 	// Goroutine's pprof labels
+ 	Labels map[string]string `json:"labels,omitempty"`
++	// Node is the goroutine's simulated node in a detsched program, and
++	// NodeState is "crashed" or "paused" when the node is not live.
++	Node      string `json:"node,omitempty"`
++	NodeState string `json:"nodeState,omitempty"`
+ }
+ 
+ const (
+@@ -705,6 +740,7 @@ const (
+ 	GoroutineRunning                         // the goroutine is running
+ 	GoroutineUser                            // the goroutine is a user goroutine
+ 	GoroutineWaitingOnChannel                // the goroutine is waiting on the channel specified by the argument
++	GoroutineNode                            // the goroutine's simulated node in a detsched program
+ )
+ 
+ // GoroutineGroup represents a group of goroutines in the return value of
+diff --git a/service/api/waitreason.go b/service/api/waitreason.go
+index b3fd71c..549b887 100644
+--- a/service/api/waitreason.go
++++ b/service/api/waitreason.go
+@@ -271,8 +271,12 @@ func WaitReasonString(goVersion *goversion.GoVersion, waitReason int64) string {
+ 		waitReasonStrings = waitReasonStrings1dot24
+ 	case 25:
+ 		waitReasonStrings = waitReasonStrings1dot25
+-	case 26, 27:
++	case 26:
+ 		waitReasonStrings = waitReasonStrings1dot26
++	case 27:
++		// The detsched toolchain's runtime adds two reasons after Go
++		// 1.27's.
++		waitReasonStrings = append(waitReasonStrings1dot26[:len(waitReasonStrings1dot26):len(waitReasonStrings1dot26)], "IO wait (simulated)", "paused (simulated)")
+ 	}
+ 
+ 	if goVersion.Major != 1 {
+diff --git a/service/debugger/debugger.go b/service/debugger/debugger.go
+index 6ef8e0a..c852d14 100644
+--- a/service/debugger/debugger.go
++++ b/service/debugger/debugger.go
+@@ -80,6 +80,8 @@ type Debugger struct {
+ 	dumpState proc.DumpState
+ 
+ 	breakpointIDCounter int
++
++	det detState // checkpoints of a detsched program; see detsched.go
+ }
+ 
+ type ExecuteKind int
+@@ -500,6 +502,9 @@ func (d *Debugger) Restart(rerecord bool, pos string, resetArgs bool, newArgs []
+ 	}
+ 
+ 	if pos != "" {
++		if d.detsched() && !rerecord && !resetArgs && !rebuild {
++			return nil, d.detRestart(pos)
++		}
+ 		return nil, proc.ErrNotRecorded
+ 	}
+ 
+@@ -615,9 +620,17 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig, withBreakpointInfo bool) (
+ 		Exited:            exited,
+ 	}
+ 
++	isdet := tgt.IsDetsched()
+ 	for _, thread := range d.target.ThreadList() {
+ 		th := api.ConvertThread(thread, d.ConvertThreadBreakpoint(thread))
+ 
++		if isdet && (th.Breakpoint != nil || thread.ThreadID() == tgt.CurrentThread().ThreadID()) {
++			g, _ := proc.GetG(thread) // none before the runtime set it up
++			if pos, err := proc.DetPosition(tgt, g); err == nil {
++				th.Position = api.ConvertPosition(pos)
++			}
++		}
++
+ 		th.CallReturn = thread.Common().CallReturn
+ 		if retLoadCfg != nil {
+ 			th.ReturnValues = api.ConvertVars(thread.Common().ReturnValues(*retLoadCfg))
+@@ -1169,6 +1182,10 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
+ 		err = proc.EvalExpressionWithCalls(d.target, g, command.Expr, *api.LoadConfigToProc(command.ReturnInfoLoadConfig), !command.UnsafeCall)
+ 	case api.Rewind:
+ 		d.log.Debug("rewinding")
++		if d.detsched() {
++			err = d.detRewind()
++			break
++		}
+ 		if err := d.target.ChangeDirection(proc.Backward); err != nil {
+ 			return nil, err
+ 		}
+@@ -1265,11 +1282,15 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
+ 			state.Exited = true
+ 			state.ExitStatus = errProcessExited.Status
+ 			state.Err = errProcessExited
++			state.Trace = d.detTraceLine()
+ 			d.maybePrintUnattendedStopWarning(proc.StopExited, state.CurrentThread, clientStatusCh)
+ 			return state, nil
+ 		}
+ 		return nil, err
+ 	}
++	if command.Name == api.Continue || command.Name == api.DirectionCongruentContinue {
++		d.detRecordStop()
++	}
+ 	state, stateErr := d.state(api.LoadConfigToProc(command.ReturnInfoLoadConfig), withBreakpointInfo)
+ 	if stateErr != nil {
+ 		return state, stateErr
+@@ -1842,6 +1863,11 @@ func matchGoroutineFilter(tgt *proc.Target, g *proc.G, filter *api.ListGoroutine
+ 		val = !g.System(tgt)
+ 	case api.GoroutineWaitingOnChannel:
+ 		val = true // handled elsewhere
++	case api.GoroutineNode:
++		// A node's name, such as "n1 (start 2)", or the part before " (".
++		node, _ := proc.DetNode(tgt, g)
++		base, _, _ := strings.Cut(node, " (")
++		val = node != "" && (node == filter.Arg || base == filter.Arg)
+ 	}
+ 	if filter.Negated {
+ 		val = !val
+@@ -1898,6 +1924,9 @@ func (d *Debugger) GroupGoroutines(gs []*proc.G, group *api.GoroutineGroupingOpt
+ 			key = fmt.Sprintf("running=%v", g.Thread != nil)
+ 		case api.GoroutineUser:
+ 			key = fmt.Sprintf("user=%v", !g.System(d.target.Selected))
++		case api.GoroutineNode:
++			node, _ := proc.DetNode(d.target.Selected, g)
++			key = "node=" + node
+ 		}
+ 		if len(groupMembers[key]) < group.MaxGroupMembers {
+ 			groupMembers[key] = append(groupMembers[key], g)
+@@ -2228,6 +2257,9 @@ func (d *Debugger) FindThreadReturnValues(id int, cfg proc.LoadConfig) ([]*proc.
+ func (d *Debugger) Checkpoint(where string) (int, error) {
+ 	d.targetMutex.Lock()
+ 	defer d.targetMutex.Unlock()
++	if d.detsched() {
++		return d.detCheckpoint(where)
++	}
+ 	return d.target.Checkpoint(where)
+ }
+ 
+@@ -2235,6 +2267,9 @@ func (d *Debugger) Checkpoint(where string) (int, error) {
+ func (d *Debugger) Checkpoints() ([]proc.Checkpoint, error) {
+ 	d.targetMutex.Lock()
+ 	defer d.targetMutex.Unlock()
++	if d.detsched() {
++		return d.detCheckpoints(), nil
++	}
+ 	return d.target.Checkpoints()
+ }
+ 
+@@ -2242,6 +2277,9 @@ func (d *Debugger) Checkpoints() ([]proc.Checkpoint, error) {
+ func (d *Debugger) ClearCheckpoint(id int) error {
+ 	d.targetMutex.Lock()
+ 	defer d.targetMutex.Unlock()
++	if d.detsched() {
++		return d.detClearCheckpoint(id)
++	}
+ 	return d.target.ClearCheckpoint(id)
+ }
+ 
+diff --git a/service/debugger/detsched.go b/service/debugger/detsched.go
+new file mode 100644
+index 0000000..2927c4e
+--- /dev/null
++++ b/service/debugger/detsched.go
+@@ -0,0 +1,429 @@
++package debugger
++
++// Going back in a detsched program (GOEXPERIMENT=detsched): its run is the
++// same every time, so a checkpoint is a position of the run, and restarting
++// to it runs the program again from the start to that position, with the
++// user's breakpoints disabled on the way, rr-style. The runtime stops the
++// new run at the checkpoint's tick (see proc.DetSetStop), and an internal
++// breakpoint then stops at the checkpoint's instruction in its goroutine at
++// that tick: in user code, where every function entry and loop back edge
++// counts a tick, an instruction runs at most once per tick.
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++
++	"github.com/go-delve/delve/pkg/proc"
++)
++
++// detMark is a point of a detsched run that the debugger can run the
++// program again to: a checkpoint, or a stop that rewind goes back to.
++type detMark struct {
++	id   int
++	note string
++	pos  proc.DetPos
++	pc   uint64
++	hits map[int]detHits // the user breakpoints' hit counts, by ID
++}
++
++type detHits struct {
++	total uint64
++	perG  map[int64]uint64
++}
++
++type detState struct {
++	marks   []*detMark
++	nextID  int
++	history []*detMark // the breakpoint stops of the run, for rewind
++}
++
++// detsched reports whether the target is a live detsched program, which
++// checkpoints, restarts to a position, and rewinds by running it again.
++func (d *Debugger) detsched() bool {
++	if recorded, _ := d.target.Recorded(); recorded || len(d.target.Targets()) != 1 {
++		return false
++	}
++	return d.target.Selected.IsDetsched()
++}
++
++// detMarkHere returns the point where the run is stopped.
++func (d *Debugger) detMarkHere(note string) (*detMark, error) {
++	tgt := d.target.Selected
++	if _, err := tgt.Valid(); err != nil {
++		return nil, err
++	}
++	th := tgt.CurrentThread()
++	regs, err := th.Registers()
++	if err != nil {
++		return nil, err
++	}
++	g, _ := proc.GetG(th)
++	pos, err := proc.DetPosition(tgt, g)
++	if err != nil {
++		return nil, err
++	}
++	m := &detMark{note: note, pos: *pos, pc: regs.PC(), hits: map[int]detHits{}}
++	for id, lbp := range d.target.LogicalBreakpoints {
++		h := detHits{total: lbp.TotalHitCount, perG: map[int64]uint64{}}
++		for g, n := range lbp.HitCount {
++			h.perG[g] = n
++		}
++		m.hits[id] = h
++	}
++	return m, nil
++}
++
++// detWhen describes m's position for the list of checkpoints.
++func (m *detMark) when() string {
++	return fmt.Sprintf("%s goroutine %d", m.pos.String(), m.pos.Goroutine)
++}
++
++func (d *Debugger) detCheckpoint(note string) (int, error) {
++	m, err := d.detMarkHere(note)
++	if err != nil {
++		return 0, err
++	}
++	d.det.nextID++
++	m.id = d.det.nextID
++	d.det.marks = append(d.det.marks, m)
++	return m.id, nil
++}
++
++func (d *Debugger) detCheckpoints() []proc.Checkpoint {
++	r := make([]proc.Checkpoint, 0, len(d.det.marks))
++	for _, m := range d.det.marks {
++		r = append(r, proc.Checkpoint{ID: m.id, When: m.when(), Where: m.note})
++	}
++	return r
++}
++
++func (d *Debugger) detClearCheckpoint(id int) error {
++	for i, m := range d.det.marks {
++		if m.id == id {
++			d.det.marks = append(d.det.marks[:i], d.det.marks[i+1:]...)
++			return nil
++		}
++	}
++	return fmt.Errorf("no checkpoint c%d", id)
++}
++
++// detRecordStop adds the stop the run is at to the history rewind goes
++// back through, if it is at a user breakpoint.
++func (d *Debugger) detRecordStop() {
++	if !d.detsched() {
++		return
++	}
++	tgt := d.target.Selected
++	bp := tgt.CurrentThread().Breakpoint()
++	if bp.Breakpoint == nil || !bp.Active || bp.Breakpoint.Logical == nil {
++		return
++	}
++	lbp := bp.Breakpoint.Logical
++	if lbp.LogicalID <= 0 || lbp.Tracepoint || lbp.TraceReturn {
++		return
++	}
++	m, err := d.detMarkHere(lbp.FunctionName)
++	if err != nil {
++		return
++	}
++	d.det.history = append(d.det.history, m)
++}
++
++// detRestart runs the program again to pos: a checkpoint cN, or a point
++// as of GODETSTOP, tD, sN or kN.
++func (d *Debugger) detRestart(pos string) error {
++	var mark *detMark
++	var kind byte
++	var n uint64
++	if len(pos) > 1 && pos[0] == 'c' {
++		id, err := strconv.Atoi(pos[1:])
++		if err != nil {
++			return fmt.Errorf("%q is not a checkpoint", pos)
++		}
++		for _, m := range d.det.marks {
++			if m.id == id {
++				mark = m
++			}
++		}
++		if mark == nil {
++			return fmt.Errorf("no checkpoint c%d", id)
++		}
++	} else {
++		var err error
++		kind, n, err = proc.ParseDetPoint(pos)
++		if err != nil {
++			return err
++		}
++	}
++	if err := d.detRelaunch(); err != nil {
++		return err
++	}
++	if mark != nil {
++		return d.detRunToMark(mark)
++	}
++	return d.detRunToPoint(kind, n, pos)
++}
++
++// detRelaunch kills the program and starts it again, stopped before its
++// first instruction, with the same breakpoints.
++func (d *Debugger) detRelaunch() error {
++	if !d.canRestart() {
++		return ErrCanNotRestart
++	}
++	if err := d.detach(true); err != nil {
++		return err
++	}
++	grp, err := d.Launch(d.processArgs, d.config.WorkingDir)
++	if err != nil {
++		return fmt.Errorf("could not launch process: %s", err)
++	}
++	proc.Restart(grp, d.target, func(oldBp *proc.LogicalBreakpoint, err error) {
++		d.log.Warnf("could not restore breakpoint %d: %v", oldBp.LogicalID, err)
++	})
++	d.target = grp
++	return nil
++}
++
++// detWithoutBreakpoints runs f with the user's breakpoints disabled, and
++// then gives them the hit counts in hits, if not nil, and enables them
++// again.
++func (d *Debugger) detWithoutBreakpoints(hits map[int]detHits, f func() error) error {
++	var disabled []*proc.LogicalBreakpoint
++	for id, lbp := range d.target.LogicalBreakpoints {
++		if id > 0 && lbp.Enabled() {
++			if err := d.target.SetBreakpointEnabled(lbp, false); err != nil {
++				return err
++			}
++			disabled = append(disabled, lbp)
++		}
++	}
++	err := f()
++	if _, verr := d.target.Valid(); verr != nil {
++		return errors.Join(err, verr)
++	}
++	for id, lbp := range d.target.LogicalBreakpoints {
++		if h, ok := hits[id]; ok {
++			lbp.TotalHitCount = h.total
++			lbp.HitCount = map[int64]uint64{}
++			for g, n := range h.perG {
++				lbp.HitCount[g] = n
++			}
++		}
++	}
++	for _, lbp := range disabled {
++		if err1 := d.target.SetBreakpointEnabled(lbp, true); err1 != nil && err == nil {
++			err = err1
++		}
++	}
++	return err
++}
++
++// detContinueTo continues to the internal breakpoint at addr, which stops
++// when cb says so, and reports an error if the run stopped elsewhere.
++func (d *Debugger) detContinueTo(addr uint64, cb func(proc.Thread, *proc.Target) (bool, error), what string) error {
++	tgt := d.target.Selected
++	if _, err := tgt.DetSetBreakpoint(addr, cb); err != nil {
++		return err
++	}
++	err := d.target.Continue()
++	if _, verr := tgt.Valid(); verr == nil {
++		tgt.DetClearBreakpoint(addr)
++	}
++	var exited proc.ErrProcessExited
++	if errors.As(err, &exited) {
++		return fmt.Errorf("the program exited with status %d before reaching %s", exited.Status, what)
++	}
++	if err != nil {
++		return err
++	}
++	th := d.target.Selected.CurrentThread()
++	bp := th.Breakpoint()
++	if bp.Breakpoint == nil || bp.Breakpoint.Addr != addr {
++		loc, _ := proc.ThreadLocation(th)
++		where := "?"
++		if loc != nil && loc.Fn != nil {
++			where = fmt.Sprintf("%s %s:%d", loc.Fn.Name, loc.File, loc.Line)
++		}
++		if bp.Breakpoint != nil && bp.Breakpoint.Logical != nil && bp.Breakpoint.Logical.Name != "" {
++			where = bp.Breakpoint.Logical.Name + " in " + where
++		}
++		return fmt.Errorf("the program stopped at %s before reaching %s", where, what)
++	}
++	return nil
++}
++
++// detRunToPoint continues the newly started program to a point as of
++// GODETSTOP, and then out of the runtime into the code of the goroutine
++// that runs there.
++func (d *Debugger) detRunToPoint(kind byte, n uint64, what string) error {
++	return d.detWithoutBreakpoints(nil, func() error {
++		tgt := d.target.Selected
++		if err := tgt.DetSetStop(kind, n); err != nil {
++			return err
++		}
++		always := func(proc.Thread, *proc.Target) (bool, error) { return true, nil }
++		if err := d.detContinueTo(tgt.DetStopPC(), always, what); err != nil {
++			return err
++		}
++		tgt = d.target.Selected
++		th := tgt.CurrentThread()
++		g, err := proc.GetG(th)
++		if err != nil || g == nil {
++			return nil
++		}
++		frames, err := proc.ThreadStacktrace(tgt, th, 6)
++		if err != nil {
++			return nil
++		}
++		for _, f := range frames {
++			if f.Current.Fn != nil && f.Current.Fn.Name == "runtime.detPreempt" && f.Ret != 0 {
++				goid := g.ID
++				ingoroutine := func(th proc.Thread, _ *proc.Target) (bool, error) {
++					g, _ := proc.GetG(th)
++					return g != nil && g.ID == goid, nil
++				}
++				return d.detContinueTo(f.Ret, ingoroutine, what)
++			}
++		}
++		return nil
++	})
++}
++
++// detRunToMark continues the newly started program to m.
++//
++// The runtime stops the run at m's tick only if its goroutine's own code
++// runs there: package sim runs some of its code, such as a node's crash,
++// on the system stack, where the run cannot stop until it leaves it. When
++// the stop comes after m, the program runs again to m's switch, or an
++// earlier one, and as a last resort from its start.
++func (d *Debugger) detRunToMark(m *detMark) error {
++	what := fmt.Sprintf("c%d (%s)", m.id, m.when())
++	if m.id == 0 {
++		what = m.when()
++	}
++	type point struct {
++		kind byte
++		n    uint64
++	}
++	var tries []point
++	if m.pos.Tick > 0 {
++		tries = append(tries, point{'k', uint64(m.pos.Tick)})
++		for s := m.pos.Switches; s > 0 && s+3 > m.pos.Switches; s-- {
++			tries = append(tries, point{'s', s})
++		}
++	}
++	tries = append(tries, point{})
++	return d.detWithoutBreakpoints(m.hits, func() error {
++		for i, p := range tries {
++			if i > 0 {
++				if err := d.detRelaunch(); err != nil {
++					return err
++				}
++			}
++			if p.kind == 0 {
++				break
++			}
++			tgt := d.target.Selected
++			if err := tgt.DetSetStop(p.kind, p.n); err != nil {
++				return err
++			}
++			always := func(proc.Thread, *proc.Target) (bool, error) { return true, nil }
++			if err := d.detContinueTo(tgt.DetStopPC(), always, what); err != nil {
++				return err
++			}
++			here, err := d.detMarkHere("")
++			if err != nil {
++				return err
++			}
++			if here.pos.Tick <= m.pos.Tick {
++				break
++			}
++		}
++		if d.detAt(m) {
++			return nil
++		}
++		var passed bool
++		cb := func(th proc.Thread, p *proc.Target) (bool, error) {
++			g, _ := proc.GetG(th)
++			if m.pos.Goroutine != 0 && (g == nil || g.ID != m.pos.Goroutine) {
++				return false, nil
++			}
++			pos, err := proc.DetPosition(p, g)
++			if err != nil {
++				return false, err
++			}
++			passed = pos.Tick > m.pos.Tick
++			return pos.Tick >= m.pos.Tick, nil
++		}
++		if err := d.detContinueTo(m.pc, cb, what); err != nil {
++			return err
++		}
++		if passed {
++			return fmt.Errorf("the run passed %s without stopping there; it stopped at the next hit of the same instruction", what)
++		}
++		return nil
++	})
++}
++
++// detAt reports whether the program is stopped at m.
++func (d *Debugger) detAt(m *detMark) bool {
++	h, err := d.detMarkHere("")
++	return err == nil && h.pc == m.pc && h.pos.Tick == m.pos.Tick && h.pos.Goroutine == m.pos.Goroutine
++}
++
++// detRewind runs the program again to the last breakpoint stop before
++// the current one, or to its start if there is none.
++func (d *Debugger) detRewind() error {
++	// After the program exited, every stop is before the current
++	// position.
++	here, err := d.detMarkHere("")
++	if err != nil && !errors.As(err, new(proc.ErrProcessExited)) {
++		return err
++	}
++	// The history is in the order of the run, but may go on past the
++	// current stop after a restart to a checkpoint.
++	h := d.det.history
++	for here != nil && len(h) > 0 {
++		last := h[len(h)-1]
++		if last.pos.Tick < here.pos.Tick || last.pos.Tick == here.pos.Tick && (last.pc != here.pc || last.pos.Goroutine != here.pos.Goroutine) {
++			break
++		}
++		h = h[:len(h)-1]
++	}
++	d.det.history = h
++	if len(h) == 0 {
++		return d.detRelaunch()
++	}
++	m := h[len(h)-1]
++	if err := d.detRelaunch(); err != nil {
++		return err
++	}
++	return d.detRunToMark(m)
++}
++
++// detTraceLine returns the first "detsched: trace=" line in the file the
++// program's standard error went to, if it went to a file.
++func (d *Debugger) detTraceLine() string {
++	if d.config.Stderr.Path == "" || !d.detschedBinary() {
++		return ""
++	}
++	data, err := os.ReadFile(d.config.Stderr.Path)
++	if err != nil {
++		return ""
++	}
++	for _, line := range strings.Split(string(data), "\n") {
++		if strings.HasPrefix(line, "detsched: trace=") {
++			return line
++		}
++	}
++	return ""
++}
++
++// detschedBinary reports whether the target was built with
++// GOEXPERIMENT=detsched, also once it exited.
++func (d *Debugger) detschedBinary() bool {
++	return len(d.target.Targets()) > 0 && d.target.Targets()[0].IsDetsched()
++}

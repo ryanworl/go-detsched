@@ -12,7 +12,10 @@
 #     GOEXPERIMENT=detsched, in -short mode;
 #   - the linker's check that a debugger's breakpoint on an inlined call
 #     is on its hot path with GOEXPERIMENT=detsched;
-#   - a stock hello world has no detsched symbols.
+#   - a stock hello world has no detsched symbols;
+#   - when GOROOT/bin has dlv, the bundled Delve's tests on a failing
+#     replay of testdata/simcompose (misc/detsched/testdata/delve), except
+#     on a Mac where debugging needs developer mode (DevToolsSecurity).
 #
 # Usage: misc/release/gate.bash [GOROOT]
 #
@@ -54,5 +57,13 @@ n=$(go tool nm "$tmp/hello" | grep -cE 'runtime\.det|detsim' || true)
 if [ "$n" != 0 ]; then
 	echo "gate: stock hello world has $n detsched symbols" >&2
 	exit 1
+fi
+if [ -x "$goroot/bin/dlv" ]; then
+	if [ "$(uname)" = Darwin ] && ! DevToolsSecurity -status 2>/dev/null | grep -q enabled; then
+		echo "gate: skipping the Delve tests: debugging needs developer mode (DevToolsSecurity -enable)"
+	else
+		echo "gate: the bundled Delve on a failing replay"
+		(cd "$goroot/misc/detsched" && DLV=$goroot/bin/dlv go test -count=1 ./testdata/delve)
+	fi
 fi
 echo "gate: passed"

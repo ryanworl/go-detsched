@@ -355,6 +355,16 @@ func TestSearchKinds(t *testing.T) {
 	}
 }
 
+// TestSearchLeftover checks that a group of runs whose test body returned
+// while goroutines of its bubble were blocked names those goroutines.
+func TestSearchLeftover(t *testing.T) {
+	s := runSearch(t, "../../testdata/bubbleleak", 20)
+	const pkg = "github.com/ryanworl/go-detsched/misc/detsched/testdata/bubbleleak"
+	if len(s.groups) != 1 || s.groups[0].left != "2 × "+pkg+".(*store).merger (created by "+pkg+".open)" {
+		t.Fatalf("want the two merger goroutines named:\n%s", searchReport(s))
+	}
+}
+
 // TestSearchTimeout checks that a search runs on past -timeout, forking
 // stopped programs it keeps from before then.
 func TestSearchTimeout(t *testing.T) {

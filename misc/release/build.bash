@@ -63,23 +63,16 @@ tar -C "$tmp" -xzf "$archive"
 cp "$bin/detsched" "$tmp/go/bin/detsched"
 chmod 0755 "$tmp/go/bin/detsched"
 
-# Delve, which the debug: lines detsched prints run, at the version the
-# docs were tested with, with delve.patch, built by this toolchain for the
-# target, with its license and the patch.
-delve=v1.27.2
-export GOPATH=$tmp/gopath GOFLAGS=-modcacherw
-src=$("$go" mod download -json "github.com/go-delve/delve@$delve" | sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$/\1/p')
-cp -R "$src" "$tmp/delve"
-chmod -R u+w "$tmp/delve"
-patch -s -d "$tmp/delve" -p1 <"$root/misc/release/delve.patch"
-(cd "$tmp/delve" && CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch "$go" build -trimpath -o "$tmp/go/bin/dlv" ./cmd/dlv)
+# Delve, which the debug: lines detsched prints run, built by delve.bash
+# with the patches in misc/release/delve, with its license and the
+# patches.
+GOOS=$goos GOARCH=$goarch "$root/misc/release/delve.bash" "$tmp/go/bin/dlv" "$tmp/delve"
 chmod 0755 "$tmp/go/bin/dlv"
 mkdir -p "$tmp/go/misc/delve"
 cp "$tmp/delve/LICENSE" "$tmp/go/misc/delve/LICENSE"
-cp "$root/misc/release/delve.patch" "$tmp/go/misc/delve/delve.patch"
-chmod 0644 "$tmp/go/misc/delve/LICENSE" "$tmp/go/misc/delve/delve.patch"
-unset GOPATH GOFLAGS
-rm -rf "$tmp/gopath" "$tmp/delve"
+cp "$root"/misc/release/delve/*.patch "$tmp/go/misc/delve/"
+chmod 0644 "$tmp/go/misc/delve/"*
+rm -rf "$tmp/delve"
 mv "$tmp/go" "$tmp/$version"
 tar -C "$tmp" --sort=name --owner=0 --group=0 --numeric-owner --mtime="$mtime" \
 	--format=gnu -cf - "$version" | gzip -9n >"$archive.new"

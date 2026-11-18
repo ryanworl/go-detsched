@@ -216,7 +216,7 @@ func (s *search) prepare(ctx context.Context) error {
 		for _, k := range []string{"park", "select", "lockorder", "recover", "max"} {
 			counted[k] = true
 		}
-		s.novelty = "the runtime's features"
+		s.novelty = "the runtime's features, as the program reports no guide states (see the README's \"The search\")"
 	}
 	f, err := os.Create(s.temp("seen"))
 	if err != nil {

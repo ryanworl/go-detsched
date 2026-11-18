@@ -42,6 +42,11 @@ import (
 // two hits of a breakpoint in user code have the same tick, and
 // detTickEnd-int64(detTicks) is the tick now. A debugger that records it
 // at a breakpoint can replay to just before that hit with GODETSTOP=kN.
+//
+// The Delve that the release bundles drives the same machinery through
+// detDebug instead (see misc/release/delve): it writes a point there
+// before the program starts, to run a replay again to a position, and the
+// run calls detDebugStop at it, without a stop line.
 
 // detStopNone is detStops.next when no stop is due.
 const detStopNone = 1 << 62
@@ -62,7 +67,77 @@ type detStopPoint struct {
 var detStops = struct {
 	points []detStopPoint
 	next   int64 // the tick at which the next stop is due
+	on     bool  // there are points, of GODETSTOP or detDebug.stop
 }{next: detStopNone}
+
+// detDebug is written by a debugger while the program is stopped, and
+// read by the runtime: the bundled Delve's side of stopping a run at a
+// position and of counting the entries of a function. Like
+// detsimWatched, it holds no pointers, so that adding it changed no
+// GC's timing.
+var detDebug struct {
+	// stop is a point, as of GODETSTOP, at which the run calls
+	// detDebugStop; kind 0 is none. The debugger writes it before the
+	// program starts.
+	stop detStopPoint
+
+	// watch counts the entries of the functions whose entry tick the
+	// debugger made call detPreempt every time; see detWatchEntry. The
+	// slots up to nwatch are in use.
+	nwatch int32
+	watch  [16]detWatch
+}
+
+// A detWatch counts the entries of a function.
+type detWatch struct {
+	pc    uintptr // the return address of the entry tick's call to detPreempt
+	count uint64  // the entries counted
+	at    uint64  // calls detDebugWatch when count reaches it; 0 is never
+}
+
+// detWatchEntry counts an entry for the watch whose pc is the return
+// address of a call to detPreempt, and reports whether there is one. When
+// there is and the goroutine has ticks left, the call is one that the
+// debugger made the entry tick take, and detPreempt returns at once, as
+// the tick would have without the debugger: counting changes nothing in
+// the run.
+//
+//go:nosplit
+func detWatchEntry(pc uintptr) bool {
+	for i := range detDebug.watch[:detDebug.nwatch] {
+		w := &detDebug.watch[i]
+		if w.pc == pc {
+			w.count++
+			if w.count == w.at {
+				detDebugWatch(i)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// detDebugWatch is where a debugger breaks when watch i reaches its count.
+//
+//go:noinline
+//go:nosplit
+func detDebugWatch(i int) {}
+
+// detDebugStop is where a debugger breaks at detDebug.stop.
+//
+//go:noinline
+//go:nosplit
+func detDebugStop() {}
+
+// detStopAt returns point i of GODETSTOP, or detDebug.stop for -1.
+//
+//go:nosplit
+func detStopAt(i int) *detStopPoint {
+	if i < 0 {
+		return &detDebug.stop
+	}
+	return &detStops.points[i]
+}
 
 // The tick clock. detTickEnd is the tick at which detTicks reaches zero.
 // detTickExtra is the running goroutine's ticks that detPutTicks held back
@@ -102,8 +177,12 @@ func detPutTicks(n int32) {
 
 // detStopInit parses GODETSTOP. Called by detRandInit.
 func detStopInit() {
+	detStops.on = detDebug.stop.kind != 0
 	s := gogetenv("GODETSTOP")
 	if s == "" {
+		if detStops.on {
+			detStopsNext()
+		}
 		return
 	}
 	n := 1
@@ -145,6 +224,7 @@ func detStopInit() {
 		points = append(points, p)
 	}
 	detStops.points = points
+	detStops.on = true
 	detStopsNext()
 }
 
@@ -180,9 +260,9 @@ func detParseSeconds(s string) (uint64, bool) {
 // and makes gp's budget run out at the next stop. Called by detExecute.
 func detStopsCheck(pp *p, gp *g) {
 	armed := false
-	for i := range detStops.points {
-		p := &detStops.points[i]
-		if p.fired || p.armed {
+	for i := -1; i < len(detStops.points); i++ {
+		p := detStopAt(i)
+		if p.kind == 0 || p.fired || p.armed {
 			continue
 		}
 		switch p.kind {
@@ -206,9 +286,10 @@ func detStopsCheck(pp *p, gp *g) {
 //go:nosplit
 func detStopsNext() {
 	next := int64(detStopNone)
-	for _, p := range detStops.points {
+	for i := -1; i < len(detStops.points); i++ {
+		p := detStopAt(i)
 		switch {
-		case p.fired:
+		case p.kind == 0, p.fired:
 		case p.armed:
 			next = min(next, detTickNow()+1)
 		case p.kind == 'k':
@@ -227,12 +308,16 @@ func detStopsNext() {
 //go:nosplit
 func detStopFire(gp *g, pc, sp uintptr) {
 	now := detTickNow()
-	for i := range detStops.points {
-		p := &detStops.points[i]
-		if p.fired || !p.armed && !(p.kind == 'k' && int64(p.n) <= now) {
+	for i := -1; i < len(detStops.points); i++ {
+		p := detStopAt(i)
+		if p.kind == 0 || p.fired || !p.armed && !(p.kind == 'k' && int64(p.n) <= now) {
 			continue
 		}
 		p.fired = true
+		if i < 0 {
+			detDebugStop()
+			continue
+		}
 		systemstack(func() {
 			print("detsched: stop ", i+1, " at t")
 			if b := gp.bubble; b != nil {

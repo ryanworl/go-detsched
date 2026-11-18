@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched17
+v=go1.27.4-detsched18
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -71,7 +71,8 @@ FAIL 174 of 489 runs: panic: computed answer twice [recovered, repanicked]
 ```
 
 The `debug:` line runs Delve's `dlv`, which the release archive has in
-`bin/`, next to `go` and `detsched`.
+`bin/`, next to `go` and `detsched`, with additions for replays: see
+below.
 
 A search keeps its binary, logs, and summary in a new directory under
 `$TMPDIR` (else `/tmp`), which it prints at its start; set `TMPDIR` to
@@ -226,7 +227,15 @@ To debug the failure, run the `debug:` line, the same command under
 Delve: `--disable-aslr` keeps dlv's breakpoints on macOS, where the
 program restarts itself without ASLR, and does nothing on Linux.
 [delve.md](delve.md) shows how to trace and inspect a replay without
-changing it.
+changing it. The bundled dlv knows it debugs a replay: every stop and
+tracepoint line ends with the run's position, such as
+`at t25.380001899 s4265 k128779 node server (start 3)` (virtual time,
+switch, tick, sim node), `goroutines -with node server` lists a node's
+goroutines, `checkpoint` and `restart c1`, `rewind`, and `restart t9.4`
+go back by running the replay again, `cond -hitcount NAME == N` stops at
+the Nth hit of a hot function without a trap for the others, `dlv --json`
+prints one JSON object per line for scripts, and `exit` lets the program
+print its trace line.
 
 `GODETBRANCH` makes a composer timeline run its failing branch in the
 process itself rather than in a forked child, which a debugger does not
@@ -238,18 +247,19 @@ goroutine switch, and diff their standard error.
 switch (`s12345`), or at a tick (`k812345678`, one per function entry and
 loop back edge), so that a debugger's breakpoints can be armed only
 between two points instead of trapping on every hit before them, and
-going back is replaying to an earlier tick; `:dump` prints every
-goroutine's stack there instead. It does not change the run.
+going back is replaying to an earlier tick (dlv's `restart` does it for
+you); `:dump` prints every goroutine's stack there instead. It does not
+change the run.
 [delve.md](delve.md#stop-at-a-point-of-the-run) shows how.
 
 ## The SDK
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched17:
+and release N's version is v0.N.0, so with go1.27.4-detsched18:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.17.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.18.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -427,8 +437,8 @@ it, so the replay command a failure prints shows the timeline again.
   until the fault ends.
 - **Life cycle.** `Kill` (power failure: unsynced data lost, connections
   go silent), `KillProcess` (the kernel keeps unsynced data and closes the
-  connections), `Stop` (runs `OnStop` functions, waits for the node's
-  goroutines, then ends the process), `Pause` and `Resume` (the node stays
+  connections), `Stop(grace)` (runs `OnStop` functions, waits up to
+  `grace` for the node's goroutines, then ends the process), `Pause` and `Resume` (the node stays
   on the network, so peers time out), `Throttle` (the node runs one period
   in n, so it reacts late), `Start` again (restart from the disk, with a
   new process ID: `os.Getpid` differs between nodes and between the

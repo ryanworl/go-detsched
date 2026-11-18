@@ -1,0 +1,618 @@
+pkg/proc: let the detsched runtime count a hit-count breakpoint's hits
+
+A breakpoint costs a trap on every hit, about a millisecond, even when
+its hit condition is false, so "cond -hitcount bp == 1000000" on a hot
+function took a thousand seconds to reach its hit.
+
+In a detsched program, when a breakpoint sits at a function's entry,
+before its entry tick, and its only condition is on its total hit count
+(== N, >= N, > N or % N), the debugger leaves it out of the program and
+has the runtime count the function's entries instead: it makes the
+entry tick's conditional branch always call runtime.detPreempt, which
+counts the calls whose return address is in runtime.detDebug.watch and
+calls runtime.detDebugWatch at the entry before the one the condition
+asks for. An internal breakpoint there writes the user's breakpoint,
+which the next entry hits with the hit count stock Delve would have
+counted. The entries before it cost a call instead of a trap. The
+schedule is unchanged: the patched tick calls detPreempt, which returns
+at once without counting a tick.
+
+breakpoints shows such a breakpoint as "hits counted by the runtime".
+
+This is specific to detsched: it needs the runtime's side, in
+src/runtime/detstop.go.
+
+diff --git a/pkg/proc/breakpoints.go b/pkg/proc/breakpoints.go
+index d36a62b..a29cdb3 100644
+--- a/pkg/proc/breakpoints.go
++++ b/pkg/proc/breakpoints.go
+@@ -320,6 +320,9 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
+ 				lbp.HitCount[goroutineID]++
+ 			}
+ 			lbp.TotalHitCount++
++			if lbp.det != nil && lbp.det.armed {
++				lbp.det.hit = true
++			}
+ 		}
+ 		active = checkHitCond(lbp, goroutineID)
+ 
+@@ -1209,6 +1212,10 @@ type LogicalBreakpoint struct {
+ 	RootFuncName string
+ 	// depth of tracing
+ 	TraceFollowCalls int
++
++	// det is set while the runtime of a detsched program counts the
++	// breakpoint's hits; see detsched.go.
++	det *detWatchState
+ }
+ 
+ // SetBreakpoint describes how a breakpoint should be set.
+diff --git a/pkg/proc/detsched.go b/pkg/proc/detsched.go
+index 15bd82b..cd77e86 100644
+--- a/pkg/proc/detsched.go
++++ b/pkg/proc/detsched.go
+@@ -17,7 +17,11 @@ package proc
+ //     SDK), g.det[0].node, named by runtime.detsimNames.
+ //
+ // The runtime's variable runtime.detDebug lets the debugger stop the run at
+-// a position: the runtime calls runtime.detDebugStop there.
++// a position (it calls runtime.detDebugStop there) and count the entries of
++// a function without a trap per entry: the debugger makes the function's
++// entry tick call runtime.detPreempt every time, rather than when the
++// goroutine's budget of ticks runs out, and the runtime counts the calls
++// and calls runtime.detDebugWatch at the count the debugger asked for.
+ 
+ import (
+ 	"encoding/binary"
+diff --git a/pkg/proc/detwatch.go b/pkg/proc/detwatch.go
+new file mode 100644
+index 0000000..8fb54fa
+--- /dev/null
++++ b/pkg/proc/detwatch.go
+@@ -0,0 +1,422 @@
++package proc
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"go/token"
++)
++
++// The runtime counts the entries of a breakpoint's function when the
++// breakpoint has a hit condition on its total hit count (== N, >= N, > N or
++// % N) and no other condition, and sits at the function's entry, before
++// its entry tick: each hit is then one entry. Until the hit before the one
++// the condition asks for, the breakpoint is not written in the program, so
++// the entries before it cost no trap; at that entry the runtime calls
++// runtime.detDebugWatch, where an internal breakpoint writes the user's
++// breakpoint, which the next entry, the one wanted, hits.
++
++// detWatchState is the state of a breakpoint whose entries the runtime
++// counts.
++type detWatchState struct {
++	slot  int
++	patch detTick
++	addrs []uint64
++	base  uint64 // the breakpoint's total hit count when the runtime's count was 0
++	armed bool   // the breakpoint is written in the program
++	hit   bool   // the armed breakpoint was hit
++}
++
++// detTick is a function's entry tick.
++type detTick struct {
++	branch      uint64 // the conditional branch that skips the call to runtime.detPreempt
++	orig, patch []byte // its instruction, and the one that always calls it
++	ret         uint64 // the call's return address
++}
++
++// detEntryTick finds fn's entry tick: the first conditional branch from
++// which the code reaches a call to runtime.detPreempt, either by falling
++// through to it and branching past it, or by branching to a block that
++// makes it.
++func (t *Target) detEntryTick(fn *Function, preempt uint64) (*detTick, error) {
++	bi := t.BinInfo()
++	text, err := disassemble(t.Memory(), nil, t.Breakpoints(), bi, fn.Entry, fn.End, false)
++	if err != nil {
++		return nil, err
++	}
++	at := make(map[uint64]int, len(text))
++	for i := range text {
++		at[text[i].Loc.PC] = i
++	}
++	arm64 := bi.Arch.Name == "arm64"
++	callsPreempt := func(i int) bool {
++		in := &text[i]
++		b := in.Bytes
++		switch {
++		case arm64 && len(b) == 4:
++			w := binary.LittleEndian.Uint32(b)
++			return w&0xFC000000 == 0x94000000 && in.Loc.PC+uint64(signExtend(uint64(w&0x3FFFFFF), 26)*4) == preempt
++		case !arm64 && len(b) == 5 && b[0] == 0xE8:
++			return in.Loc.PC+5+uint64(int64(int32(binary.LittleEndian.Uint32(b[1:])))) == preempt
++		}
++		return false
++	}
++	for i := 0; i < len(text) && i < 64; i++ {
++		in := &text[i]
++		target, ok := condBranchTarget(arm64, in)
++		if !ok {
++			continue
++		}
++		next := in.Loc.PC + uint64(in.Size)
++		if i+1 < len(text) && callsPreempt(i+1) && target == next+uint64(text[i+1].Size) {
++			return &detTick{branch: in.Loc.PC, orig: in.Bytes, patch: nopBytes(arm64, in.Size), ret: target}, nil
++		}
++		if j, ok := at[target]; ok {
++			for k := j; k < len(text) && k < j+8; k++ {
++				if callsPreempt(k) {
++					return &detTick{branch: in.Loc.PC, orig: in.Bytes, patch: jmpBytes(arm64, in, target), ret: text[k].Loc.PC + uint64(text[k].Size)}, nil
++				}
++				if text[k].IsJmp() || text[k].IsRet() || text[k].IsCall() {
++					break
++				}
++			}
++		}
++	}
++	return nil, fmt.Errorf("%s has no entry tick", fn.Name)
++}
++
++func signExtend(v uint64, bits uint) int64 {
++	return int64(v<<(64-bits)) >> (64 - bits)
++}
++
++// condBranchTarget returns the target of in if it is a conditional branch
++// with an immediate offset.
++func condBranchTarget(arm64 bool, in *AsmInstruction) (uint64, bool) {
++	b := in.Bytes
++	switch {
++	case arm64 && len(b) == 4:
++		w := binary.LittleEndian.Uint32(b)
++		if w&0xFF000010 == 0x54000000 && w&0xF < 0xE {
++			return in.Loc.PC + uint64(signExtend(uint64(w>>5)&0x7FFFF, 19)*4), true
++		}
++	case !arm64 && len(b) == 2 && b[0]&0xF0 == 0x70:
++		return in.Loc.PC + 2 + uint64(int64(int8(b[1]))), true
++	case !arm64 && len(b) == 6 && b[0] == 0x0F && b[1]&0xF0 == 0x80:
++		return in.Loc.PC + 6 + uint64(int64(int32(binary.LittleEndian.Uint32(b[2:])))), true
++	}
++	return 0, false
++}
++
++func nopBytes(arm64 bool, size int) []byte {
++	if arm64 {
++		return []byte{0x1F, 0x20, 0x03, 0xD5}
++	}
++	if size == 2 {
++		return []byte{0x66, 0x90}
++	}
++	return []byte{0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00}
++}
++
++func jmpBytes(arm64 bool, in *AsmInstruction, target uint64) []byte {
++	off := int64(target - in.Loc.PC)
++	if arm64 {
++		return binary.LittleEndian.AppendUint32(nil, 0x14000000|uint32(off/4)&0x3FFFFFF)
++	}
++	if in.Size == 2 {
++		return []byte{0xEB, in.Bytes[1]}
++	}
++	return append(binary.LittleEndian.AppendUint32([]byte{0xE9}, uint32(off-5)), 0x90)
++}
++
++// detWatchable reports whether the runtime can count lbp's hits.
++func detWatchable(lbp *LogicalBreakpoint) bool {
++	if lbp.hitCond == nil || lbp.HitCondPerG || lbp.cond != nil || lbp.TraceReturn || lbp.hitCond.Val <= 0 {
++		return false
++	}
++	switch lbp.hitCond.Op {
++	case token.EQL, token.GEQ, token.GTR, token.REM:
++		return true
++	}
++	return false
++}
++
++// detWatchEnable makes the runtime count the hits of lbp, at addrs, if it
++// can, and reports whether it does.
++func (t *Target) detWatchEnable(lbp *LogicalBreakpoint, addrs []uint64) (bool, error) {
++	if len(addrs) != 1 || !detWatchable(lbp) {
++		return false, nil
++	}
++	di := t.detInfo()
++	if di == nil {
++		return false, nil
++	}
++	fn := t.BinInfo().PCToFunc(addrs[0])
++	if fn == nil {
++		return false, nil
++	}
++	tick, err := t.detEntryTick(fn, di.preemptFn)
++	if err != nil || addrs[0] > tick.branch {
++		return false, nil
++	}
++	for addr, bp := range t.Breakpoints().M {
++		if addr+uint64(len(bp.OriginalData)) > tick.branch && addr < tick.branch+uint64(len(tick.orig)) {
++			return false, nil
++		}
++	}
++	slot := -1
++	for i := 0; i < di.nslots; i++ {
++		if i >= len(t.detSlots) {
++			t.detSlots = append(t.detSlots, nil)
++		}
++		if t.detSlots[i] == nil {
++			slot = i
++			break
++		}
++	}
++	if slot < 0 {
++		return false, nil
++	}
++	if t.Breakpoints().M[di.watchFn] == nil {
++		if _, err := t.DetSetBreakpoint(di.watchFn, t.detWatchFired); err != nil {
++			return false, err
++		}
++	}
++	mem := t.Memory()
++	w := di.debug + uint64(di.watch+int64(slot)*di.watchSize)
++	if _, err := mem.WriteMemory(w+uint64(di.watchPC), le64(tick.ret)); err != nil {
++		return false, err
++	}
++	if _, err := mem.WriteMemory(tick.branch, tick.patch); err != nil {
++		mem.WriteMemory(w+uint64(di.watchPC), le64(0))
++		return false, err
++	}
++	t.detSlots[slot] = lbp
++	lbp.det = &detWatchState{slot: slot, patch: *tick, addrs: addrs, base: lbp.TotalHitCount}
++	if err := t.detWriteNwatch(); err != nil {
++		return true, err
++	}
++	return true, t.detWatchSchedule(lbp)
++}
++
++func (t *Target) detWriteNwatch() error {
++	di := t.detInfo()
++	n := 0
++	for i, lbp := range t.detSlots {
++		if lbp != nil {
++			n = i + 1
++		}
++	}
++	b := make([]byte, 4)
++	binary.LittleEndian.PutUint32(b, uint32(n))
++	_, err := t.Memory().WriteMemory(di.debug+uint64(di.nwatch), b)
++	return err
++}
++
++// detWatchSchedule asks the runtime to call runtime.detDebugWatch at the
++// entry before the next hit lbp's condition asks for, or writes the
++// breakpoint at once if that is the next entry.
++func (t *Target) detWatchSchedule(lbp *LogicalBreakpoint) error {
++	di := t.detInfo()
++	d := lbp.det
++	// The runtime's count starts at the next entry tick, which belongs to
++	// the hit the program is stopped at if it is stopped before the tick.
++	base := lbp.TotalHitCount
++	if base > 0 && t.detBeforeTick(d) {
++		base--
++	}
++	d.base = base
++	n := uint64(lbp.hitCond.Val)
++	var hit uint64
++	switch lbp.hitCond.Op {
++	case token.EQL, token.GEQ:
++		hit = n
++	case token.GTR:
++		hit = n + 1
++	case token.REM:
++		hit = (lbp.TotalHitCount/n + 1) * n
++	}
++	if hit <= lbp.TotalHitCount {
++		if lbp.hitCond.Op == token.EQL {
++			hit = 0 // == N passed: no hit is left
++		} else {
++			hit = lbp.TotalHitCount + 1 // >= N or > N holds: every next hit
++		}
++	}
++	at := uint64(0)
++	if hit > base+1 {
++		at = hit - 1 - base
++	}
++	mem := t.Memory()
++	w := di.debug + uint64(di.watch+int64(d.slot)*di.watchSize)
++	if _, err := mem.WriteMemory(w+uint64(di.watchCount), le64(0)); err != nil {
++		return err
++	}
++	if _, err := mem.WriteMemory(w+uint64(di.watchAt), le64(at)); err != nil {
++		return err
++	}
++	if hit == 0 {
++		return nil
++	}
++	if at == 0 {
++		return t.detWatchArm(lbp)
++	}
++	return nil
++}
++
++// detBeforeTick reports whether a thread is stopped between d's breakpoint
++// and its function's entry tick.
++func (t *Target) detBeforeTick(d *detWatchState) bool {
++	for _, th := range t.ThreadList() {
++		regs, err := th.Registers()
++		if err != nil {
++			continue
++		}
++		for _, addr := range d.addrs {
++			if pc := regs.PC(); pc >= addr && pc <= d.patch.branch {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// detWatchArm writes lbp's breakpoint in the program.
++func (t *Target) detWatchArm(lbp *LogicalBreakpoint) error {
++	for _, addr := range lbp.det.addrs {
++		if _, err := t.SetBreakpoint(lbp.LogicalID, addr, UserBreakpoint, nil); err != nil {
++			if _, exists := err.(BreakpointExistsError); !exists {
++				return err
++			}
++		}
++	}
++	lbp.det.armed = true
++	return nil
++}
++
++// detWatchFired is the callback of the breakpoint on
++// runtime.detDebugWatch: it writes the breakpoints whose counts were
++// reached, and never stops.
++func (t *Target) detWatchFired(th Thread, _ *Target) (bool, error) {
++	di := t.detInfo()
++	mem := t.Memory()
++	for slot, lbp := range t.detSlots {
++		if lbp == nil || lbp.det == nil || lbp.det.armed {
++			continue
++		}
++		w := di.debug + uint64(di.watch+int64(slot)*di.watchSize)
++		count, err1 := readUintRaw(mem, w+uint64(di.watchCount), 8)
++		at, err2 := readUintRaw(mem, w+uint64(di.watchAt), 8)
++		if err := errors.Join(err1, err2); err != nil {
++			return false, err
++		}
++		if at == 0 || count != at {
++			continue
++		}
++		mem.WriteMemory(w+uint64(di.watchAt), le64(0))
++		lbp.TotalHitCount = lbp.det.base + count
++		if err := t.detWatchArm(lbp); err != nil {
++			return false, err
++		}
++	}
++	return false, nil
++}
++
++// detWatchRelease stops the runtime counting lbp's hits, and leaves its
++// breakpoints in the program as they are.
++func (t *Target) detWatchRelease(lbp *LogicalBreakpoint) error {
++	d := lbp.det
++	if d == nil {
++		return nil
++	}
++	lbp.det = nil
++	if d.slot < len(t.detSlots) && t.detSlots[d.slot] == lbp {
++		t.detSlots[d.slot] = nil
++	}
++	if valid, _ := t.Valid(); !valid {
++		return nil
++	}
++	di := t.detInfo()
++	mem := t.Memory()
++	_, err := mem.WriteMemory(d.patch.branch, d.patch.orig)
++	w := di.debug + uint64(di.watch+int64(d.slot)*di.watchSize)
++	mem.WriteMemory(w+uint64(di.watchPC), le64(0))
++	mem.WriteMemory(w+uint64(di.watchAt), le64(0))
++	return errors.Join(err, t.detWriteNwatch())
++}
++
++// detWatchContinue updates, as the program is about to run, the
++// breakpoints whose hits the runtime counts and that were hit: one with a
++// condition >= N or > N becomes an ordinary breakpoint, one with == N is
++// done, and one with % N goes back to the runtime's count.
++func (grp *TargetGroup) detWatchContinue() error {
++	for _, t := range grp.targets {
++		for _, lbp := range t.detSlots {
++			if lbp == nil || lbp.det == nil || !lbp.det.hit {
++				continue
++			}
++			lbp.det.hit = false
++			if lbp.hitCond.Op != token.REM {
++				if err := t.detWatchRelease(lbp); err != nil {
++					return err
++				}
++				continue
++			}
++			for addr, bp := range t.Breakpoints().M {
++				if bp.LogicalID() == lbp.LogicalID {
++					if err := t.ClearBreakpoint(addr); err != nil {
++						return err
++					}
++				}
++			}
++			lbp.det.armed = false
++			if err := t.detWatchSchedule(lbp); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++// detWatchCounts sets the hit counts of the breakpoints whose hits the
++// runtime counts, as the program stopped.
++func (grp *TargetGroup) detWatchCounts() {
++	for _, t := range grp.targets {
++		if valid, _ := t.Valid(); !valid {
++			continue
++		}
++		di := t.detInfo()
++		for slot, lbp := range t.detSlots {
++			if lbp == nil || lbp.det == nil || lbp.det.armed {
++				continue
++			}
++			w := di.debug + uint64(di.watch+int64(slot)*di.watchSize)
++			if count, err := readUintRaw(t.Memory(), w+uint64(di.watchCount), 8); err == nil {
++				lbp.TotalHitCount = lbp.det.base + count
++			}
++		}
++	}
++}
++
++// detWatchUpdate starts or stops the runtime's count of lbp's hits after
++// its condition changed.
++func (grp *TargetGroup) detWatchUpdate(lbp *LogicalBreakpoint) error {
++	if !lbp.enabled || !lbp.condSatisfiable || len(grp.targets) != 1 || !grp.targets[0].IsDetsched() {
++		return nil
++	}
++	if lbp.det == nil && !detWatchable(lbp) {
++		return nil
++	}
++	if err := grp.disableBreakpoint(lbp); err != nil {
++		return err
++	}
++	return grp.enableBreakpoint(lbp)
++}
++
++// DetCountedAddrs returns the addresses of lbp if the runtime counts its
++// hits, rather than a breakpoint written in the program.
++func (lbp *LogicalBreakpoint) DetCountedAddrs() []uint64 {
++	if lbp.det == nil || lbp.det.armed {
++		return nil
++	}
++	return lbp.det.addrs
++}
+diff --git a/pkg/proc/target.go b/pkg/proc/target.go
+index be40658..e9aa7e0 100644
+--- a/pkg/proc/target.go
++++ b/pkg/proc/target.go
+@@ -67,6 +67,10 @@ type Target struct {
+ 	// have read and parsed from the targets memory.
+ 	// This must be cleared whenever the target is resumed.
+ 	gcache goroutineCache
++
++	// detSlots holds the breakpoints whose hits the runtime of a detsched
++	// program counts, by slot; see detsched.go.
++	detSlots []*LogicalBreakpoint
+ 	// scache is a cache for stack traces.
+ 	scache stackCache
+ 
+diff --git a/pkg/proc/target_exec.go b/pkg/proc/target_exec.go
+index c2cfa23..931bba3 100644
+--- a/pkg/proc/target_exec.go
++++ b/pkg/proc/target_exec.go
+@@ -78,6 +78,10 @@ func (grp *TargetGroup) Continue() error {
+ 			grp.finishManualStop()
+ 		}
+ 	}()
++	if err := grp.detWatchContinue(); err != nil {
++		return err
++	}
++	defer grp.detWatchCounts()
+ 	hadAttaching := grp.targets[0].BinInfo().attaching
+ 	grp.targets[0].BinInfo().attaching = false
+ 	for {
+diff --git a/pkg/proc/target_group.go b/pkg/proc/target_group.go
+index ca8df63..930b132 100644
+--- a/pkg/proc/target_group.go
++++ b/pkg/proc/target_group.go
+@@ -86,6 +86,7 @@ func Restart(grp, oldgrp *TargetGroup, discard func(*LogicalBreakpoint, error))
+ 		bp.TotalHitCount = 0
+ 		bp.HitCount = make(map[int64]uint64)
+ 		bp.Set.PidAddrs = nil // breakpoints set through a list of addresses can not be restored after a restart
++		bp.det = nil
+ 		if bp.enabled {
+ 			toenable = append(toenable, bp)
+ 		}
+@@ -399,6 +400,10 @@ func enableBreakpointOnTarget(p *Target, lbp *LogicalBreakpoint) error {
+ 		return err
+ 	}
+ 
++	if ok, err := p.detWatchEnable(lbp, addrs); ok {
++		return err
++	}
++
+ 	for _, addr := range addrs {
+ 		_, err = p.SetBreakpoint(lbp.LogicalID, addr, UserBreakpoint, nil)
+ 		if err != nil {
+@@ -416,6 +421,13 @@ func enableBreakpointOnTarget(p *Target, lbp *LogicalBreakpoint) error {
+ func (grp *TargetGroup) disableBreakpoint(lbp *LogicalBreakpoint) error {
+ 	var errs []error
+ 	n := 0
++	for _, t := range grp.targets {
++		if lbp.det != nil && lbp.det.slot < len(t.detSlots) && t.detSlots[lbp.det.slot] == lbp {
++			if err := t.detWatchRelease(lbp); err != nil {
++				errs = append(errs, err)
++			}
++		}
++	}
+ 	it := ValidTargets{Group: grp}
+ 	for it.Next() {
+ 		for _, bp := range it.Breakpoints().M {
+@@ -480,6 +492,10 @@ func (grp *TargetGroup) ChangeBreakpointCondition(lbp *LogicalBreakpoint, cond,
+ 
+ 	lbp.condUsesHitCounts = breakpointConditionUsesHitCounts(lbp)
+ 
++	if err := grp.detWatchUpdate(lbp); err != nil {
++		return err
++	}
++
+ 	if lbp.enabled {
+ 		switch {
+ 		case lbp.condSatisfiable && !breakpointConditionSatisfiable(grp.LogicalBreakpoints, lbp):
+diff --git a/pkg/terminal/command.go b/pkg/terminal/command.go
+index 594894d..cf60955 100644
+--- a/pkg/terminal/command.go
++++ b/pkg/terminal/command.go
+@@ -1876,6 +1876,8 @@ func breakpoints(t *Term, ctx callContext, args string) error {
+ 			enabled = "(disabled)"
+ 		} else if bp.ExprString != "" {
+ 			enabled = "(suspended)"
++		} else if bp.RuntimeCounted {
++			enabled = "(enabled, hits counted by the runtime)"
+ 		}
+ 		fmt.Fprintf(t.stdout, "%s %s", formatBreakpointName(bp, true), enabled)
+ 		if bp.ExprString != "" {
+diff --git a/service/api/types.go b/service/api/types.go
+index 69b1e59..6525dfb 100644
+--- a/service/api/types.go
++++ b/service/api/types.go
+@@ -139,6 +139,10 @@ type Breakpoint struct {
+ 	HitCount map[string]uint64 `json:"hitCount"`
+ 	// number of times a breakpoint has been reached
+ 	TotalHitCount uint64 `json:"totalHitCount"`
++	// RuntimeCounted is set when the runtime of a detsched program counts
++	// the breakpoint's hits until the one its hit condition asks for, so
++	// that the hits before it cost no trap.
++	RuntimeCounted bool `json:"runtimeCounted,omitempty"`
+ 	// Disabled flag, signifying the state of the breakpoint
+ 	Disabled bool `json:"disabled"`
+ 
+diff --git a/service/debugger/debugger.go b/service/debugger/debugger.go
+index c852d14..d911d2d 100644
+--- a/service/debugger/debugger.go
++++ b/service/debugger/debugger.go
+@@ -860,6 +860,13 @@ func (d *Debugger) convertBreakpoint(lbp *proc.LogicalBreakpoint) *api.Breakpoin
+ 		}
+ 	}
+ 	api.ConvertPhysicalBreakpoints(abp, lbp, pids, bps)
++	if addrs := lbp.DetCountedAddrs(); len(addrs) > 0 && len(bps) == 0 {
++		abp.RuntimeCounted = true
++		abp.Addrs, abp.Addr, abp.ExprString = addrs, addrs[0], ""
++		for range addrs {
++			abp.AddrPid = append(abp.AddrPid, d.target.Selected.Pid())
++		}
++	}
+ 	return abp
+ }
+ 

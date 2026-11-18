@@ -45,8 +45,9 @@ misc/release/gate.bash      # the checks every change must pass
 `GOOS`, `GOARCH`). With `-distpack` it also writes
 `pkg/distpack/$VERSION.$GOOS-$GOARCH.tar.gz`: make.bash's distribution
 archive with `detsched` and Delve's `dlv` added to `bin/` (dlv at the
-version the docs were tested with, built by the toolchain, which downloads
-its module, with its license in `misc/delve/LICENSE`) and its top
+version the docs were tested with, with the patches in `delve/`, built by
+the toolchain, which downloads its module, with its license and the
+patches in `misc/delve/`) and its top
 directory renamed to the version, so that unpacking it never mixes it into
 a stock `go/`, plus a `.sha256` file. To build all three release archives:
 
@@ -58,14 +59,41 @@ done
 
 `gate.bash [GOROOT]` runs the detsched command's tests, the runtime,
 testing/synctest, internal/godebug and sync tests with the experiment in
-`-short` mode, and checks that a stock hello world has no detsched
-symbols. `smoke.bash ARCHIVE` tests an archive on its own platform as a
+`-short` mode, checks that a stock hello world has no detsched
+symbols, and, when `bin/dlv` exists, runs the bundled Delve's tests
+(`misc/detsched/testdata/delve`) on a failing replay of
+`testdata/simcompose`. `smoke.bash ARCHIVE` tests an archive on its own platform as a
 user gets it: it checks the checksum, unpacks the archive in a new
 directory, and with an empty environment checks `go version`, runs the
 archive's own gate, runs `detsched -n 100` on the planted bug in
 `testdata/bugcache`, and runs the replay line it prints under `env -i`,
 which must fail with the same trace line, and the `debug:` line, which on
 Linux must stop in dlv at the failure's panic.
+
+## Delve
+
+The release bundles Delve 1.27.2 with the patches in `delve/`, applied in
+order by `delve.bash`, which `build.bash -distpack` runs. Each patch is a
+commit message followed by its diff against the previous one, and says
+whether it is a generic fix for upstream Delve or specific to detsched:
+
+- `0001`: two generic fixes (module data of register variables, a
+  tracepoint's stack printed twice);
+- `0002`: generic: goroutine filter errors that say what is wrong, no
+  color escapes off a terminal;
+- `0003`: detsched: positions on every stop, `detsched.*` expressions,
+  goroutines by node, `checkpoint`/`restart`/`rewind`, the trace line at
+  `exit`, and the JSON output mode (generic but for its detsched fields);
+- `0004`: detsched: hit counts counted by the runtime
+  (`runtime.detDebug` in `src/runtime/detstop.go`).
+
+To build dlv for this tree, `delve.bash bin/dlv`. To change the patches,
+copy Delve's module (`go mod download -json
+github.com/go-delve/delve@v1.27.2` prints its directory) into a git
+repository, commit each patch in order (`git apply` takes the patch, `git
+commit -F` the message before its `diff --git` line), edit, and write each
+commit C back as `git log -1 --format=%B C; echo; git diff C~1 C`.
+`gate.bash` then tests the dlv in `bin/`.
 
 ## Publish and release
 

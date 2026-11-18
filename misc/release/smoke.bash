@@ -8,7 +8,9 @@
 # next to it), unpacks it in a new directory, and with an empty environment
 #
 #   - checks that go version names the archive's version and platform;
-#   - runs the archive's own misc/release/gate.bash;
+#   - runs the archive's own misc/release/gate.bash, which tests the
+#     archive's dlv on a failing replay too (on macOS when developer mode
+#     is on);
 #   - runs detsched -n 100 on the planted bug in testdata/bugcache, which
 #     must fail, and runs the replay line it prints under env -i, which must
 #     fail with the same message and trace line;

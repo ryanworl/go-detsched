@@ -1,0 +1,114 @@
+service/api, pkg/terminal: say what goroutine filters take; no colors off a terminal
+
+goroutines -with, -without and -group answered every mistake with
+"wrong argument: '-with'", which does not say what is wrong. Return the
+parser's error, which now lists the filters each flag takes, and say
+which flags goroutines has for an unknown one.
+
+The terminal wrote color escapes into output that is not a terminal,
+such as a script's output piped to a file, so every line a script
+matched had them. Write colors only to a terminal.
+
+Both are generic fixes for upstream Delve.
+
+diff --git a/pkg/terminal/terminal.go b/pkg/terminal/terminal.go
+index 67e4656..ca04161 100644
+--- a/pkg/terminal/terminal.go
++++ b/pkg/terminal/terminal.go
+@@ -17,6 +17,7 @@ import (
+ 
+ 	"github.com/derekparker/trie/v3"
+ 	"github.com/go-delve/liner"
++	"github.com/mattn/go-isatty"
+ 
+ 	"github.com/go-delve/delve/pkg/config"
+ 	"github.com/go-delve/delve/pkg/goversion"
+@@ -128,7 +129,8 @@ func New(client service.Client, conf *config.Config, isAttachCmd bool) *Term {
+ 	}
+ 	t.line.SetCtrlZStop(true)
+ 
+-	if strings.ToLower(os.Getenv("TERM")) != "dumb" {
++	// Output that is not to a terminal, such as a script's, gets no colors.
++	if strings.ToLower(os.Getenv("TERM")) != "dumb" && isatty.IsTerminal(os.Stdout.Fd()) {
+ 		t.stdout.pw = &pagingWriter{w: getColorableWriter()}
+ 		t.stdout.colorEscapes = make(map[colorize.Style]string)
+ 		t.stdout.colorEscapes[colorize.NormalStyle] = terminalResetEscapeCode
+diff --git a/service/api/command.go b/service/api/command.go
+index 9afb61d..484e997 100644
+--- a/service/api/command.go
++++ b/service/api/command.go
+@@ -72,14 +72,14 @@ func ParseGoroutineArgs(argstr string) ([]ListGoroutinesFilter, GoroutineGroupin
+ 		case "-w", "-with":
+ 			filter, err := readGoroutinesFilter(args, &i)
+ 			if err != nil {
+-				return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", fmt.Errorf("wrong argument: '%s'", arg)
++				return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", err
+ 			}
+ 			filters = append(filters, *filter)
+ 
+ 		case "-wo", "-without":
+ 			filter, err := readGoroutinesFilter(args, &i)
+ 			if err != nil {
+-				return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", fmt.Errorf("wrong argument: '%s'", arg)
++				return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", err
+ 			}
+ 			filter.Negated = true
+ 			filters = append(filters, *filter)
+@@ -88,12 +88,12 @@ func ParseGoroutineArgs(argstr string) ([]ListGoroutinesFilter, GoroutineGroupin
+ 			var err error
+ 			group.GroupBy, err = readGoroutinesFilterKind(args, i+1)
+ 			if err != nil {
+-				return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", fmt.Errorf("wrong argument: '%s'", arg)
++				return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", err
+ 			}
+ 			i++
+ 			if group.GroupBy == GoroutineLabel {
+ 				if i+1 >= len(args) {
+-					return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", fmt.Errorf("wrong argument: '%s'", arg)
++					return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", errors.New("-group label must be followed by a label key, as in: goroutines -group label key")
+ 				}
+ 				group.GroupByKey = args[i+1]
+ 				i++
+@@ -115,15 +115,19 @@ func ParseGoroutineArgs(argstr string) ([]ListGoroutinesFilter, GoroutineGroupin
+ 		case "":
+ 			// nothing to do
+ 		default:
+-			return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", fmt.Errorf("wrong argument: '%s'", arg)
++			return nil, GoroutineGroupingOptions{}, 0, 0, 0, 0, "", fmt.Errorf("wrong argument: '%s' (flags: -u, -r, -g, -s, -t [depth], -l, -with FILTER, -without FILTER, -group FIELD, -chan expr, -exec command; see help goroutines)", arg)
+ 		}
+ 	}
+ 	return filters, group, fgl, flags, depth, batchSize, cmd, nil
+ }
+ 
++// goroutineFilterHelp lists the filters of goroutines -with, -without and
++// -group.
++const goroutineFilterHelp = "curloc, userloc, goloc or startloc and a substring of the location, label and key or key=value, running, user, as in: goroutines -with userloc mypkg.(*T).F"
++
+ func readGoroutinesFilterKind(args []string, i int) (GoroutineField, error) {
+-	if i >= len(args) {
+-		return GoroutineFieldNone, fmt.Errorf("%s must be followed by an argument", args[i-1])
++	if i >= len(args) || args[i] == "" {
++		return GoroutineFieldNone, fmt.Errorf("%s must be followed by a filter: %s", args[i-1], goroutineFilterHelp)
+ 	}
+ 
+ 	switch args[i] {
+@@ -142,7 +146,7 @@ func readGoroutinesFilterKind(args []string, i int) (GoroutineField, error) {
+ 	case "user":
+ 		return GoroutineUser, nil
+ 	default:
+-		return GoroutineFieldNone, fmt.Errorf("unrecognized argument to %s %s", args[i-1], args[i])
++		return GoroutineFieldNone, fmt.Errorf("unrecognized argument to %s: %s; it takes %s", args[i-1], args[i], goroutineFilterHelp)
+ 	}
+ }
+ 
+@@ -158,8 +162,8 @@ func readGoroutinesFilter(args []string, pi *int) (*ListGoroutinesFilter, error)
+ 	case GoroutineRunning, GoroutineUser:
+ 		return r, nil
+ 	}
+-	if *pi+1 >= len(args) {
+-		return nil, fmt.Errorf("%s %s needs to be followed by an expression", args[*pi-1], args[*pi])
++	if *pi+1 >= len(args) || args[*pi+1] == "" {
++		return nil, fmt.Errorf("%s %s needs to be followed by an expression, which must not contain spaces", args[*pi-1], args[*pi])
+ 	}
+ 	r.Arg = args[*pi+1]
+ 	*pi++

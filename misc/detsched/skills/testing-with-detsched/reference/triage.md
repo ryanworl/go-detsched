@@ -46,7 +46,7 @@ Decide with evidence from the replay, not from the message alone. Assume the har
 - A run that ends at the per-run timeout with little output: a nemesis callback (`Event`, `Restart`) waiting for a node, a harness lock held by a paused node, or an oracle that is too slow (profile it). Read the stacks in the log.
 - `concurrent map writes` in harness code: a harness map without a mutex.
 - Socket calls failing with `EPERM`: code running on a goroutine of no node.
-- synctest reporting a deadlock or blocked goroutines when the test ends: a harness goroutine not joined.
+- synctest reporting `deadlock: main bubble goroutine has exited but blocked goroutines remain`: a goroutine still running when the test body returned. The summary lists the functions they are blocked in and what created them: a harness goroutine not joined, or one the SUT starts and its `Close` does not wait for (then wait for it in the harness, and note it as SUT behavior).
 - A failure only in runs with a backward clock skip: a check that compares wall-clock times or durations without allowing for the skip.
 - `branch K died of signal 5`: a debugger breakpoint hit inside a forked branch; replay with `GODETBRANCH=K`.
 - `detsched: predicted deadlock: ... context.(*cancelCtx).cancel ...` in the summary: likely a false alarm, two contexts whose memory was reused. The summary says how many runs were directed at the predictions and how many of those failed; a real deadlock fails them.
