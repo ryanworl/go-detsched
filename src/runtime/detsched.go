@@ -223,7 +223,7 @@ func detExecute(pp *p, gp *g, inheritTime bool) {
 	}
 	if detBusy.on {
 		detBusyCount() // the last goroutine's ticks
-		detBusy.last = nil
+		detBusy.last = 0
 	}
 	switch {
 	case inheritTime:
