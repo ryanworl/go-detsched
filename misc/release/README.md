@@ -88,7 +88,14 @@ whether it is a generic fix for upstream Delve or specific to detsched:
   (`runtime.detDebug` in `src/runtime/detstop.go`);
 - `0005`: generic: hit and stop lines name the inlined function and the
   one it was inlined into, and a tracepoint's returns follow its
-  condition.
+  condition;
+- `0006`: generic: `FILE:LINE` by the package's import path wherever it
+  was built (a `replace`d module), and closures in closures
+  (`pkg.F.func1.1`);
+- `0007`: generic: a breakpoint whose addresses another one partly has
+  is set and says which (hits name the function it was set on), return
+  lines and records carry their tracepoint's name, and `goroutines -t`
+  in JSON has each goroutine's frames.
 
 To build dlv for this tree, `delve.bash bin/dlv`. To change the patches,
 copy Delve's module (`go mod download -json

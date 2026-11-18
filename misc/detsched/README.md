@@ -351,10 +351,12 @@ fork while `runtime.iscgo` is set, which detsched's `CGO_ENABLED=0` build
 leaves unset unless a package sets it, as
 `github.com/ebitengine/purego/internal/fakecgo` does; during package
 initialization; while a goroutine is in a system call or locked to its
-thread; while a file is registered with the network poller; while a
-regular file it opened with package `os` is open, since a fork would share
-its offset, locks, and shared mappings with the process it forked from; and
-on macOS once it has used the system's certificate verifier. detsched then
+thread; while a file is registered with the network poller; once it has
+used the real file system through package `os`, by keeping a regular file
+open or by creating a file or directory, such as `t.TempDir()`, since its
+forks would share the files, their offsets, locks, and shared mappings,
+with each other; and on macOS once it has used the system's certificate
+verifier. detsched then
 runs without forking, and says why when it starts and in its summary.
 Subprocesses started before a fork are not the children's children, so a
 program that forks should keep to simulated files and start no processes.

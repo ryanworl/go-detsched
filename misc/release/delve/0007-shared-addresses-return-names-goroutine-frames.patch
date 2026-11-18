@@ -1,0 +1,447 @@
+pkg/proc, pkg/terminal: shared addresses, return names, goroutine frames
+
+An address stops for one breakpoint, and two functions share an address
+when one is inlined into the other at its first statement, as
+(*T).Free calling release. After "trace a pkg.(*T).Free", "trace b
+pkg.(*T).release" printed a bare "Breakpoint exists" when the last of
+b's addresses was a's, even though b's other addresses had been set,
+and those were left behind without their logical breakpoint; when
+another address was last, b was set silently without a's. Now a
+breakpoint is set when it gets any of its addresses, the terminal says
+which addresses another breakpoint has:
+
+	tracepoint b does not stop at 0x49a2a8, which tracepoint a has: an address stops for one breakpoint, and the stack at its stops shows every call inlined there
+
+and when every address is taken the error names the breakpoint that
+has it ("Breakpoint exists at FILE:LINE at ADDR: tracepoint a on
+pkg.(*T).Free has it, ..."). A breakpoint on a function's returns that
+another tracepoint already has no longer fails the trace command.
+
+At such an address, a hit was labeled with the innermost inlined call,
+so tracepoint a printed release. The debugger now picks, among the calls
+inlined at the PC and the function they were inlined into, the call of
+the function the breakpoint was set on: api.Thread.Inlined, File and
+Line, and the arguments the breakpoint loads, are that call's.
+
+A tracepoint's return lines and records carried no name of their own:
+in the JSON output a return record's "bp" was the ID of the breakpoint
+on the return, so a filter on the tracepoint's name missed the returns.
+They now carry the tracepoint's name (or its ID), in text as on its
+entries:
+
+	>> goroutine(16): [w] main.work => (...)
+
+In the JSON output, goroutines -t N left out the stacks and -exec CMD
+did not run CMD; each goroutine now has "frames", as the stack record,
+and CMD's records follow.
+
+All are generic fixes for upstream Delve, the JSON ones for the output
+mode of 0003.
+
+diff --git a/pkg/proc/breakpoints.go b/pkg/proc/breakpoints.go
+index 63b14f2..ad52a92 100644
+--- a/pkg/proc/breakpoints.go
++++ b/pkg/proc/breakpoints.go
+@@ -262,15 +262,51 @@ func (bp *Breakpoint) VerboseDescr() []string {
+ // BreakpointExistsError is returned when trying to set a breakpoint at
+ // an address that already has a breakpoint set for it.
+ type BreakpointExistsError struct {
+-	File string
+-	Line int
+-	Addr uint64
++	File  string
++	Line  int
++	Addr  uint64
++	Owner string // the breakpoint that has the address, if known
+ }
+ 
+ func (bpe BreakpointExistsError) Error() string {
++	if bpe.Owner != "" {
++		// Two functions share the address when one is inlined into the
++		// other at its first statement.
++		return fmt.Sprintf("Breakpoint exists at %s:%d at %x: %s has it, and an address stops for one breakpoint; the stack at its stops shows every call inlined there", bpe.File, bpe.Line, bpe.Addr, bpe.Owner)
++	}
+ 	return fmt.Sprintf("Breakpoint exists at %s:%d at %x", bpe.File, bpe.Line, bpe.Addr)
+ }
+ 
++// describe names lbp and where it was set, such as
++// "tracepoint a on main.(*T).F", or returns "" for nil.
++func (lbp *LogicalBreakpoint) describe() string {
++	if lbp == nil {
++		return ""
++	}
++	kind := "breakpoint"
++	if lbp.Tracepoint || lbp.TraceReturn {
++		kind = "tracepoint"
++	}
++	name := lbp.Name
++	if name == "" {
++		name = strconv.Itoa(lbp.LogicalID)
++	}
++	if lbp.TraceReturn {
++		if lbp.traceEntry != nil {
++			return "the returns of " + lbp.traceEntry.describe()
++		}
++		return "returns breakpoint " + name
++	}
++	on := lbp.Set.ExprString
++	if on == "" {
++		on = lbp.FunctionName
++	}
++	if on == "" {
++		return kind + " " + name
++	}
++	return fmt.Sprintf("%s %s on %s", kind, name, on)
++}
++
+ // InvalidAddressError represents the result of
+ // attempting to set a breakpoint at an invalid address.
+ type InvalidAddressError struct {
+@@ -856,7 +892,7 @@ func (t *Target) setBreakpointInternal(logicalID int, addr uint64, kind Breakpoi
+ 
+ 	if bp, ok := bpmap.M[addr]; ok {
+ 		if !bp.canOverlap(kind) {
+-			return bp, BreakpointExistsError{bp.File, bp.Line, bp.Addr}
++			return bp, BreakpointExistsError{File: bp.File, Line: bp.Line, Addr: bp.Addr, Owner: bp.Logical.describe()}
+ 		}
+ 		bp.Breaklets = append(bp.Breaklets, newBreaklet)
+ 		setLogicalBreakpoint(bp)
+diff --git a/pkg/proc/target_group.go b/pkg/proc/target_group.go
+index ba48cd5..aebdda2 100644
+--- a/pkg/proc/target_group.go
++++ b/pkg/proc/target_group.go
+@@ -407,17 +407,24 @@ func enableBreakpointOnTarget(p *Target, lbp *LogicalBreakpoint) error {
+ 		return err
+ 	}
+ 
++	// An address another breakpoint has is skipped: the breakpoint exists
++	// only if it got none of its addresses.
++	set := false
++	var errExists error
+ 	for _, addr := range addrs {
+-		_, err = p.SetBreakpoint(lbp.LogicalID, addr, UserBreakpoint, nil)
+-		if err != nil {
++		if _, err := p.SetBreakpoint(lbp.LogicalID, addr, UserBreakpoint, nil); err != nil {
+ 			if _, isexists := err.(BreakpointExistsError); isexists {
++				errExists = err
+ 				continue
+ 			}
+ 			return err
+ 		}
++		set = true
+ 	}
+-
+-	return err
++	if set {
++		return nil
++	}
++	return errExists
+ }
+ 
+ // disableBreakpoint disables a logical breakpoint.
+diff --git a/pkg/terminal/command.go b/pkg/terminal/command.go
+index 9e76df3..4886ccf 100644
+--- a/pkg/terminal/command.go
++++ b/pkg/terminal/command.go
+@@ -969,21 +969,57 @@ func (c *Commands) goroutines(t *Term, ctx callContext, argstr string) error {
+ 			return err
+ 		}
+ 		if t.jsonOn() {
++			// Each goroutine's frames with -t, and then the records of
++			// the command -exec runs on each.
++			list := func(gs []*api.Goroutine) ([]map[string]any, error) {
++				l := []map[string]any{}
++				for _, g := range gs {
++					r := t.jsonGoroutine(g)
++					if flags&api.PrintGoroutinesStack != 0 {
++						stack, err := t.client.Stacktrace(g.ID, depth, 0, 0, nil)
++						if err != nil {
++							return nil, err
++						}
++						r["frames"] = t.jsonFrames(stack)
++					}
++					l = append(l, r)
++				}
++				return l, nil
++			}
++			exec := func(gs []*api.Goroutine) error {
++				for _, g := range gs {
++					if cmd == "" {
++						break
++					}
++					ctx.Scope.GoroutineID = g.ID
++					if err := c.CallWithContext(cmd, t, ctx); err != nil {
++						return err
++					}
++				}
++				return nil
++			}
+ 			if len(groups) > 0 {
+ 				for i := range groups {
+-					list := []map[string]any{}
+-					for _, g := range gs[groups[i].Offset:][:groups[i].Count] {
+-						list = append(list, t.jsonGoroutine(g))
++					ggs := gs[groups[i].Offset:][:groups[i].Count]
++					l, err := list(ggs)
++					if err != nil {
++						return err
++					}
++					t.jsonEmit(map[string]any{"event": "goroutines", "group": groups[i].Name, "total": groups[i].Total, "goroutines": l})
++					if err := exec(ggs); err != nil {
++						return err
+ 					}
+-					t.jsonEmit(map[string]any{"event": "goroutines", "group": groups[i].Name, "total": groups[i].Total, "goroutines": list})
+ 				}
+ 			} else {
+ 				slices.SortFunc(gs, func(a, b *api.Goroutine) int { return cmp.Compare(a.ID, b.ID) })
+-				list := []map[string]any{}
+-				for _, g := range gs {
+-					list = append(list, t.jsonGoroutine(g))
++				l, err := list(gs)
++				if err != nil {
++					return err
++				}
++				t.jsonEmit(map[string]any{"event": "goroutines", "goroutines": l})
++				if err := exec(gs); err != nil {
++					return err
+ 				}
+-				t.jsonEmit(map[string]any{"event": "goroutines", "goroutines": list})
+ 			}
+ 			continue
+ 		}
+@@ -2057,6 +2093,7 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
+ 		created = append(created, bp)
+ 
+ 		fmt.Fprintf(t.stdout, "%s set at %s\n", formatBreakpointName(bp, true), t.formatBreakpointLocation(bp))
++		t.printSkippedAddrs(bp, loc.PCs)
+ 	}
+ 
+ 	var shouldSetReturnBreakpoints bool
+@@ -2087,7 +2124,8 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
+ 					Line:          -1,
+ 					LoadArgs:      &ShortLoadConfig,
+ 				})
+-				if err != nil {
++				if err != nil && !strings.HasPrefix(err.Error(), "Breakpoint exists") {
++					// Returns another tracepoint has stop for that one.
+ 					return nil, err
+ 				}
+ 			}
+@@ -3192,7 +3230,11 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, i
+ 			for _, v := range th.ReturnValues {
+ 				retVals = append(retVals, api.FormatTraceVariable(v, verbosity))
+ 			}
+-			fmt.Fprintf(t.stdout, "%s>> %s %s%s => (%s)%s\n", depthPrefix, tracePrefix, fn.Name(), inl, strings.Join(retVals, ","), posSuffix(th))
++			label := ""
++			if n := t.traceName(th.Breakpoint); n != "" {
++				label = "[" + n + "] "
++			}
++			fmt.Fprintf(t.stdout, "%s>> %s %s%s%s => (%s)%s\n", depthPrefix, tracePrefix, label, fn.Name(), inl, strings.Join(retVals, ","), posSuffix(th))
+ 		}
+ 	}
+ 	if th.Breakpoint.TraceFollowCalls > 0 {
+@@ -3208,6 +3250,56 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, i
+ 	}
+ }
+ 
++// printSkippedAddrs says which of the addresses found for bp other
++// breakpoints have, so that bp does not stop at them: two functions share
++// an address when one is inlined into the other at its first statement.
++func (t *Term) printSkippedAddrs(bp *api.Breakpoint, pcs []uint64) {
++	var skipped []uint64
++	for _, pc := range pcs {
++		if !slices.Contains(bp.Addrs, pc) {
++			skipped = append(skipped, pc)
++		}
++	}
++	if len(skipped) == 0 || bp.RuntimeCounted {
++		return
++	}
++	bps, err := t.client.ListBreakpoints(false)
++	if err != nil {
++		return
++	}
++	for _, pc := range skipped {
++		for _, o := range bps {
++			if o.ID == bp.ID || !slices.Contains(o.Addrs, pc) {
++				continue
++			}
++			fmt.Fprintf(t.stdout, "\t%s does not stop at %#x, which %s has: an address stops for one breakpoint, and the stack at its stops shows every call inlined there\n",
++				formatBreakpointName(bp, false), pc, formatBreakpointName(o, false))
++			break
++		}
++	}
++}
++
++// traceName returns the name of the tracepoint bp stops at the returns
++// of, or "" if it has none: return lines and records carry their
++// tracepoint's name, so that a filter on it sees both.
++func (t *Term) traceName(bp *api.Breakpoint) string {
++	if bp.TraceReturnOf == 0 {
++		return ""
++	}
++	if n, ok := t.traceNames[bp.TraceReturnOf]; ok {
++		return n
++	}
++	n := ""
++	if tp, err := t.client.GetBreakpoint(bp.TraceReturnOf); err == nil {
++		n = tp.Name
++	}
++	if t.traceNames == nil {
++		t.traceNames = map[int]string{}
++	}
++	t.traceNames[bp.TraceReturnOf] = n
++	return n
++}
++
+ type printPosFlags uint8
+ 
+ const (
+diff --git a/pkg/terminal/json.go b/pkg/terminal/json.go
+index 09632ef..d79f08b 100644
+--- a/pkg/terminal/json.go
++++ b/pkg/terminal/json.go
+@@ -209,9 +209,16 @@ func (t *Term) jsonThread(th *api.Thread) {
+ 		default:
+ 			rec["event"] = "break"
+ 		}
+-		if bp.Name != "" {
++		switch {
++		case bp.TraceReturn && bp.TraceReturnOf != 0:
++			// The tracepoint's, as on the entry record.
++			rec["bp"] = t.traceName(bp)
++			if rec["bp"] == "" {
++				rec["bp"] = strconv.Itoa(bp.TraceReturnOf)
++			}
++		case bp.Name != "":
+ 			rec["bp"] = bp.Name
+-		} else {
++		default:
+ 			rec["bp"] = strconv.Itoa(bp.ID)
+ 		}
+ 		rec["hits"] = bp.TotalHitCount
+diff --git a/pkg/terminal/terminal.go b/pkg/terminal/terminal.go
+index 8b4c38a..7e68306 100644
+--- a/pkg/terminal/terminal.go
++++ b/pkg/terminal/terminal.go
+@@ -95,6 +95,9 @@ type Term struct {
+ 	// detSeen is set once the target showed it is a detsched program.
+ 	detSeen bool
+ 
++	// traceNames caches tracepoints' names by ID; see traceName.
++	traceNames map[int]string
++
+ 	longCommandMu         sync.Mutex
+ 	longCommandCancelFlag bool
+ 
+diff --git a/service/debugger/debugger.go b/service/debugger/debugger.go
+index b0e5298..a2da672 100644
+--- a/service/debugger/debugger.go
++++ b/service/debugger/debugger.go
+@@ -623,6 +623,7 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig, withBreakpointInfo bool) (
+ 	isdet := tgt.IsDetsched()
+ 	for _, thread := range d.target.ThreadList() {
+ 		th := api.ConvertThread(thread, d.ConvertThreadBreakpoint(thread))
++		var bpFrames []proc.Stackframe
+ 
+ 		if isdet && (th.Breakpoint != nil || thread.ThreadID() == tgt.CurrentThread().ThreadID()) {
+ 			g, _ := proc.GetG(thread) // none before the runtime set it up
+@@ -636,6 +637,9 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig, withBreakpointInfo bool) (
+ 			// breakpoint on it, or a step into it, stops in.
+ 			if frames, err := proc.ThreadStacktrace(tgt, thread, 0); err == nil && len(frames) > 0 && frames[0].Inlined {
+ 				th.Inlined = api.ConvertFunction(frames[0].Call.Fn)
++				if th.Breakpoint != nil {
++					bpFrames = d.breakpointInlined(tgt, thread, th)
++				}
+ 			}
+ 		}
+ 
+@@ -645,7 +649,7 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig, withBreakpointInfo bool) (
+ 		}
+ 
+ 		if withBreakpointInfo {
+-			err := d.collectBreakpointInformation(th, thread)
++			err := d.collectBreakpointInformation(th, thread, bpFrames)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -885,6 +889,47 @@ func (d *Debugger) ConvertThreadBreakpoint(thread proc.Thread) *api.Breakpoint {
+ 	return nil
+ }
+ 
++// breakpointInlined sets th.Inlined, for a thread stopped at a breakpoint
++// set on a function where calls were inlined into it or into each other,
++// to the call of the function the breakpoint was set on rather than the
++// innermost call (nil if that is the function the calls were inlined
++// into), and File and Line to where that call is. It returns the stack
++// from that call, or nil if the innermost call is the one.
++func (d *Debugger) breakpointInlined(tgt *proc.Target, thread proc.Thread, th *api.Thread) []proc.Stackframe {
++	lbp := d.target.LogicalBreakpoints[th.Breakpoint.ID]
++	if lbp == nil || lbp.Set.ExprString == "" {
++		return nil
++	}
++	loc, err := locspec.Parse(lbp.Set.ExprString)
++	if err != nil {
++		return nil
++	}
++	spec, ok := loc.(*locspec.NormalLocationSpec)
++	if !ok || spec.FuncBase == nil || spec.LineOffset >= 0 {
++		return nil
++	}
++	const maxInlined = 16
++	frames, err := proc.ThreadStacktrace(tgt, thread, maxInlined)
++	if err != nil {
++		return nil
++	}
++	bi := tgt.BinInfo()
++	// The calls inlined at the PC, innermost first, and the function they
++	// were inlined into.
++	for i := 1; i < len(frames) && frames[i-1].Inlined; i++ {
++		if frames[i].Call.Fn == nil || !spec.FuncBase.Match(frames[i].Call.Fn, bi.PackageMap) {
++			continue
++		}
++		th.Inlined = nil
++		if frames[i].Inlined {
++			th.Inlined = api.ConvertFunction(frames[i].Call.Fn)
++		}
++		th.File, th.Line = frames[i].Call.File, frames[i].Call.Line
++		return frames[i:]
++	}
++	return nil
++}
++
+ func (d *Debugger) CreateEBPFTracepoint(fnName string) error {
+ 	d.targetMutex.Lock()
+ 	defer d.targetMutex.Unlock()
+@@ -1327,7 +1372,11 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
+ 	return state, err
+ }
+ 
+-func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread proc.Thread) error {
++// collectBreakpointInformation loads what apiThread's breakpoint asks
++// for. Its arguments and variables are those of frames[0] if frames is
++// not empty, the stack from the call of the function the breakpoint was
++// set on (see breakpointInlined), and else of the innermost call.
++func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread proc.Thread, frames []proc.Stackframe) error {
+ 	if apiThread.Breakpoint == nil || apiThread.BreakpointInfo != nil {
+ 		return nil
+ 	}
+@@ -1369,7 +1418,17 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
+ 		return nil
+ 	}
+ 
+-	s, err := proc.GoroutineScope(tgt, thread)
++	var s *proc.EvalScope
++	var err error
++	if g, gerr := proc.GetG(thread); gerr == nil && len(frames) > 0 {
++		threadID := 0
++		if g.Thread != nil {
++			threadID = g.Thread.ThreadID()
++		}
++		s = proc.FrameToScope(tgt, thread.ProcessMemory(), g, threadID, frames...)
++	} else {
++		s, err = proc.GoroutineScope(tgt, thread)
++	}
+ 	if err != nil {
+ 		var errNoGoroutine proc.ErrNoGoroutine
+ 		if errors.As(err, &errNoGoroutine) {

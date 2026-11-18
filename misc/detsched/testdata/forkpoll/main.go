@@ -3,8 +3,9 @@
 // license that can be found in the LICENSE file.
 
 // Forkpoll keeps a pipe registered with the network poller open in the
-// middle of its run, then a regular file, and fork mode must refuse to
-// fork while either is open.
+// middle of its run, and fork mode must refuse to fork while it is open;
+// then it creates a temporary file, and fork mode must refuse to fork from
+// then on.
 package main
 
 import (

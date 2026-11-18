@@ -864,8 +864,8 @@ func syscall_detStartProcess(argv0 string) {
 	systemstack(func() { detStrictOS(what, gp) })
 }
 
-// os_runtime_detFileOpen counts fd, a regular file package os opened,
-// and reports whether it did: a forked child shares the file and its
+// os_runtime_detFileOpen counts fd, a file package os opened, which os
+// uncounts unless it is a regular file, and reports whether it did: a forked child shares the file and its
 // offset with its parent and its siblings, so detForkCheck refuses to fork
 // while one is open. A simulated file is the simulation's, which forks
 // with the process.
@@ -891,6 +891,20 @@ func os_runtime_detOSRand() uint64 {
 	}
 	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
 		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+}
+
+// os_runtime_detWroteFS records that package os created a directory (fd
+// -1) or opened fd for writing, unless the simulation handled it: from then
+// on detForkCheck refuses to fork, since a forked child would share with
+// its parent and its siblings what is on the real file system, such as a
+// temporary directory and the files it writes there.
+//
+//go:linkname os_runtime_detWroteFS os.runtime_detWroteFS
+func os_runtime_detWroteFS(fd int) {
+	if fd >= 0 && detsimFD(uintptr(fd)) || fd < 0 && detsimNodeOf() != 0 {
+		return
+	}
+	atomic.Storeint32(&detFork.wroteFS, 1)
 }
 
 // os_runtime_detFileClose uncounts a file os_runtime_detFileOpen counted.
@@ -1818,6 +1832,7 @@ var detFork struct {
 	watchdog muintptr
 	pollOpen int32 // descriptors registered with the network poller
 	files    int32 // regular files package os has open (see os_runtime_detFileOpen)
+	wroteFS  int32 // package os wrote to the real file system (see os_runtime_detWroteFS)
 	security bool  // Security.framework was called (darwin); see detfork_darwin.go
 }
 

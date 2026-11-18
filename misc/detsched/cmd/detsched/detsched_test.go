@@ -472,6 +472,46 @@ func TestStops(t *testing.T) {
 	}
 }
 
+// A branchOutput is the part of a composer run's standard error that a
+// failing branch wrote, from its fault timeline on.
+type branchOutput struct {
+	text string
+	late bool // the timeline had failed before it forked the branch
+}
+
+// branchOutputs returns the output of each failing branch in a composer
+// run's standard error, by branch number. A branch is late when the first
+// assertion that failed in the timeline's fault timeline is in the
+// branch's too, which holds the timeline's events up to the fork.
+func branchOutputs(stderr string) map[string]branchOutput {
+	head := regexp.MustCompile(`(?m)^sim: fault timeline of (?:branch (\d+):|the timeline)`)
+	at := regexp.MustCompile(`(?m)^sim: \d+\.\d{9} \S+: assertion failed: .*$`)
+	hs := head.FindAllStringSubmatchIndex(stderr, -1)
+	timeline := stderr // the timeline's part: before the first fault timeline, or after its own
+	if len(hs) > 0 {
+		timeline = stderr[:hs[0][0]]
+	}
+	branches := map[string]string{}
+	for i, h := range hs {
+		end := len(stderr)
+		if i+1 < len(hs) {
+			end = hs[i+1][0]
+		}
+		if h[2] < 0 {
+			timeline = stderr[h[0]:end]
+		} else {
+			branches[stderr[h[2]:h[3]]] = stderr[h[0]:end]
+		}
+	}
+	first := at.FindString(timeline)
+	out := map[string]branchOutput{}
+	for n, text := range branches {
+		late := first != "" && slices.Contains(at.FindAllString(text, -1), first)
+		out[n] = branchOutput{text, late}
+	}
+	return out
+}
+
 // TestSimBranchInline checks that GODETBRANCH=N runs the Nth terminal
 // branch of a composer timeline in the process itself, as a debugger
 // needs: the composer's output for the failing forked branch of
@@ -502,21 +542,22 @@ func TestSimBranchInline(t *testing.T) {
 		if bm == nil {
 			continue
 		}
-		// The branch failed first unless the run's first failure is an
-		// anytime check's, in the timeline.
-		_, first, _ := strings.Cut(o.stderr, "detsched: assertion failed: ")
-		if !strings.HasPrefix(first, "compose: anytime") {
-			if m == nil {
-				env, forked, m = e, o, bm
-			}
-		} else if late == nil {
-			late = e
-			// The timeline's failure comes first, then the branch's
-			// output, after the timeline's report.
-			anytime := strings.Index(o.stderr, "detsched: assertion failed: compose: anytime")
-			branchTimeline := strings.Index(o.stderr, "sim: fault timeline of branch ")
-			if anytime < 0 || branchTimeline < anytime || !strings.Contains(o.stderr[branchTimeline:], "detsched: assertion failed: compose: finally") {
-				t.Errorf("%s: the timeline failed, but its branch's failure does not follow its report:\n%s", strings.Join(e, " "), o.stderr)
+		// The timeline writes its report before the output of a branch
+		// it forked after it had failed, which only an anytime check
+		// does, and after the output of the others.
+		branches := branchOutputs(o.stderr)
+		if b, ok := branches[bm[1]]; ok && !b.late && m == nil {
+			env, forked, m = e, o, bm
+		}
+		for _, b := range branches {
+			// (A late branch can fail with only the timeline's failure,
+			// which it does not print again; skip those.)
+			if late == nil && b.late && strings.Contains(b.text, "detsched: assertion failed: ") {
+				late = e
+				anytime := strings.Index(o.stderr, "detsched: assertion failed: compose: anytime")
+				if anytime < 0 || strings.Index(o.stderr, b.text) < anytime {
+					t.Errorf("%s: the timeline failed, but its branch's failure does not follow its report:\n%s", strings.Join(e, " "), o.stderr)
+				}
 			}
 		}
 	}
@@ -551,8 +592,16 @@ func TestSimBranchInline(t *testing.T) {
 	// search forks a cell's stopped program, writes the branch's output
 	// too: here, a child that goes on as the run did, from the timeline's
 	// last switch, writes what the run wrote.
-	traces := switchesField.FindAllStringSubmatch(forked.stderr, -1)
-	if len(traces) == 0 {
+	// Its trace line is the one no "detsched: branch" line follows: the
+	// output of another failing branch may come after it.
+	var last string
+	lines := strings.Split(forked.stderr, "\n")
+	for i, l := range lines {
+		if sm := switchesField.FindStringSubmatch(l); sm != nil && (i+1 == len(lines) || !strings.HasPrefix(lines[i+1], "detsched: branch ")) {
+			last = sm[1]
+		}
+	}
+	if last == "" {
 		t.Fatalf("no trace line of the timeline:\n%s", forked.stderr)
 	}
 	srv, err := startForkServer(command(bin, env...))
@@ -560,7 +609,7 @@ func TestSimBranchInline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.close()
-	if ok, err := srv.run(atou(traces[len(traces)-1][1]) - 1); !ok || err != nil {
+	if ok, err := srv.run(atou(last) - 1); !ok || err != nil {
 		t.Fatalf("run to the timeline's last switch: %v, %v", ok, err)
 	}
 	child, err := srv.branchOutcome(1|detBranchGoesOn, 0)

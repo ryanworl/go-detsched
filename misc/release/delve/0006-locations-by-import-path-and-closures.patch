@@ -1,0 +1,246 @@
+pkg/locspec, pkg/proc: files by import path, closures in closures
+
+A FILE:LINE location matches a suffix of a source file's path on disk,
+so a file of a package built from a directory whose path does not end
+in the package's import path, such as a module that go.mod replaces
+with a local directory, could not be named by its import path:
+
+	trace x github.com/tidewater-io/strata/collection.go:218
+
+said "not found" when go.mod had
+
+	replace github.com/tidewater-io/strata => ../strata
+
+and only a suffix of the path on disk worked, so command files differed
+between checkouts. BinaryInfo.PackageFileAliases lists each file of a Go
+package under the package's import path (from its compile unit, in the
+directory of the package's functions), and NormalLocationSpec.Find also
+matches those names. A file of an external test package, pkg_test, is
+listed under pkg too.
+
+A function location splits at dots into at most three parts, package,
+receiver and name, so the name of a closure in a closure, as stacks
+print it, did not parse:
+
+	trace x example.com/m/harness.TestReadYourWrites.func1.1
+
+said "location not found", as did pkg.F.func1.1 and F.func1.1 without
+the package. FuncLocationSpec.Suffix now holds such a name, and a
+function matches it when its full name is the name or ends with it
+after a '/' or a '.'.
+
+Both are generic fixes for upstream Delve.
+
+diff --git a/pkg/locspec/locations.go b/pkg/locspec/locations.go
+index c98103f..74b2b33 100644
+--- a/pkg/locspec/locations.go
++++ b/pkg/locspec/locations.go
+@@ -9,6 +9,7 @@ import (
+ 	"reflect"
+ 	"regexp"
+ 	"runtime"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -71,6 +72,12 @@ type FuncLocationSpec struct {
+ 	ReceiverName          string
+ 	PackageOrReceiverName string
+ 	BaseName              string
++
++	// Suffix is set for a name of three or more dotted parts, such as a
++	// closure's, pkg.F.func1.2, or a method's closure, (*T).M.func1:
++	// a function matches it as well when its full name is Suffix or ends
++	// with it after a '/' or a '.', as Delve prints the name.
++	Suffix string
+ }
+ 
+ // Parse will turn locStr into a parsed LocationSpec.
+@@ -211,9 +218,20 @@ func parseFuncLocationSpec(in string) *FuncLocationSpec {
+ 		spec.BaseName = v[2]
+ 		spec.ReceiverName = stripReceiverDecoration(v[1])
+ 		spec.PackageName = v[0]
++		if closureNameRegexp.MatchString(v[2]) {
++			// Perhaps a closure without its package, F.func1.2, or of
++			// a method, (*T).M.func1.
++			spec.Suffix = in
++		}
+ 
+ 	default:
+-		return nil
++		// A closure: package, function and the closure's numbers, or
++		// method and the closure's numbers. Only the full name says which
++		// part is which.
++		if strings.Contains(v[len(v)-1], "/") {
++			return nil
++		}
++		return &FuncLocationSpec{Suffix: in}
+ 	}
+ 
+ 	if strings.HasPrefix(spec.PackageName, "/") {
+@@ -228,6 +246,10 @@ func parseFuncLocationSpec(in string) *FuncLocationSpec {
+ 	return &spec
+ }
+ 
++// closureNameRegexp matches the last part of a closure's name, as in
++// pkg.F.func1, pkg.F.func1.2 and pkg.F.gowrap1.
++var closureNameRegexp = regexp.MustCompile(`^(func|gowrap|deferwrap)?[0-9]+$`)
++
+ func stripReceiverDecoration(in string) string {
+ 	if len(in) < 3 {
+ 		return in
+@@ -241,6 +263,18 @@ func stripReceiverDecoration(in string) string {
+ 
+ // Match will return whether the provided function matches the location spec.
+ func (spec *FuncLocationSpec) Match(sym *proc.Function, packageMap map[string][]string) bool {
++	if spec.Suffix != "" {
++		if s, abs := strings.CutPrefix(spec.Suffix, "/"); abs {
++			if sym.Name == s {
++				return true
++			}
++		} else if n := sym.Name; n == s || strings.HasSuffix(n, s) && (n[len(n)-len(s)-1] == '/' || n[len(n)-len(s)-1] == '.') {
++			return true
++		}
++		if spec.BaseName == "" {
++			return false
++		}
++	}
+ 	if spec.BaseName != sym.BaseName() {
+ 		return false
+ 	}
+@@ -394,6 +428,16 @@ func (loc *NormalLocationSpec) Find(t *proc.Target, processArgs []string, scope
+ 		}
+ 	}
+ 
++	// A file by its package's import path, wherever the package was built.
++	for _, alias := range t.BinInfo().PackageFileAliases() {
++		if len(candidateFiles) >= limit {
++			break
++		}
++		if loc.FileMatch(alias[0]) && !slices.Contains(candidateFiles, alias[1]) {
++			candidateFiles = append(candidateFiles, alias[1])
++		}
++	}
++
+ 	limit -= len(candidateFiles)
+ 
+ 	var candidateFuncs []string
+diff --git a/pkg/locspec/locations_test.go b/pkg/locspec/locations_test.go
+index 58aa6d2..9a5d140 100644
+--- a/pkg/locspec/locations_test.go
++++ b/pkg/locspec/locations_test.go
+@@ -2,6 +2,8 @@ package locspec
+ 
+ import (
+ 	"testing"
++
++	"github.com/go-delve/delve/pkg/proc"
+ )
+ 
+ func parseLocationSpecNoError(t *testing.T, locstr string) LocationSpec {
+@@ -66,6 +68,25 @@ func TestFunctionLocationParsing(t *testing.T) {
+ 	assertNormalLocationSpec(t, "github.com/go-delve/delve/pkg/proc.(*Process).Continue:10", NormalLocationSpec{"github.com/go-delve/delve/pkg/proc.(*Process).Continue", &FuncLocationSpec{PackageName: "github.com/go-delve/delve/pkg/proc", ReceiverName: "Process", BaseName: "Continue"}, 10})
+ 	assertNormalLocationSpec(t, "github.com/go-delve/delve/pkg/proc.Process.Continue:10", NormalLocationSpec{"github.com/go-delve/delve/pkg/proc.Process.Continue", &FuncLocationSpec{PackageName: "github.com/go-delve/delve/pkg/proc", ReceiverName: "Process", BaseName: "Continue"}, 10})
+ 	assertNormalLocationSpec(t, "github.com/go-delve/delve/pkg/proc.Continue:10", NormalLocationSpec{"github.com/go-delve/delve/pkg/proc.Continue", &FuncLocationSpec{PackageName: "github.com/go-delve/delve/pkg/proc", BaseName: "Continue"}, 10})
++
++	// Closures, matched by the end of the full name
++	assertNormalLocationSpec(t, "example.com/m/pkg.TestX.func1.1", NormalLocationSpec{"example.com/m/pkg.TestX.func1.1", &FuncLocationSpec{Suffix: "example.com/m/pkg.TestX.func1.1"}, -1})
++	assertNormalLocationSpec(t, "TestX.func1.2", NormalLocationSpec{"TestX.func1.2", &FuncLocationSpec{PackageName: "TestX", ReceiverName: "func1", BaseName: "2", Suffix: "TestX.func1.2"}, -1})
++}
++
++func TestClosureLocationMatch(t *testing.T) {
++	t.Parallel()
++	fn := &proc.Function{Name: "example.com/m/pkg.TestX.func1.1"}
++	for _, spec := range []string{"example.com/m/pkg.TestX.func1.1", "pkg.TestX.func1.1", "TestX.func1.1"} {
++		if !parseFuncLocationSpec(spec).Match(fn, nil) {
++			t.Errorf("%s does not match %s", spec, fn.Name)
++		}
++	}
++	for _, spec := range []string{"kg.TestX.func1.1", "TestX.func1.11", "TestY.func1.1"} {
++		if parseFuncLocationSpec(spec).Match(fn, nil) {
++			t.Errorf("%s matches %s", spec, fn.Name)
++		}
++	}
+ }
+ 
+ func assertSubstitutePathEqual(t *testing.T, expected string, substituted string) {
+diff --git a/pkg/proc/bininfo.go b/pkg/proc/bininfo.go
+index 46213cb..d96ef0f 100644
+--- a/pkg/proc/bininfo.go
++++ b/pkg/proc/bininfo.go
+@@ -68,6 +68,8 @@ type BinaryInfo struct {
+ 	// lookupGenericFunc maps function names, with their type parameters removed, to functions.
+ 	// Functions that are not generic are not added to this map.
+ 	lookupGenericFunc map[string][]*Function
++	// packageFileAliases caches PackageFileAliases.
++	packageFileAliases [][2]string
+ 
+ 	// SymNames maps addr to a description *elf.Symbol of this addr.
+ 	SymNames map[uint64]*elf.Symbol
+@@ -2763,6 +2765,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
+ 
+ 	bi.lookupFunc = nil
+ 	bi.lookupGenericFunc = nil
++	bi.packageFileAliases = nil
+ 
+ 	for _, cu := range image.compileUnits {
+ 		if cu.lineInfo != nil {
+@@ -2779,6 +2782,58 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
+ 	}
+ }
+ 
++// PackageFileAliases returns each source file of a Go package under the
++// package's import path, such as example.com/m/pkg/file.go, paired with
++// the file's path on disk, sorted by the first. A file of a package built
++// from a directory whose path does not end in the import path, such as
++// a module replaced by a local directory, is otherwise found only by its
++// path on disk. A file of an external test package, pkg_test, is also
++// listed under pkg.
++func (bi *BinaryInfo) PackageFileAliases() [][2]string {
++	if bi.packageFileAliases != nil {
++		return bi.packageFileAliases
++	}
++	dir := func(file string) string {
++		return file[:max(strings.LastIndexAny(file, `/\`), 0)]
++	}
++	// The package's directory is that of the first of its functions.
++	dirs := map[*compileUnit]string{}
++	for i := range bi.Functions {
++		fn := &bi.Functions[i]
++		cu := fn.cu
++		if cu == nil || !cu.isgo || cu.lineInfo == nil || fn.Entry == 0 || cu.name == "main" {
++			continue
++		}
++		if _, ok := dirs[cu]; ok {
++			continue
++		}
++		if !strings.HasPrefix(fn.Name, cu.name+".") && !strings.HasPrefix(fn.Name, escapePackagePath(cu.name)+".") {
++			continue
++		}
++		if f, _ := bi.pcToLine(fn, fn.Entry); f != "" && !strings.HasPrefix(f, "<") {
++			dirs[cu] = dir(f)
++		}
++	}
++	aliases := [][2]string{}
++	for cu, d := range dirs {
++		pkgs := []string{cu.name}
++		if p, ok := strings.CutSuffix(cu.name, "_test"); ok {
++			pkgs = append(pkgs, p)
++		}
++		for _, fe := range cu.lineInfo.FileNames {
++			if dir(fe.Path) != d {
++				continue
++			}
++			for _, p := range pkgs {
++				aliases = append(aliases, [2]string{p + "/" + fe.Path[len(d)+1:], fe.Path})
++			}
++		}
++	}
++	slices.SortFunc(aliases, func(a, b [2]string) int { return cmp.Or(cmp.Compare(a[0], b[0]), cmp.Compare(a[1], b[1])) })
++	bi.packageFileAliases = slices.Compact(aliases)
++	return bi.packageFileAliases
++}
++
+ // LookupGenericFunc returns a map that allows searching for instantiations of generic function by specifying a function name without type parameters.
+ // For example the key "pkg.(*Receiver).Amethod" will find all instantiations of Amethod:
+ //   - pkg.(*Receiver[.shape.int]).Amethod

@@ -404,7 +404,18 @@ refused anyway on optimized functions (`can not call optimized function`).
 - A line is `FILE:LINE`, matched as a path suffix. Lengthen the suffix
   when the name is ambiguous (`fs.go:183` matches io/fs too; use
   `sdk/sim/fs.go:183`), and include the module version for a dependency:
-  `break hashicorp/raft@v1.8.0/raft.go:288`.
+  `break hashicorp/raft@v1.8.0/raft.go:288`. In the bundled Delve, a file
+  also matches by its package's import path wherever the package was
+  built, so `trace x github.com/tidewater-io/strata/collection.go:218`
+  works for a module that go.mod `replace`s with a local directory, and
+  the same command file serves binaries built from different checkouts.
+  A stock Delve finds such a file only by a suffix of its path on disk.
+- A closure is `pkg.F.func1`, and a closure in a closure `pkg.F.func1.1`,
+  as stacks print them; a closure inlined into an inlined closure may be
+  named `pkg.F.func1.func1` instead: take the name from `funcs pkg.F.` or
+  a stack. A stock Delve finds only the first form and only without its
+  package (`F.func1`); the bundled one finds every form, with or without
+  the package's import path.
 - Read the line Delve prints when it sets a breakpoint. It names the
   function the address belongs to: a line inside a closure lands in
   `F.func1`, a line of an inlined function in its caller, and
@@ -415,7 +426,10 @@ refused anyway on optimized functions (`can not call optimized function`).
   was inlined into:
   `> goroutine(1): [a] go.etcd.io/bbolt.(*shared).AddReadonlyTXID(...) (inlined in go.etcd.io/bbolt.(*array).AddReadonlyTXID)`
   (in JSON, `func` and `inlined_in`). A stock Delve names only the
-  wrapper. `could not find statement`
+  wrapper. When calls were inlined into each other, as `(*T).Free`
+  calling `release` at its first statement, the bundled Delve names the
+  function the breakpoint was set on, and loads that call's arguments.
+  `could not find statement`
   means the line has no code (a declaration, a constant, a line the
   compiler folded into another); pick a nearby line with a statement.
 - A breakpoint that never stops is a claim to check, not evidence that the
@@ -427,6 +441,17 @@ refused anyway on optimized functions (`can not call optimized function`).
 - Name your breakpoints: `break NAME LOCATION`, then `cond NAME ...` and
   `on NAME ...`. With numbers, one `break` that fails shifts every later
   number, and the conditions attach to the wrong breakpoints.
+- An address stops for one breakpoint. Two functions share an address
+  when one is inlined into the other at its first statement, so after
+  `trace a pkg.(*T).Free`, `trace b pkg.(*T).release` leaves out the
+  addresses `a` has and says which:
+  `tracepoint b does not stop at 0x49a2a8, which tracepoint a has: ...`.
+  `b` still stops at its other call sites, and `a`'s stops at the shared
+  address show `release` in their stack (`on a stack 3`). When `a` has
+  every address, the error names it:
+  `Breakpoint exists at ...: tracepoint a on pkg.(*T).Free has it, ...`.
+  A stock Delve fails with a bare `Breakpoint exists` when the last
+  address is taken, even though it set the others.
 
 ## Read values in optimized code
 
@@ -472,13 +497,17 @@ continue
 Each hit prints a line
 `> goroutine(16): [pf] github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.(*disk).powerFail(...) at t25.380001899 s4265 k128779`
 followed by one line per `on` action; lines starting with `>>` are the
-function's returns. In the bundled Delve, returns follow the entry's
-condition: a return line prints only for a call whose entry printed,
-matched by goroutine and frame (a stock Delve prints every return). An
+function's returns, such as `>> goroutine(16): [pf] ...powerFail => ()`.
+In the bundled Delve, returns follow the entry's condition: a return line
+prints only for a call whose entry printed, matched by goroutine and
+frame, and carries the tracepoint's name (a stock Delve prints every
+return, without the name). An
 inlined copy of the function has no return to break at, so its hits print
 no return line.
 
 - `on` takes one expression; add one `on` line per value.
+- A `[]byte` prints as an array of numbers; `on NAME print string(b)` (or
+  `print string(b)` at a stop) prints it as text.
 - Goroutine IDs are the same in every replay. Find the goroutine in one
   run, then condition on it in the next: `cond NAME runtime.curg.goid == 1354`.
 - String comparisons work: `cond NAME c.name == "TestCompose"`, and
@@ -701,14 +730,14 @@ that printed it:
 | event | printed by | fields besides `cmd` and `src` |
 | --- | --- | --- |
 | `trace` | a tracepoint hit | `bp`, `hits`, `goroutine`, `func`, `inlined_in` (the function `func` was inlined into, when it was), `file`, `line`, `pc`, `pos`, and `args`, `vars` (one per `on ... print`), `stack`, `locals`, `goroutine_info` as its `on` actions ask |
-| `return` | a tracepoint's return, only for a call whose entry passed the condition | the same, with `ret` |
+| `return` | a tracepoint's return, only for a call whose entry passed the condition | the same, with `ret`; `bp` is the tracepoint's name, as on its `trace` records |
 | `break` | a stop at a breakpoint | as `trace` |
 | `watch` | a stop at a watchpoint | as `trace`, with `expr` |
 | `stop` | a stop elsewhere (`next`, `step`, `restart` to a point, `rewind`) | `goroutine`, `func`, `file`, `line`, `pc`, `pos` |
 | `value` | `print` | `expr`, `type`, `value` |
 | `args`, `locals` | `args`, `locals` | `vars`: `name`, `type`, `value` |
 | `stack` | `stack` | `frames`: `n`, `func`, `file`, `line`, `pc` |
-| `goroutines` | `goroutines` | `goroutines`: `id`, `user`, `current`, `go`, `start` locations, `node`, `node_state`, `wait`, `thread`, `labels` |
+| `goroutines` | `goroutines` | `goroutines`: `id`, `user`, `current`, `go`, `start` locations, `node`, `node_state`, `wait`, `thread`, `labels`, and with `-t N` `frames` as in `stack`; `-exec CMD` then prints CMD's records for each goroutine |
 | `exit` | the program's exit | `pid`, `status`, `trace` |
 | `error` | a command that failed | `error` |
 | `output` | any other text Delve prints | `text` |

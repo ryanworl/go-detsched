@@ -56,7 +56,7 @@ const (
 	detForkBadFDs      = 6 // the command did not carry the descriptors its flags call for
 	detForkCloneFailed = 7
 	detForkSecurity    = 8 // the system's certificate verifier was used (darwin)
-	detForkFiles       = 9 // regular files are open
+	detForkFiles       = 9 // regular files are open, or it wrote to the real file system
 )
 
 // detForkInit sets s, GODETSEARCH's fork field, as the driver's control
@@ -177,7 +177,7 @@ func detForkCheck() uint64 {
 	if detFork.security {
 		return detForkSecurity
 	}
-	if atomic.Loadint32(&detFork.files) != 0 {
+	if atomic.Loadint32(&detFork.files) != 0 || atomic.Loadint32(&detFork.wroteFS) != 0 {
 		return detForkFiles
 	}
 	// An M that just gave up the P, such as one that handed it to a
@@ -205,7 +205,7 @@ func detForkWhy(r uint64) string {
 	case detForkSecurity:
 		return "the system's certificate verifier was used"
 	case detForkFiles:
-		return "regular files are open, which a fork would share with this process"
+		return "it uses the real file system, which a fork would share with this process"
 	}
 	return "unknown reason"
 }
@@ -423,8 +423,20 @@ func detsimBranch(msg string) int {
 		if share != nil {
 			detOutTakeBranch(share, detBranchN, detSDK.failures > 0)
 		}
-		n := string(itoa(nbuf[:], uint64(detBranchN)))
-		detSDKAssert(detAssertAlways, false, msg, "branch "+n+what+string(itoa(buf[:], code))+" (GODETBRANCH="+n+" runs it in place)")
+		// Build the details on the stack: a heap allocation here, which a
+		// replay with GODETBRANCH does not make, would move every later
+		// allocation, and with it the schedule of a program whose work
+		// depends on heap addresses.
+		n := itoa(nbuf[:], uint64(detBranchN))
+		var d [96]byte
+		k := copy(d[:], "branch ")
+		k += copy(d[k:], n)
+		k += copy(d[k:], what)
+		k += copy(d[k:], itoa(buf[:], code))
+		k += copy(d[k:], " (GODETBRANCH=")
+		k += copy(d[k:], n)
+		k += copy(d[k:], " runs it in place)")
+		detSDKAssert(detAssertAlways, false, msg, unsafe.String(&d[0], k))
 	}
 	return 0
 }

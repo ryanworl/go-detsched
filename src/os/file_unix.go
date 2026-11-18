@@ -68,10 +68,10 @@ type file struct {
 	detFile     bool                    // whether the runtime counts this regular file (GOEXPERIMENT=detsched)
 }
 
-// runtime_detFileOpen counts fd, a regular file just opened, under
-// GOEXPERIMENT=detsched, and reports whether it did; the runtime does not
-// fork while a counted file is open. runtime_detFileClose uncounts one.
-// They are provided by the runtime.
+// runtime_detFileOpen counts fd, a file just opened, under
+// GOEXPERIMENT=detsched, unless it is a simulated one, and reports whether
+// it did; the runtime does not fork while a counted file is open.
+// runtime_detFileClose uncounts one. They are provided by the runtime.
 func runtime_detFileOpen(fd int) bool
 func runtime_detFileClose()
 
@@ -213,12 +213,16 @@ func newFile(fd int, name string, kind newFileKind, nonBlocking bool) *File {
 		}
 	}
 
-	if goexperiment.DetSched && kind == kindOpenFile {
+	if goexperiment.DetSched && kind == kindOpenFile && runtime_detFileOpen(fd) {
+		// Counted; uncount it unless it is a regular file. (A simulated
+		// file is never counted, nor asked for its type, which would be
+		// a call into the simulation the run did not make before.)
 		var st syscall.Stat_t
-		if err := ignoringEINTR(func() error {
+		err := ignoringEINTR(func() error {
 			return syscall.Fstat(fd, &st)
-		}); err == nil && st.Mode&syscall.S_IFMT == syscall.S_IFREG {
-			f.detFile = runtime_detFileOpen(fd)
+		})
+		if f.detFile = err == nil && st.Mode&syscall.S_IFMT == syscall.S_IFREG; !f.detFile {
+			runtime_detFileClose()
 		}
 	}
 
@@ -307,6 +311,9 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 		syscall.CloseOnExec(r)
 	}
 
+	if goexperiment.DetSched && flag&(O_WRONLY|O_RDWR|O_CREATE|O_TRUNC|O_APPEND) != 0 {
+		runtime_detWroteFS(r)
+	}
 	f := newFile(r, name, kindOpenFile, unix.HasNonblockFlag(flag))
 	f.pfd.SysFile = s
 	return f, nil

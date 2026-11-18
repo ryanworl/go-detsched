@@ -13,7 +13,11 @@
 // runtime-counted hit count stops at the hit stock Delve's counting does.
 // On a small program of its own, promoted, they check that the hits of a
 // method inlined into compiler-generated wrappers name the method, and
-// that a conditional tracepoint's returns follow its condition.
+// that a conditional tracepoint's returns follow its condition and carry
+// its name. On replaced, a program using a module replaced by a local
+// directory, they check locations: a file by its import path, a closure
+// in a closure, a method inlined at an address another tracepoint has,
+// and the frames of goroutines -t in JSON.
 //
 // $DLV names the dlv to test; the default is dlv next to go. gate.bash
 // runs them when the tree has bin/dlv:
@@ -432,7 +436,7 @@ exit
 	}
 	for _, f := range []struct{ name, entry string }{{"work", `\[w\] main\.work\(3\)`}, {"depth", `\[d\] main\.depth\(2\)`}} {
 		entries := regexp.MustCompile(`(?m)^> goroutine\((\d+)\): `+f.entry+`$`).FindAllStringSubmatch(out, -1)
-		returns := regexp.MustCompile(`(?m)^>> goroutine\((\d+)\): main\.`+f.name+` => `).FindAllStringSubmatch(out, -1)
+		returns := regexp.MustCompile(`(?m)^>> goroutine\((\d+)\): \[`+f.name[:1]+`\] main\.`+f.name+` => `).FindAllStringSubmatch(out, -1)
 		if len(entries) != 1 || len(returns) != 1 || entries[0][1] != returns[0][1] {
 			t.Errorf("%s: got entries %q and returns %q, want one of each on the same goroutine:\n%s", f.name, entries, returns, out)
 		}
@@ -448,10 +452,112 @@ exit
 				inlined++
 			}
 		case "return":
+			// The tracepoint's name, as on its entries.
+			if bp := r.str("bp"); bp != "w" && bp != "d" || !strings.HasSuffix(r.str("func"), "."+map[string]string{"w": "work", "d": "depth"}[bp]) {
+				t.Errorf("JSON return record: %v", r)
+			}
 			rets++
 		}
 	}
 	if inlined != 4 || rets != 2 {
 		t.Errorf("dlv --json: %d hits of a with inlined_in, want 4; %d returns, want 2", inlined, rets)
+	}
+}
+
+func TestLocations(t *testing.T) {
+	dlv := dlvPath(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "app")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "replaced/app"
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	run := func(script string, flags ...string) string {
+		path := filepath.Join(dir, "script.dlv")
+		if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		args := append([]string{"exec", bin, "-r", "stdout:" + filepath.Join(dir, "prog.out"), "--init", path, "--allow-non-terminal-interactive=true"}, flags...)
+		out, err := exec.Command(dlv, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("dlv %q: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+
+	// Put's first line by the replaced module's import path; the closure
+	// in a closure, in a module path with dots; Free, into which release
+	// is inlined at Free's first statement, and then release, which Drop
+	// also calls.
+	script := `trace p github.com/tidewater-io/strata/collection.go:13
+trace c github.com/tidewater-io/strata.Visit.func1.1
+trace f strata.(*Set).Free
+trace r strata.(*Set).release
+continue
+exit
+`
+	out := run(script)
+	for _, want := range []string{
+		`(?m)^Tracepoint p set at .* for github\.com/tidewater-io/strata\.Put\(\) `,
+		`(?m)^Tracepoint c set at .* for github\.com/tidewater-io/strata\.Visit\.func1\.1\(\) `,
+		`(?m)^\ttracepoint r does not stop at 0x[0-9a-f]+, which tracepoint f has: `,
+	} {
+		if !regexp.MustCompile(want).MatchString(out) {
+			t.Errorf("no match for %s:\n%s", want, out)
+		}
+	}
+	for _, c := range []struct {
+		re string
+		n  int
+	}{
+		{`\[p\] github\.com/tidewater-io/strata\.Put\(\d\)`, 3},
+		{`\[c\] github\.com/tidewater-io/strata\.Visit\.func1\.1\(\d\)`, 3},
+		{`\[f\] github\.com/tidewater-io/strata\.\(\*Set\)\.Free\(.*\) \(inlined in main\.main\)`, 2},
+		{`\[r\] github\.com/tidewater-io/strata\.\(\*Set\)\.release\(.*\) \(inlined in main\.main\)`, 1},
+	} {
+		if n := len(regexp.MustCompile(`(?m)^> goroutine\(1\): `+c.re+`$`).FindAllString(out, -1)); n != c.n {
+			t.Errorf("got %d lines matching %s, want %d:\n%s", n, c.re, c.n, out)
+		}
+	}
+
+	hits := map[string]int{}
+	for _, r := range parseJSON(t, run(script, "--json")) {
+		if e := r.str("event"); e == "trace" || e == "return" {
+			hits[e+" "+r.str("bp")+" "+r.str("func")]++
+		}
+	}
+	const strata = "github.com/tidewater-io/strata."
+	want := map[string]int{
+		"trace p " + strata + "Put":            3,
+		"trace c " + strata + "Visit.func1.1":  3,
+		"return c " + strata + "Visit.func1.1": 3,
+		"trace f " + strata + "(*Set).Free":    2,
+		"trace r " + strata + "(*Set).release": 1,
+	}
+	if fmt.Sprint(hits) != fmt.Sprint(want) {
+		t.Errorf("dlv --json: got hits %v, want %v", hits, want)
+	}
+
+	// goroutines -t: each goroutine's frames.
+	var gs []any
+	for _, r := range parseJSON(t, run("break strata.Put\ncontinue\ngoroutines -t 3\nexit -k\n", "--json")) {
+		if r.str("event") == "goroutines" {
+			gs, _ = r["goroutines"].([]any)
+		}
+	}
+	found := false
+	for _, g := range gs {
+		frames, _ := g.(map[string]any)["frames"].([]any)
+		if len(frames) == 0 {
+			t.Errorf("goroutine without frames: %v", g)
+			continue
+		}
+		if f, _ := frames[min(1, len(frames)-1)].(map[string]any); f["func"] == strata+"Visit.func1.1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("goroutines -t 3 --json: no goroutine called Put from Visit.func1.1: %v", gs)
 	}
 }

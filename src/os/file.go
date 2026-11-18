@@ -46,6 +46,7 @@ package os
 import (
 	"errors"
 	"internal/filepathlite"
+	"internal/goexperiment"
 	"internal/poll"
 	"internal/testlog"
 	"io"
@@ -56,6 +57,13 @@ import (
 	"time"
 	"unsafe"
 )
+
+// runtime_detWroteFS tells the runtime, under GOEXPERIMENT=detsched, that
+// the program created a directory (fd -1) or opened fd for writing, which
+// it ignores for the simulation's files; the runtime then no longer forks,
+// since forked runs would share what is on the real file system. It is
+// provided by the runtime.
+func runtime_detWroteFS(fd int)
 
 // Name returns the name of the file as presented to Open.
 //
@@ -332,6 +340,9 @@ func Mkdir(name string, perm FileMode) error {
 
 	if e != nil {
 		return &PathError{Op: "mkdir", Path: name, Err: e}
+	}
+	if goexperiment.DetSched {
+		runtime_detWroteFS(-1)
 	}
 
 	// mkdir(2) itself won't handle the sticky bit on *BSD and Solaris
