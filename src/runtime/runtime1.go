@@ -335,6 +335,7 @@ var debug struct {
 	profstackdepth           int32
 	dataindependenttiming    int32
 	dettrace                 int32 // GOEXPERIMENT=detsched only; see detsched.go
+	dettimeline              int32 // GOEXPERIMENT=detsched only; see detsimFailLog
 
 	// debug.malloc is used as a combined debug check
 	// in the malloc function and should be set
@@ -369,6 +370,7 @@ var dbgvars = []*dbgVar{
 	{name: "dataindependenttiming", value: &debug.dataindependenttiming},
 	{name: "decoratemappings", value: &debug.decoratemappings, def: 1},
 	{name: "dettrace", value: &debug.dettrace},
+	{name: "dettimeline", value: &debug.dettimeline},
 	{name: "disablethp", value: &debug.disablethp},
 	{name: "dontfreezetheworld", value: &debug.dontfreezetheworld},
 	{name: "checkfinalizers", value: &debug.checkfinalizers},

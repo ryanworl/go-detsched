@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched20
+v=go1.27.4-detsched21
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -423,10 +423,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched20:
+and release N's version is v0.N.0, so with go1.27.4-detsched21:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.20.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.21.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
@@ -438,11 +438,12 @@ with stock Go. `go doc -all` on each documents its API.
   failing assertion is reported once at exit, as
   `detsched: assertion failed: MESSAGE DETAILS (and N more failures)`,
   with its first failure's details formatted as `map[k:v ...]`, sorted by
-  key, a value with a space quoted; a breakpoint on
-  `runtime.detAssertFailed` stops at every failure. A test during which
-  one failed fails too, so that its log is printed, and a run that would
-  exit with status 0 exits with status 3. `assert.Failures` counts the
-  failures so far.
+  key, a value with a space quoted, then where the first one failed,
+  with the `GODETSTOP=kN:dump` that prints every goroutine's stack there;
+  a breakpoint on `runtime.detAssertFailed` stops at every failure. A
+  test during which one failed fails too, so that its log is printed, and
+  a run that would exit with status 0 exits with status 3.
+  `assert.Failures` counts the failures so far.
 - `buggify`, after FoundationDB's BUGGIFY: `buggify.On("site")` marks a
   place to inject a fault. Each run enables a quarter of the sites (swarm
   testing), and an enabled site fires a quarter of the time. `Disable`
@@ -489,7 +490,8 @@ crash, stop, pause, disk fault, clock skip, and nemesis fault, and the
 first failure of each assertion while the world exists, under the node
 whose goroutine failed it (`world` for no node), with the simulated time
 since the World was created, such as `sim: 12.004000000 n1: power
-failure`. A passing run prints none of it.
+failure`. A passing run prints none of it, unless `GODEBUG=dettimeline=1`
+is set, as on a passing seed's replay line to check what the harness did.
 
 - **Network.** Every write becomes segments that arrive after a latency
   drawn from the fault stream, in order on their connection. Links have a
@@ -578,9 +580,9 @@ failure`. A passing run prints none of it.
   stack go to the run's log (`sim: node NAME panicked: ...`), the timeline
   says `NODE: panicked: MESSAGE`, and the summary counts each kind of
   panic, `sim.PanicKind(msg, stack)`: the message's first line, numbers
-  masked, and the innermost function outside the runtime. `OnPanic` gets
-  the node, the message, and the stack, to tell a crash the system meant
-  from a bug; failing `assert.Unreachable("node panicked: "+
+  masked, and the innermost function outside the runtime where it first
+  panicked. `OnPanic` gets the node, the message, and the stack, to tell a
+  crash the system meant from a bug; failing `assert.Unreachable("node panicked: "+
   sim.PanicKind(msg, stack), ...)` makes a group per kind of panic.
   Fatal errors the runtime cannot attribute to user code, such as
   `concurrent map writes`, still end the program.

@@ -203,7 +203,6 @@ type search struct {
 	lru         []*cell      // cells with stopped programs, least recently used first
 	pool        []*cell      // setup roots
 	claimed     map[int]bool // new features of plain runs' cells not stopped yet
-	kept        int          // cells when the search ended
 	lowMem      bool         // memory ran low, which has been reported
 	baseTrace   string       // the trace line of the base run, seed 1
 	unstable    string       // how seed 1 ran two schedules, or ""
@@ -706,11 +705,16 @@ func (s *search) buildDebug(ctx context.Context) {
 	case errors.Is(err, errCanceled):
 	case err != nil:
 		s.debugNote = fmt.Sprintf("building or running it without optimizations failed: %v", truncate(err.Error(), 500))
+		s.notice("debug lines run the optimized binary: building or running it without optimizations failed")
 	case r.trace() != s.baseTrace:
 		s.debugNote = fmt.Sprintf("its build without optimizations (-gcflags=all=-N -l) ran seed 1 on another schedule three times (%s, not %s), as a program that reads its own stacks or whose work depends on heap addresses does", strings.TrimPrefix(r.trace(), "detsched: "), strings.TrimPrefix(s.baseTrace, "detsched: "))
+		s.notice("debug lines run the optimized binary: its build without optimizations runs another schedule")
 	default:
 		s.debugBin = bin
 		s.printf("detsched: debug lines from here on run %s, built without optimizations (-gcflags=all=-N -l), which runs the same schedules and in which dlv reads every local\n", bin)
+		for _, g := range s.groups {
+			s.printf("\tgroup %d (%s): %s\n", g.index, g.msg(), s.debugLine(g))
+		}
 	}
 }
 
@@ -1511,13 +1515,11 @@ func (s *search) fallbacks() []fallback {
 			"their replay lines may not reproduce them",
 			"run a replay line and check that its trace line equals the first one in the log")
 	}
-	if len(s.groups) > 0 && s.debugBin == "" {
+	// With -exec, the user built the binary, and the debug line runs it.
+	if len(s.groups) > 0 && s.debugBin == "" && s.built {
 		why, fix := s.debugNote, "debug the optimized binary: read values at function entries, where arguments are readable"
 		if why == "" {
 			why = "the build without optimizations was not ready when the search ended"
-			if !s.built {
-				why = "-exec gave a binary, so detsched built none without optimizations"
-			}
 			fix = "build the same source with -gcflags='all=-N -l' and put it in place of the binary on the debug line (see delve.md)"
 		}
 		add("debug-lines-run-the-optimized-binary", "debug lines run the optimized binary: "+why,
@@ -1578,7 +1580,11 @@ func (s *search) summary(w io.Writer, final bool) {
 	fmt.Fprintf(w, "detsched: %s: %s\n", s.pkg, s.status())
 	if fs := s.fallbacks(); len(fs) > 0 {
 		docs := docsPath()
-		fmt.Fprintf(w, "\nWARNING: %d fallbacks limited this search; each costs what it says until fixed:\n", len(fs))
+		what := fmt.Sprintf("%d fallbacks", len(fs))
+		if len(fs) == 1 {
+			what = "1 fallback"
+		}
+		fmt.Fprintf(w, "\nWARNING: %s limited this search; each costs what it says until fixed:\n", what)
 		for _, f := range fs {
 			fmt.Fprintf(w, "  - %s\n    cost: %s\n    fix:  %s\n    docs: %s#%s\n", f.what, f.cost, f.fix, docs, f.anchor)
 		}
@@ -1594,12 +1600,14 @@ func (s *search) summary(w io.Writer, final bool) {
 		}
 	}
 	if len(mix) > 0 {
-		fmt.Fprintf(w, "detsched: runs started: %s; %d cells kept; features count %s\n", strings.Join(mix, ", "), s.kept, s.novelty)
+		fmt.Fprintf(w, "detsched: runs started: %s; %d cells kept; features count %s\n", strings.Join(mix, ", "), len(s.cells), s.novelty)
 	}
 	if len(s.vars) > 0 {
 		fmt.Fprintf(w, "detsched: replay lines set these variables of detsched's environment, which the schedule depends on: %s\n", strings.Join(s.vars, " "))
 	}
-	if len(s.predicted) > 0 {
+	if len(s.predicted) > 0 && s.directed[1] == 0 {
+		fmt.Fprintf(w, "detsched: %d lock orders predicted a deadlock, and none of the %d runs directed at them failed, so they are likely false alarms (a freed lock's memory reused for another)\n", len(s.predicted), s.directed[0])
+	} else if len(s.predicted) > 0 {
 		fmt.Fprintf(w, "detsched: lock orders that predict a deadlock, at which %d runs were directed, %d of which failed (a prediction no directed run fails is likely a false alarm: a freed lock's memory reused for another):\n", s.directed[0], s.directed[1])
 		for _, p := range s.predicted {
 			fmt.Fprintf(w, "\t%s\n", p)

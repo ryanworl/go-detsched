@@ -869,7 +869,6 @@ func (s *search) waitMem(ctx context.Context) {
 // roots' process groups.
 func (s *search) closeAll() {
 	s.mu.Lock()
-	s.kept = len(s.cells)
 	var ps []*proc
 	for _, c := range append(slices.Clone(s.lru), s.pool...) {
 		if c.proc != nil {

@@ -344,7 +344,9 @@ Each costs a replay up to the point: under a second for
 
 ## Tracepoints
 
-A tracepoint prints and continues, so one `continue` prints every hit:
+A tracepoint prints and continues, so one `continue` prints every hit.
+Use it, not `break` with `on` actions, to log values: a breakpoint stops,
+prints a source listing at every hit, and needs one `continue` per stop.
 
 ```
 trace st example.com/kv/server.(*Store).apply

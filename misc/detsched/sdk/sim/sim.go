@@ -69,7 +69,7 @@
 // A run that fails prints the fault timeline after its output: when each
 // node started, crashed, stopped, paused, and lost data, each disk fault,
 // each clock skip, and each fault of a Nemesis, with the simulated time.
-// A run that passes prints none of it.
+// A run that passes prints none of it, unless GODEBUG=dettimeline=1.
 //
 // Create the World inside a synctest bubble, so that time is simulated,
 // and close it before the bubble ends. The package exists on Linux on
@@ -138,6 +138,7 @@ type World struct {
 	failed map[string]bool        // assertions that failed, which the timeline shows
 	quiet  int64                  // no buggify faults before then (calm)
 	setup  bool                   // true until setup completes (see calm)
+	sites  bool                   // a fault site was reached, in setup or after (see fault)
 
 	fds map[int]*fdesc
 
@@ -287,13 +288,16 @@ func (w *World) endSetup() {
 // of its message, with numbers masked, and the innermost function outside
 // the runtime that panicked, such as "index out of range [N] with length
 // N in example.com/kv.(*log).at": an assertion message per kind of panic,
-// which the detsched command makes a group of.
+// which the detsched command makes a group of. A panic a deferred call
+// recovered and panicked again, as sync.WaitGroup.Go does, is named by
+// where it first panicked.
 func PanicKind(msg string, stack []byte) string {
 	first, _, _ := strings.Cut(msg, "\n")
 	kind := maskNumbers(first)
 	lines := strings.Split(string(stack), "\n")
-	for i, l := range lines {
-		if !strings.HasPrefix(l, "panic(") {
+	// The outermost panic call on the stack is the first panic.
+	for i := len(lines) - 1; i >= 0; i-- {
+		if !strings.HasPrefix(lines[i], "panic(") {
 			continue
 		}
 		for _, f := range lines[i+1:] {
@@ -304,6 +308,7 @@ func PanicKind(msg string, stack []byte) string {
 				return kind + " in " + f
 			}
 		}
+		break
 	}
 	return kind
 }
@@ -373,8 +378,11 @@ func (w *World) Close() {
 	runtime_busyOn(false)
 	hook.AssertFailed = nil
 	hook.SetupComplete = nil
-	// The detsched command warns when no run got this far.
-	assert.Sometimes(!w.setup, "sim: setup completed, so the simulation injected faults", nil)
+	// The detsched command warns when no run got this far, if runs reach
+	// fault sites at all: a program that does no I/O has nothing to fault.
+	if w.sites {
+		assert.Sometimes(!w.setup, "sim: setup completed, so the simulation injected faults", nil)
+	}
 }
 
 // onPanic crashes the node of a goroutine that panicked, if the world's

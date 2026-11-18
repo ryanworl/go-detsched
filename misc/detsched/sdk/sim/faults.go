@@ -339,6 +339,9 @@ func normal(mean, dev time.Duration) int64 {
 // as the assertion msg, "fault: " and the site, by which the detsched
 // command's summary says in what share of each group's runs it fired.
 func fault(site, msg string, p float64) bool {
+	if world != nil {
+		world.sites = true
+	}
 	if calm() || !buggify.OnChance(site, p) {
 		return false
 	}

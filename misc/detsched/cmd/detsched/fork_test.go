@@ -433,7 +433,7 @@ func TestSearchReports(t *testing.T) {
 	if err := s.run(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	want := regexp.MustCompile(`\nWARNING: \d+ fallbacks limited this search.*\n  - seed 1 left the deterministic subset in 1 places, first: goroutine 1 starts a subprocess \(\S*/true\), whose timing comes from the OS, at s\d+ k\d+\n    cost: .*\n    fix:  .*seed-1\.log\n    docs: .*README\.md#seed-1-left-the-deterministic-subset\n`)
+	want := regexp.MustCompile(`\nWARNING: \d+ fallbacks? limited this search.*\n  - seed 1 left the deterministic subset in 1 places, first: goroutine 1 starts a subprocess \(\S*/true\), whose timing comes from the OS, at s\d+ k\d+\n    cost: .*\n    fix:  .*seed-1\.log\n    docs: .*README\.md#seed-1-left-the-deterministic-subset\n`)
 	if r := searchReport(s); len(s.left) != 1 || !want.MatchString(r) {
 		t.Errorf("%d reports, summary:\n%s\nwant 1, matching %s", len(s.left), r, want)
 	}

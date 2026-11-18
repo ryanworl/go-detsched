@@ -58,6 +58,27 @@ if [ "$n" != 0 ]; then
 	echo "gate: stock hello world has $n detsched symbols" >&2
 	exit 1
 fi
+
+# golang.org/x/sys/unix's Syscall6 is a NOSPLIT jump to syscall.Syscall6,
+# which adds a frame to the runtime's nosplit system call path; the debug
+# build detsched makes (all=-N -l) must still link.
+echo "gate: a build without optimizations that jumps to syscall.Syscall6 links"
+mkdir "$tmp/nosplit"
+cat >"$tmp/nosplit/main.go" <<'EOF'
+package main
+
+import "syscall"
+
+func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)
+
+func main() { Syscall6(syscall.SYS_GETPID, 0, 0, 0, 0, 0, 0) }
+EOF
+printf '#include "textflag.h"\nTEXT ·Syscall6(SB),NOSPLIT,$0-80\n\tJMP\tsyscall·Syscall6(SB)\n' >"$tmp/nosplit/stub_linux_amd64.s"
+printf '#include "textflag.h"\nTEXT ·Syscall6(SB),NOSPLIT,$0-80\n\tB\tsyscall·Syscall6(SB)\n' >"$tmp/nosplit/stub_linux_arm64.s"
+printf 'module nosplit\n' >"$tmp/nosplit/go.mod"
+for arch in amd64 arm64; do
+	(cd "$tmp/nosplit" && GOOS=linux GOARCH=$arch GOEXPERIMENT=detsched go build -gcflags='all=-N -l' -o /dev/null .)
+done
 if [ -x "$goroot/bin/dlv" ]; then
 	if [ "$(uname)" = Darwin ] && ! DevToolsSecurity -status 2>/dev/null | grep -q enabled; then
 		echo "gate: skipping the Delve tests: debugging needs developer mode (DevToolsSecurity -enable)"

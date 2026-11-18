@@ -366,11 +366,14 @@ func syscall_detsimSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr, raw bool) (r1, 
 		return
 	}
 	args := [6]uintptr{a1, a2, a3, a4, a5, a6}
-	ticks, q, last := detsimEnter()
 	systemstack(func() {
+		// On the system stack, where the caller's nosplit chain leaves
+		// room for them, as golang.org/x/sys/unix's jump to
+		// syscall.Syscall6 needs in a build without optimizations.
+		ticks, q, last := detsimEnter()
 		r1, r2, errno, ok = detsim.handler(node, trap, args)
+		detsimExit(ticks, q, last)
 	})
-	detsimExit(ticks, q, last)
 	if detG(gp).wait != 0 {
 		detsimWaitDevice(gp)
 	}
@@ -1277,9 +1280,10 @@ func detsimPrintStack(gp *g) {
 func detsimSetFailLog(p *[]byte) { detsim.failLog = p }
 
 // detsimFailLog writes the simulation's failure log if code, the exit
-// status, is nonzero. Called by detExit and detPanic.
+// status, is nonzero, or GODEBUG=dettimeline=1 asks for it, to show what a
+// passing run did. Called by detExit and detPanic.
 func detsimFailLog(code int) {
-	if p := detsim.failLog; p != nil && code != 0 {
+	if p := detsim.failLog; p != nil && (code != 0 || debug.dettimeline > 0) {
 		// A failed branch's output, with its own timeline, comes first.
 		switch {
 		case detBranchChild:

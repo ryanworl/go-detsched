@@ -4,7 +4,7 @@ A harness is a Go test in its own package that runs the system under test (SUT) 
 
 ## A library in one process
 
-When the SUT is a library called in one process, a `synctest.Test` with goroutines is the whole harness: every seed draws another interleaving. Draw the workload and options from the seed with `math/rand` or `sim.Intn`.
+When the SUT is a library called in one process, a `synctest.Test` with goroutines drives it: every seed draws another interleaving. Draw the workload and options from the seed with `math/rand` or `sim.Intn`.
 
 ```go
 func TestStore(t *testing.T) {
@@ -30,7 +30,7 @@ func TestStore(t *testing.T) {
 }
 ```
 
-If the library writes files, run it on one sim node instead, so that the search can fork it (it cannot fork a program that used the real file system) and so that crashes and disk faults reach it:
+Then run it on one sim node, even if it does no I/O. On a node, CPU work takes simulated time as on a real machine; outside one it is free, so a loop that re-arms a timer for "now" spins at one instant until the search stops it, where a real machine would move on. A node also lets the search fork a library that writes files (it cannot fork a program that used the real file system), and lets crashes and disk faults reach it:
 
 ```go
 w := sim.NewWorld(sim.Config{})
@@ -46,7 +46,7 @@ done := n.Start(func() {
 
 - A node runs nothing before `Start`. Crash it from the test body with `n.Kill()` (power failure) or `n.KillProcess()`, and `Start` it again to reopen its files.
 - Wait on the channel `Start` returns, not on a channel the node's code closes: a crash freezes the node's goroutines where they are.
-- Disk faults (failed fsyncs, read errors, a full disk) start once setup completes, at `lifecycle.SetupComplete` or the first fsync, so that opening the store does not fail on an injected error. Call `lifecycle.SetupComplete` where your setup ends.
+- Disk faults (failed fsyncs, read errors, a full disk) start once setup completes, at `lifecycle.SetupComplete` or the first fsync, so that opening the store does not fail on an injected error. Call `lifecycle.SetupComplete` where your setup ends, once every party is ready: after the server has accepted the client's connection, not when the client's dial returns, or a fault during the half-finished handshake fails runs the way the bug would.
 - A goroutine the library starts and its `Close` does not wait for fails the run with `blocked goroutines remain`; the summary names it. That is the SUT's behavior: wait for it in the harness (sleep past its timer after `Close`) so the search counts the bug you look for.
 
 ## A cluster

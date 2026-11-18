@@ -615,6 +615,13 @@ var detSDK struct {
 	all      [64 << 10]byte
 	allN     int
 	allCount int
+
+	// Where the first failure since base was: its bubble time (or -1),
+	// switch, tick, and goroutine.
+	first struct {
+		ns, s, k int64
+		goid     uint64
+	}
 }
 
 const detAllHeader = 8
@@ -638,6 +645,13 @@ func detSDKFailure(b []byte, msg, details string) int {
 //go:noinline
 func detAssertFailed(msg, details string) {
 	detSDK.failures++
+	if gp := getg(); detSDK.failures-detSDK.base == 1 && gp.m.p != 0 {
+		f := &detSDK.first
+		f.ns, f.s, f.k, f.goid = -1, int64(detP(gp.m.p.ptr()).switches), detTickNow(), gp.goid
+		if b := gp.bubble; b != nil {
+			f.ns = b.now - detBubbleStart
+		}
+	}
 	for i := 0; i < detSDK.allN; {
 		k := int(detSDK.all[i]) | int(detSDK.all[i+1])<<8
 		m := int(detSDK.all[i+2]) | int(detSDK.all[i+3])<<8
@@ -677,6 +691,7 @@ func testing_detAssertFailures() int { return detSDK.failures - detSDK.base }
 func detSDKBranch() {
 	detSDK.base = detSDK.failures
 	detSDK.allN, detSDK.allCount = 0, 0
+	detSDK.first.goid = 0
 }
 
 // detSDKAssert records an assertion of kind with message msg evaluated to
@@ -751,6 +766,15 @@ func detSDKReport() {
 	}
 	if n := detSDK.failures - detSDK.base - detSDK.allCount; n > 0 {
 		print("detsched: and ", n, " more assertion failures\n")
+	}
+	if f := &detSDK.first; f.goid != 0 {
+		print("detsched: the first assertion failed at t")
+		if f.ns >= 0 {
+			detPrintSeconds(f.ns)
+		} else {
+			print("-")
+		}
+		print(" s", f.s, " k", f.k, " goroutine ", f.goid, "; GODETSTOP=k", f.k, ":dump on its replay line prints every goroutine's stack there\n")
 	}
 	if !detFeed.on {
 		return

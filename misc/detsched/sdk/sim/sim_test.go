@@ -27,4 +27,22 @@ func TestPanicKind(t *testing.T) {
 	if kind != want {
 		t.Errorf("PanicKind = %q, want %q", kind, want)
 	}
+
+	// Recovered and panicked again, as sync.WaitGroup.Go does.
+	func() {
+		defer func() { kind = PanicKind(fmt.Sprint(recover()), debug.Stack()) }()
+		func() {
+			defer func() {
+				if x := recover(); x != nil {
+					panic(x)
+				}
+			}()
+			var m map[int]int
+			m[n] = 1
+		}()
+	}()
+	want = "assignment to entry in nil map in github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.TestPanicKind.func2.2"
+	if kind != want {
+		t.Errorf("PanicKind of a panic panicked again = %q, want %q", kind, want)
+	}
 }

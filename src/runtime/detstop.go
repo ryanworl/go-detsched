@@ -335,11 +335,7 @@ func detStopFire(gp *g, pc, sp uintptr) {
 		systemstack(func() {
 			print("detsched: stop ", i+1, " at t")
 			if b := gp.bubble; b != nil {
-				ns := b.now - detBubbleStart
-				print(ns/1e9, ".")
-				for d := int64(1e8); d > 0; d /= 10 {
-					print(ns / d % 10)
-				}
+				detPrintSeconds(b.now - detBubbleStart)
 			} else {
 				print("-")
 			}
@@ -356,6 +352,14 @@ func detStopFire(gp *g, pc, sp uintptr) {
 	detStopsNext()
 	if real := detTicksReal(); real > 0 {
 		detPutTicks(real)
+	}
+}
+
+// detPrintSeconds prints ns as seconds with nine decimals.
+func detPrintSeconds(ns int64) {
+	print(ns/1e9, ".")
+	for d := int64(1e8); d > 0; d /= 10 {
+		print(ns / d % 10)
 	}
 }
 
