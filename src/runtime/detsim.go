@@ -1339,6 +1339,28 @@ func detsimFatal(s string) {
 	runningPanicDefers.Add(n)
 }
 
+// detsimFault offers a fault at addr in a node's goroutine, which sigpanic
+// would end the program with, such as a read of memory a node's store
+// unmapped, to the simulation, as detsimFatal offers a fatal error: the
+// fault would end only the node's process.
+func detsimFault(addr uintptr) {
+	if detsim.panic == nil {
+		return
+	}
+	var buf [18]byte
+	i := len(buf)
+	for {
+		i--
+		buf[i] = "0123456789abcdef"[addr&15]
+		if addr >>= 4; addr == 0 {
+			break
+		}
+	}
+	i -= 2
+	buf[i], buf[i+1] = '0', 'x'
+	detsimFatalHook("unexpected fault address " + string(buf[i:]))
+}
+
 // detsimPanic offers an unrecovered panic on a node's goroutine to the
 // simulation, which may crash the node instead, freezing this goroutine;
 // otherwise it returns and the panic ends the program. Called by gopanic

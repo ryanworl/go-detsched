@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched16
+v=go1.27.4-detsched17
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -82,12 +82,18 @@ Flags, all optional:
 
 - `-run regexp` runs only the matching tests, as `go test -run` does.
 - `-duration d` stops after `d`; `-n N` stops after N runs, so that a CI job
-  checks the same N runs every time.
+  checks the same N runs every time. Either then runs seed 1 once more, to
+  check that its schedule has not changed, before the summary; SIGINT or
+  SIGTERM skips that run.
 - `-timeout d` (default 10m) stops a run that takes longer, with `SIGQUIT`,
   so that its log shows every goroutine, and counts it as a failure. The
   summary prints the slowest passing and failing runs to choose it from,
+  with the slowest passing run's replay line when it took 5 seconds or more,
   and the progress line counts the runs going on for over 10 times as long
   as the slowest passing run, which may hang, before `-timeout` stops them.
+  When seed 1 passes, a forked run that makes 1000 times its goroutine
+  switches is taken to spin and stopped sooner; the summary counts such runs
+  apart, not as failures, with the replay line of one.
 - `-p n` (default: one fewer than the number of CPUs) runs `n` programs at
   once. Lower it when each run takes enough memory that a run per CPU would
   make the machine swap. detsched and its runs run at nice 10, so a search
@@ -141,8 +147,9 @@ K:`), and goes on with the timeline's (`sim: fault timeline of the timeline
 The summary also lists the program's `assert.Sometimes` and
 `assert.Reachable` assertions with the runs each held in, those never true
 first, so that a search that passes still shows which paths it reached,
-and on one line each, the runs that reached each fault of the nemesis and
-each feature of the composer. An assertion counts as reached in a run if
+and on one line each, the runs that reached each fault of the nemesis,
+each feature of the composer, and each kind of node panic that
+`sim.Config.OnPanic` caught. An assertion counts as reached in a run if
 the run or any branch it forked reached it.
 An assertion that no run reached is not listed.
 
@@ -239,10 +246,10 @@ goroutine's stack there instead. It does not change the run.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched16:
+and release N's version is v0.N.0, so with go1.27.4-detsched17:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.16.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.17.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -398,7 +405,9 @@ it, so the replay command a failure prints shows the timeline again.
   `Node.SetNAT` puts a node behind a NAT, which `Node.Rebind` rebinds.
 - **Disk.** Writes stay in a page cache until fsync. With an ordered
   journal's semantics, fsync of any file commits the namespace. A killed
-  node loses everything unsynced. `mmap` of a file is a coherent copy. On
+  node loses everything unsynced. `mmap` of a file is a coherent copy: a
+  write or truncation through a descriptor shows through its mappings at
+  once, as the page cache does, also after a failed fsync. On
   Linux, the shared mappings of a file all map one memfd, so that a store
   through one shows through the others at once; on macOS each is a copy
   too. Stores to a shared writable mapping reach the file's page cache
@@ -450,7 +459,7 @@ it, so the replay command a failure prints shows the timeline again.
 - **Panics.** A panic on a node's goroutine ends the program, as a bug.
   With `Config.OnPanic`, it crashes only that node, as it would crash only
   that process on a real cluster, and so do runtime fatal errors raised by
-  user code and `os.Exit` (`log.Fatal`); `OnPanic` gets the node, the
+  user code, faults on unmapped memory, and `os.Exit` (`log.Fatal`); `OnPanic` gets the node, the
   message, and the stack, to tell a crash the system meant from a bug.
 - **Clock.** `SkipClock` moves every node's wall clock forward or back, on
   top of earlier skips. While a world exists, `time.Now` in the bubble

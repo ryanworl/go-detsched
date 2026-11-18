@@ -818,6 +818,8 @@ func TestSimFaults(t *testing.T) {
 			"the node ran during OnPanic: false",
 			"OnPanic: a: os.Exit(3)",
 			"after os.Exit on a: a up false, b up true",
+			"OnPanic: a: fatal error: unexpected fault address, in readUnmapped: true",
+			"after a fault on a: a up false, b up true",
 			"bind to the port of a refused connect: ok",
 			"dial twice from port 5000 to a closed port: " + refused + ", " + refused,
 			"the first read of a 64KiB write gets part of it: true ok",

@@ -191,9 +191,14 @@ func (s *search) prepare(ctx context.Context) error {
 		}
 		s.printf("%s", b.String())
 	}
-	m := switchesField.FindStringSubmatch(trace)
-	total := atou(m[1])
-	s.maxSwitches = 1000 * max(total, 1000)
+	// A run that makes 1000 times the switches of seed 1 spins, and is
+	// stopped. Seed 1 measures a whole run only if it passed: one that
+	// failed early would stop runs that are only longer, so then -timeout
+	// alone stops them.
+	if !base.failed() {
+		m := switchesField.FindStringSubmatch(trace)
+		s.maxSwitches = 1000 * max(atou(m[1]), 1000)
+	}
 	if m := setupLine.FindSubmatch(base.output); m != nil {
 		s.setup, s.stop = true, atou(string(m[1]))+1
 	}

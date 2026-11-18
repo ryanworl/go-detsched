@@ -35,13 +35,13 @@
 //     its states rather than only from where it ends. The mean time
 //     between branches is drawn for each timeline from 2 to 30 seconds.
 //     The timeline also runs the terminal phase itself when its drive
-//     phase ends. Once the timeline has failed, it forks no more
-//     branches, as each would fail the same way, so a symptom that only
-//     a terminal command checks is checked less often in a run that
-//     failed first some other way; check it in an Anytime command too to
-//     count it in every run. A branch that fails fails the run, and the failure it
+//     phase ends. A branch that fails fails the run, and the failure it
 //     reports comes first in the output, with the GODETBRANCH setting
-//     that replays the branch in one process, as a debugger needs. For an
+//     that replays the branch in one process, as a debugger needs. After
+//     the timeline has failed, branches still run, so that a terminal
+//     command shows the failure's symptoms: a branch reports only the
+//     assertions that fail in it, its output follows the timeline's
+//     report, and once one fails the timeline forks no more. For an
 //     Eventually command, the composer cancels the drivers' context,
 //     waits a second, and then kills the client nodes they run on, freezing
 //     whatever is still running: a goroutine of a client node may be
@@ -233,7 +233,10 @@ func (c *Composer) Singleton(name string, f func(*Ctx) error) { c.add(singleton,
 
 // Anytime registers a check that runs now and then during the drive
 // phase, alongside any driver, such as that a read reflects the last
-// acknowledged write. Once it fails, it runs no more in the timeline.
+// acknowledged write. The composer picks it as it picks a driver (see
+// Weight), so it runs hundreds of times in a timeline: keep it cheap, and
+// leave a check that reads every node's whole state to a Finally command.
+// Once it fails, it runs no more in the timeline.
 func (c *Composer) Anytime(name string, f func(*Ctx) error, opts ...Option) {
 	c.add(anytime, name, f, opts)
 }

@@ -660,6 +660,26 @@ func disk(w *sim.World, n *sim.Node) {
 	})
 }
 
+// readUnmapped reads a file's mapping after unmapping it, as a store that
+// unmaps a file while a reader holds a slice of it does, which faults.
+func readUnmapped() {
+	f, err := os.Create("/unmapped")
+	if err == nil {
+		err = f.Truncate(4096)
+	}
+	if err != nil {
+		logf("readUnmapped: %v", err)
+		return
+	}
+	m, err := syscall.Mmap(int(f.Fd()), 0, 4096, syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		logf("readUnmapped: %v", err)
+		return
+	}
+	syscall.Munmap(m)
+	logf("read after munmap: %d", m[0])
+}
+
 func readErr(name string) error {
 	_, err := os.ReadFile(name)
 	return err
@@ -674,7 +694,10 @@ func TestPanic(t *testing.T) {
 	}
 	synctest.Test(t, func(t *testing.T) {
 		spins := 0
-		w := sim.NewWorld(sim.Config{OnPanic: func(n *sim.Node, msg string, _ []byte) {
+		w := sim.NewWorld(sim.Config{OnPanic: func(n *sim.Node, msg string, stack []byte) {
+			if strings.HasPrefix(msg, "fatal error: unexpected fault address 0x") {
+				msg = fmt.Sprintf("fatal error: unexpected fault address, in readUnmapped: %v", bytes.Contains(stack, []byte("readUnmapped")))
+			}
 			logf("OnPanic: %s: %s", n.Name(), msg)
 			if msg == "while spinning" {
 				before := spins
@@ -726,6 +749,10 @@ func TestPanic(t *testing.T) {
 		a.Go(func() { os.Exit(3) }) // as log.Fatal does
 		time.Sleep(time.Second)
 		logf("after os.Exit on a: a up %v, b up %v", a.Up(), b.Up())
+		a.Start(func() {})
+		a.Go(readUnmapped)
+		time.Sleep(time.Second)
+		logf("after a fault on a: a up %v, b up %v", a.Up(), b.Up())
 		a.Start(func() {})
 		a.Go(func() {
 			for {

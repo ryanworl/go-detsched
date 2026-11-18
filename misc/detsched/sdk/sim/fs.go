@@ -355,7 +355,7 @@ func cloneEnts(m map[string]*inode) map[string]*inode {
 func (d *disk) sync(n *inode) uintptr {
 	d.wait(n)
 	if !n.dir && len(n.pending) > 0 && !calm() && buggify.OnChance("sim.disk.fsyncfail", 0.05) && !d.exempt(n) {
-		world.logEvent(d.nodeName(), "fsync failed (EIO), unsynced writes dropped")
+		world.logEvent(d.nodeName(), "fsync failed (EIO): unsynced writes stay readable, a power failure loses them")
 		n.pending = nil
 		n.errSeq++
 		d.syncFailed = true

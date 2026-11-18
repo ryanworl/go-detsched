@@ -2043,3 +2043,111 @@ func TestConsistentGoKindAndRuntimeType(t *testing.T) {
 		t.Logf("%d types checked\n", typesChecked)
 	}
 }
+
+// TestDetschedInlinedLowPC checks that under GOEXPERIMENT=detsched an
+// inlined call's low PC, where a debugger sets a breakpoint on the inlined
+// function, begins a statement of its body. The tick at a wrapper's entry
+// calls runtime.detPreempt on a rarely taken path, and the reloads after
+// that call used to take the position of the inlined body, so the
+// breakpoint was on them and almost never hit.
+func TestDetschedInlinedLowPC(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	mustHaveDWARF(t)
+	t.Parallel()
+
+	const prog = `package main
+
+import "os"
+
+type shared struct{ ids []int }
+
+func (s *shared) Add(id int) { s.ids = append(s.ids, id) }
+
+type I interface{ Add(int) }
+
+type a struct{ *shared }
+type b struct{ *shared }
+
+//go:noinline
+func use(i I) { i.Add(1) }
+
+func main() {
+	var i I = a{&shared{}}
+	if len(os.Args) > 5 {
+		i = b{&shared{}}
+	}
+	use(i)
+}
+`
+	dir := t.TempDir()
+	src := filepath.Join(dir, "test.go")
+	dst := filepath.Join(dir, "out.exe")
+	if err := os.WriteFile(src, []byte(prog), 0666); err != nil {
+		t.Fatal(err)
+	}
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", dst, src)
+	cmd.Env = append(cmd.Environ(), "GOEXPERIMENT=detsched")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	f, err := objfilepkg.Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	d, err := f.DWARF()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var cu *dwarf.Entry
+	n := 0
+	for r := d.Reader(); ; {
+		e, err := r.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e == nil {
+			break
+		}
+		switch e.Tag {
+		case dwarf.TagCompileUnit:
+			cu = e
+			if e.Val(dwarf.AttrName) != "main" {
+				r.SkipChildren()
+			}
+			continue
+		case dwarf.TagInlinedSubroutine:
+		default:
+			continue
+		}
+		ar := d.Reader()
+		ar.Seek(e.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset))
+		origin, err := ar.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if origin.Val(dwarf.AttrName) != "main.(*shared).Add" {
+			continue
+		}
+		ranges, err := d.Ranges(e)
+		if err != nil || len(ranges) == 0 {
+			t.Fatalf("ranges of an inlined main.(*shared).Add: %v %v", ranges, err)
+		}
+		lr, err := d.LineReader(cu)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var le dwarf.LineEntry
+		if err := lr.SeekPC(ranges[0][0], &le); err != nil {
+			t.Fatal(err)
+		}
+		if !le.IsStmt || le.Line != 7 {
+			t.Errorf("an inlined main.(*shared).Add starts at %#x, %s:%d, is_stmt %v; want the statement at line 7", ranges[0][0], le.File.Name, le.Line, le.IsStmt)
+		}
+		n++
+	}
+	if n < 2 {
+		t.Fatalf("found %d inlined calls of main.(*shared).Add, want one in each wrapper", n)
+	}
+}

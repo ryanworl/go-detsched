@@ -96,15 +96,20 @@ type Config struct {
 	// crash only that node, as KillProcess does, instead of the whole
 	// program, as a panic crashes only the node's process on a real
 	// cluster; so do fatal errors the runtime raises for user code, such
-	// as unlocking an unlocked mutex, and os.Exit, as log.Fatal calls it,
-	// with the message "os.Exit(<code>)". The panic is printed to
+	// as unlocking an unlocked mutex or a fault on unmapped memory
+	// ("fatal error: unexpected fault address 0x…"), and os.Exit, as
+	// log.Fatal calls it, with the message "os.Exit(<code>)". The panic is printed to
 	// standard error and reported as assert.Reachable("node panicked:
-	// <first line of the message>"), and then OnPanic is called with the
+	// <first line of the message>"), with its numbers written N so that
+	// one kind of panic is one assertion, and then OnPanic is called with the
 	// node, the message, and the goroutine's stack, so that a harness can
 	// tell a crash its system meant, which it ignores, from a bug, such as
 	// a nil pointer dereference, which it fails. The goroutine's deferred
 	// calls have run by then. Panics on goroutines of no node still end
-	// the program, and so does every panic without OnPanic.
+	// the program, and so does every panic without OnPanic, and every
+	// fatal error the runtime cannot attribute to user code, such as
+	// concurrent map writes: then OnPanic is not called, and the failure log holds
+	// the stacks and the fault timeline but no dump OnPanic would write.
 	OnPanic func(n *Node, msg string, stack []byte)
 }
 
@@ -242,6 +247,33 @@ func NewWorld(cfg Config) *World {
 }
 
 // assertFailed puts the first failure of each assertion in the fault
+// maskNumbers writes each number in s, decimal or 0x hexadecimal, as N.
+func maskNumbers(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		j := i
+		if strings.HasPrefix(s[i:], "0x") {
+			for j = i + 2; j < len(s) && strings.IndexByte("0123456789abcdefABCDEF", s[j]) >= 0; j++ {
+			}
+			if j == i+2 {
+				j = i
+			}
+		} else {
+			for j < len(s) && '0' <= s[j] && s[j] <= '9' {
+				j++
+			}
+		}
+		if j > i {
+			b.WriteByte('N')
+			i = j
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
 // timeline, under the node whose goroutine failed it.
 func (w *World) assertFailed(msg string) {
 	name, first := "world", false
@@ -303,7 +335,7 @@ func onPanic(node int32, v any) {
 	// frozen holding its lock.
 	syscall.Write(2, fmt.Appendf(nil, "sim: node %s panicked: %s\n\n%s\n", inc.node.name, msg, stack))
 	w.logEvent(inc.node.name, "panicked:", first)
-	assert.Reachable("node panicked: "+first, nil)
+	assert.Reachable("node panicked: "+maskNumbers(first), map[string]any{"panic": first})
 	w.cfg.OnPanic(inc.node, msg, stack)
 	inc.node.crash(true)
 }

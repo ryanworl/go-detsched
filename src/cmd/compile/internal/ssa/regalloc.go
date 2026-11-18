@@ -2534,6 +2534,11 @@ func (e *edgeState) setup(idx int, srcReg []endReg, dstReg []startReg, stacklive
 	for _, x := range dstReg {
 		dsts = append(dsts, dstRecord{&e.s.registers[x.r], x.v.ID, nil, x.pos})
 	}
+	if pos, ok := detCallPos(e.p); ok {
+		for i := range dsts {
+			dsts[i].pos = pos
+		}
+	}
 	// Phis need their args to end up in a specific location.
 	for _, v := range e.b.Values {
 		if v.Op != OpPhi {

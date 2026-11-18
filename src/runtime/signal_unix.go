@@ -930,6 +930,9 @@ func sigpanic() {
 		if gp.paniconfault {
 			panicmemAddr(gp.sigcode1)
 		}
+		if goexperiment.DetSched {
+			detsimFault(gp.sigcode1) // may crash only the goroutine's node
+		}
 		print("unexpected fault address ", hex(gp.sigcode1), "\n")
 		throw("fault")
 	case _SIGSEGV:
@@ -939,6 +942,9 @@ func sigpanic() {
 		// Support runtime/debug.SetPanicOnFault.
 		if gp.paniconfault {
 			panicmemAddr(gp.sigcode1)
+		}
+		if goexperiment.DetSched {
+			detsimFault(gp.sigcode1) // may crash only the goroutine's node
 		}
 		if inUserArenaChunk(gp.sigcode1) {
 			// We could check that the arena chunk is explicitly set to fault,

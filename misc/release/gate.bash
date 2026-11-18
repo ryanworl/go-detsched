@@ -10,6 +10,8 @@
 #   - the detsched command's tests;
 #   - the runtime, testing/synctest, internal/godebug and sync tests with
 #     GOEXPERIMENT=detsched, in -short mode;
+#   - the linker's check that a debugger's breakpoint on an inlined call
+#     is on its hot path with GOEXPERIMENT=detsched;
 #   - a stock hello world has no detsched symbols.
 #
 # Usage: misc/release/gate.bash [GOROOT]
@@ -35,6 +37,9 @@ echo "gate: detsched command tests"
 
 echo "gate: runtime tests with GOEXPERIMENT=detsched"
 GOEXPERIMENT=detsched go test -short -count=1 runtime testing/synctest internal/godebug sync
+
+echo "gate: debug info of inlined calls with GOEXPERIMENT=detsched"
+go test -count=1 -run '^TestDetsched' cmd/link/internal/ld
 
 echo "gate: stock hello world has no detsched symbols"
 tmp=$(mktemp -d)

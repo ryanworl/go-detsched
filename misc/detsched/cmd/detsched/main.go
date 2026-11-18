@@ -107,16 +107,18 @@ func main() {
 	s.live = isTerminal(os.Stderr)
 	lowerPriority()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signals.Done()
+		stop() // a second interrupt kills detsched
+	}()
+	s.signals = signals
+	ctx := signals
 	if *duration > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, *duration)
 		defer cancel()
 	}
-	go func() {
-		<-ctx.Done()
-		stop() // a second interrupt kills detsched
-	}()
 	err = s.run(ctx, *seeds)
 	s.summary(os.Stdout)
 	s.writeSummary()
@@ -151,8 +153,9 @@ type search struct {
 	workers    int
 	seedBase   uint64 // added to every seed after seed 1
 
-	progress io.Writer // where to report progress, or nil
-	live     bool      // progress is a terminal, where a status line updates in place
+	progress io.Writer       // where to report progress, or nil
+	signals  context.Context // done at SIGINT or SIGTERM, or nil
+	live     bool            // progress is a terminal, where a status line updates in place
 
 	// Set up by prepare.
 	setup       bool   // the program reports the end of its setup
@@ -162,44 +165,46 @@ type search struct {
 	seen        []byte // features recorded so far, shared with every fork
 	seenFile    *os.File
 
-	mu         sync.Mutex
-	start      time.Time
-	rng        *rand.Rand
-	runs       int
-	failed     int
-	tooLong    int           // runs stopped for too many switches, not counted as failures
-	slowPass   time.Duration // the longest passing run
-	slowFail   time.Duration // the longest failing run, timeouts aside
-	groups     []*group      // in order of first appearance
-	byKey      map[string]*group
-	kinds      map[string]*also // every kind of failure, first in its run or not, by key
-	arms       [numArms]arm
-	cells      []*cell      // the archive
-	lru        []*cell      // cells with stopped programs, least recently used first
-	pool       []*cell      // setup roots
-	claimed    map[int]bool // new features of plain runs' cells not stopped yet
-	kept       int          // cells when the search ended
-	lowMem     bool         // memory ran low, which has been reported
-	memWaited  time.Time    // when waitMem last reported waiting
-	baseTrace  string       // the trace line of the base run, seed 1
-	unstable   string       // how seed 1 ran two schedules, or ""
-	left       int          // places where seed 1 left the deterministic subset
-	only       int          // the only arm to run, for measuring, or -1
-	noFork     bool         // run fresh seeds without forking, for measuring
-	roots      map[int]bool // process groups of the fork servers
-	running    map[*liveRun]bool
-	outOfMem   int     // runs stopped because memory ran out, not counted as failures
-	bigStopped *result // the one of them that held the most memory
-	features   int     // new features recorded during the search
-	canFork    bool
-	forked     bool   // a fork succeeded
-	refused    int    // forks the program refused
-	refusal    string // why the search stopped forking, or ""
-	yieldSites []string
-	predicted  []string                // deadlocks the lock order predicts
-	directed   [2]int                  // runs directed at predicted deadlocks, and those that failed
-	bigOutput  int64                   // the most output a run wrote
-	asserts    map[string]*assertCount // sometimes and reachable assertions, by kind and message
+	mu          sync.Mutex
+	start       time.Time
+	rng         *rand.Rand
+	runs        int
+	failed      int
+	tooLong     int           // runs stopped for too many switches, not counted as failures
+	tooLongRun  *result       // the first of them
+	slowPass    time.Duration // the longest passing run
+	slowPassRun *result       // that run
+	slowFail    time.Duration // the longest failing run, timeouts aside
+	groups      []*group      // in order of first appearance
+	byKey       map[string]*group
+	kinds       map[string]*also // every kind of failure, first in its run or not, by key
+	arms        [numArms]arm
+	cells       []*cell      // the archive
+	lru         []*cell      // cells with stopped programs, least recently used first
+	pool        []*cell      // setup roots
+	claimed     map[int]bool // new features of plain runs' cells not stopped yet
+	kept        int          // cells when the search ended
+	lowMem      bool         // memory ran low, which has been reported
+	memWaited   time.Time    // when waitMem last reported waiting
+	baseTrace   string       // the trace line of the base run, seed 1
+	unstable    string       // how seed 1 ran two schedules, or ""
+	left        int          // places where seed 1 left the deterministic subset
+	only        int          // the only arm to run, for measuring, or -1
+	noFork      bool         // run fresh seeds without forking, for measuring
+	roots       map[int]bool // process groups of the fork servers
+	running     map[*liveRun]bool
+	outOfMem    int     // runs stopped because memory ran out, not counted as failures
+	bigStopped  *result // the one of them that held the most memory
+	features    int     // new features recorded during the search
+	canFork     bool
+	forked      bool   // a fork succeeded
+	refused     int    // forks the program refused
+	refusal     string // why the search stopped forking, or ""
+	yieldSites  []string
+	predicted   []string                // deadlocks the lock order predicts
+	directed    [2]int                  // runs directed at predicted deadlocks, and those that failed
+	bigOutput   int64                   // the most output a run wrote
+	asserts     map[string]*assertCount // sometimes and reachable assertions, by kind and message
 }
 
 // An assertCount counts the runs that reached an assertion, and the runs
@@ -365,7 +370,7 @@ type result struct {
 var (
 	traceLine     = regexp.MustCompile(`(?m)^detsched: trace=0x[0-9a-f]+ switches=\d+ syncs=\d+$`)
 	traceHash     = regexp.MustCompile(`(?m)^detsched: trace=(0x[0-9a-f]+) `)
-	branchWrapper = regexp.MustCompile(`\(GODETBRANCH=(\d+) runs it in place\)$`)
+	branchWrapper = regexp.MustCompile(`\(GODETBRANCH=(\d+) runs it in place\)( \(and \d+ more failures?\))?$`)
 	assertCounts  = regexp.MustCompile(`(?m)^detsched: assert (sometimes|reachable) true=(\d+) false=\d+ (.*)$`)
 	switchesField = regexp.MustCompile(` switches=(\d+) `)
 	envReadLine   = regexp.MustCompile(`(?m)^detsched: environment read: (.*)$`)
@@ -869,9 +874,14 @@ func (s *search) run(ctx context.Context, n uint64) error {
 // recheck runs seed 1 once more, minutes after the base run in real time,
 // and warns if it runs another schedule: a program that reads the real
 // clock outside a bubble, such as at init, often runs the same schedule
-// in two runs started at once.
+// in two runs started at once. A signal, also after -duration ended the
+// search, stops it and goes on to the summary.
 func (s *search) recheck() {
-	r, err := s.exec(context.Background(), s.plain(1))
+	ctx := s.signals
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r, err := s.exec(ctx, s.plain(1))
 	if err != nil || r.trace() == s.baseTrace {
 		return
 	}
@@ -900,6 +910,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	if r.tooLong() {
 		s.tooLong++
+		if s.tooLongRun == nil {
+			s.tooLongRun = r
+		}
 		s.mu.Unlock()
 		return nil
 	}
@@ -912,7 +925,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		return nil
 	}
 	if !r.failed() {
-		s.slowPass = max(s.slowPass, r.wall)
+		if r.wall > s.slowPass {
+			s.slowPass, s.slowPassRun = r.wall, r
+		}
 		s.mu.Unlock()
 		return nil
 	}
@@ -1185,9 +1200,12 @@ func (s *search) summary(w io.Writer) {
 		}
 	}
 	if s.tooLong > 0 {
-		fmt.Fprintf(w, "detsched: %d runs made 1000 times the switches of the first and were stopped, not counted as failures\n", s.tooLong)
+		fmt.Fprintf(w, "detsched: %d runs made 1000 times the switches of the first and were stopped, not counted as failures; one of them, which may loop forever:\n\treplay: %s\n", s.tooLong, s.replayLine(s.tooLongRun, false))
 	}
 	fmt.Fprintf(w, "detsched: slowest passing run %v, slowest failing run %v; -timeout is %v\n", s.slowPass.Round(time.Millisecond), s.slowFail.Round(time.Millisecond), s.timeout)
+	if r := s.slowPassRun; r != nil && s.slowPass >= 5*time.Second {
+		fmt.Fprintf(w, "detsched: the slowest passing run, to replay when runs are slower than the program's work explains:\n\treplay: %s\n", s.replayLine(r, false))
+	}
 	s.assertSummary(w)
 	s.kindSummary(w)
 	for _, g := range s.groups {
@@ -1262,7 +1280,7 @@ func (s *search) countAsserts(out []byte) {
 
 // sdkAsserts are the prefixes of the SDK's own assertions, which say what
 // faults and composer features runs reached.
-var sdkAsserts = []string{"nemesis: ", "compose: "}
+var sdkAsserts = []string{"nemesis: ", "compose: ", "node panicked: "}
 
 // assertSummary prints the sometimes and reachable assertions, those never
 // true first, and then on one line those of the SDK. s.mu must be held.
