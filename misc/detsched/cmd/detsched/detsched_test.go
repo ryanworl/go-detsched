@@ -1164,29 +1164,33 @@ func TestDetGodebug(t *testing.T) {
 	}
 }
 
-// TestDebugBuildInfo checks that the build without optimizations, which
-// debug lines run, sees the optimized build's build info, which records
-// no -gcflags, so that a program that reads it runs the same schedule
-// (testdata/buildinfo).
-func TestDebugBuildInfo(t *testing.T) {
-	var outs []outcome
-	for _, flags := range [][]string{nil, {"-gcflags=all=-N -l"}} {
-		tmp := t.TempDir()
-		_, bin, err := buildPackage("../../testdata/buildinfo", tmp, flags...)
-		if err != nil {
-			t.Fatal(err)
+// TestDebugBuild checks that the build without optimizations, which debug
+// lines run, runs the optimized build's schedule and prints the same: in a
+// program that reads its build info, which records -gcflags only in the
+// build without optimizations (testdata/buildinfo), and in one that makes
+// types with reflect.ArrayOf, which searches the binary's types, and looks
+// them up in a sync.Map, whose work depends on their addresses; both
+// differ between the builds (testdata/typemap).
+func TestDebugBuild(t *testing.T) {
+	for _, prog := range []string{"buildinfo", "typemap"} {
+		var outs []outcome
+		for _, flags := range [][]string{nil, {"-gcflags=all=-N -l"}} {
+			_, bin, err := buildPackage("../../testdata/"+prog, t.TempDir(), flags...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			o, _, err := runBin(bin, "GODETSEED=1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if o.exitCode != 0 {
+				t.Fatalf("%s built with %q: exit status %d\n%s%s", prog, flags, o.exitCode, o.stdout, o.stderr)
+			}
+			outs = append(outs, o)
 		}
-		o, _, err := runBin(bin, "GODETSEED=1")
-		if err != nil {
-			t.Fatal(err)
+		if outs[1].trace != outs[0].trace || outs[1].stdout != outs[0].stdout {
+			t.Errorf("%s built with -gcflags=all=-N -l: %s, %q; optimized: %s, %q", prog, outs[1].trace, outs[1].stdout, outs[0].trace, outs[0].stdout)
 		}
-		if o.exitCode != 0 {
-			t.Fatalf("buildinfo built with %q: exit status %d\n%s%s", flags, o.exitCode, o.stdout, o.stderr)
-		}
-		outs = append(outs, o)
-	}
-	if outs[1].trace != outs[0].trace || outs[1].stdout != outs[0].stdout {
-		t.Errorf("buildinfo built with -gcflags=all=-N -l: %s, %q; optimized: %s, %q", outs[1].trace, outs[1].stdout, outs[0].trace, outs[0].stdout)
 	}
 }
 

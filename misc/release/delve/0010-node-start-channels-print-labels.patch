@@ -1,0 +1,182 @@
+pkg/proc, service/api: detsched.node and detsched.start, channels in one line, on print labels
+
+detsched.node was the name package sim gives a node's handle, such as
+"n2 (start 4)", so cond NAME detsched.node == "n2" never held. It is now
+the node's name, "n2", and detsched.start which start of the node the
+goroutine runs in, 4 (0 for no node). The position on stops and hits
+still names both: "node n2 (start 4)".
+
+A channel printed as the runtime's whole hchan wherever structs print
+in several lines, as print and on NAME print do in the terminal: its
+buffer, element type, wait queues, lock and synctest bubble, about 25
+lines a hit. It prints in one line now, with its length, capacity,
+whether it is closed, and, in that multi-line form, the address of its
+hchan:
+
+	chan int 3/100 (closed) at 0xc000123000
+
+The one-line form elsewhere, as in the JSON output and DAP, is
+upstream's with " (closed)"; the JSON value record has the address in
+"addr". *ch, which was refused, is the hchan, and prints it whole;
+ch.closed and the other fields read as before.
+
+on NAME print EXPR labelled the value with the name evaluation gave
+its result, so a field read through an interface field, j.env.err,
+printed as "data.err", in text and in the JSON record's "expr", where
+stock Delve 1.27.2 does the same in text. The value is now labelled
+with EXPR.
+
+detsched.node and detsched.start are detsched's (0003); the rest are
+generic fixes for upstream Delve.
+
+diff --git a/pkg/proc/detsched.go b/pkg/proc/detsched.go
+index db0cd43..f5154c2 100644
+--- a/pkg/proc/detsched.go
++++ b/pkg/proc/detsched.go
+@@ -309,6 +309,21 @@ func (di *detInfo) node(bi *BinaryInfo, mem MemoryReadWriter, gaddr uint64) (nam
+ 	return string(buf), state
+ }
+ 
++// detNodeStart splits the name package sim gives a node's handle, such as
++// "n2 (start 4)", into the node's name, "n2", and which start of the node
++// the handle is, 4, or 0 if the name does not say.
++func detNodeStart(handle string) (node string, start int64) {
++	i := strings.LastIndex(handle, " (start ")
++	if i < 0 || !strings.HasSuffix(handle, ")") {
++		return handle, 0
++	}
++	n, err := strconv.ParseInt(handle[i+len(" (start "):len(handle)-1], 10, 64)
++	if err != nil {
++		return handle, 0
++	}
++	return handle[:i], n
++}
++
+ // DetNode returns the name of g's simulated node, "" for none, and its
+ // state, "crashed" or "paused" if it is not live.
+ func DetNode(t *Target, g *G) (name, state string) {
+@@ -345,9 +360,13 @@ func evalDetsched(scope *EvalScope, name string) (*Variable, error) {
+ 	case "switches":
+ 		v = constant.MakeUint64(pos.Switches)
+ 	case "node":
+-		v = constant.MakeString(pos.Node)
++		node, _ := detNodeStart(pos.Node)
++		v = constant.MakeString(node)
++	case "start":
++		_, start := detNodeStart(pos.Node)
++		v = constant.MakeInt64(start)
+ 	default:
+-		return nil, fmt.Errorf("unknown detsched.%s (detsched.time, detsched.tick, detsched.switches and detsched.node are known)", name)
++		return nil, fmt.Errorf("unknown detsched.%s (detsched.time, detsched.tick, detsched.switches, detsched.node and detsched.start are known)", name)
+ 	}
+ 	return newConstant(v, scope.BinInfo, scope.Mem), nil
+ }
+diff --git a/pkg/proc/eval.go b/pkg/proc/eval.go
+index b7248b8..e55c0b9 100644
+--- a/pkg/proc/eval.go
++++ b/pkg/proc/eval.go
+@@ -2312,6 +2312,20 @@ func (scope *EvalScope) evalReslice(op *evalop.Reslice, stack *evalStack) {
+ func (scope *EvalScope) evalPointerDeref(op *evalop.PointerDeref, stack *evalStack) {
+ 	xev := stack.pop()
+ 
++	if ct, ok := xev.RealType.(*godwarf.ChanType); ok && xev.Kind == reflect.Chan && xev.Unreadable == nil {
++		// *ch is the runtime's hchan behind ch, which print shows in one
++		// line.
++		sv := xev.clone()
++		sv.RealType = godwarf.ResolveTypedef(&ct.TypedefType)
++		rv := sv.maybeDereference()
++		if rv == sv || rv.Addr == 0 {
++			stack.err = errors.New("nil channel dereference")
++			return
++		}
++		stack.push(rv)
++		return
++	}
++
+ 	if xev.Kind != reflect.Ptr {
+ 		stack.err = fmt.Errorf("expression %q (%s) can not be dereferenced", astutil.ExprToString(op.Node.X), xev.TypeString())
+ 		return
+diff --git a/pkg/proc/evalop/evalcompile.go b/pkg/proc/evalop/evalcompile.go
+index f694049..abe8335 100644
+--- a/pkg/proc/evalop/evalcompile.go
++++ b/pkg/proc/evalop/evalcompile.go
+@@ -331,7 +331,7 @@ func (ctx *compileCtx) compileAST(t ast.Expr, toplevel bool) error {
+ 			case x.Name == "runtime" && node.Sel.Name == "rangeParentOffset":
+ 				ctx.pushOp(&PushRangeParentOffset{})
+ 
+-			case x.Name == "detsched" && (node.Sel.Name == "time" || node.Sel.Name == "tick" || node.Sel.Name == "switches" || node.Sel.Name == "node"):
++			case x.Name == "detsched" && (node.Sel.Name == "time" || node.Sel.Name == "tick" || node.Sel.Name == "switches" || node.Sel.Name == "node" || node.Sel.Name == "start"):
+ 				ctx.pushOp(&PushDetsched{Name: node.Sel.Name})
+ 
+ 			case x.Name == DelvePackage && node.Sel.Name == BreakpointHitCountVarName:
+diff --git a/pkg/terminal/json.go b/pkg/terminal/json.go
+index adcac2b..183aae6 100644
+--- a/pkg/terminal/json.go
++++ b/pkg/terminal/json.go
+@@ -22,6 +22,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
++	"reflect"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -119,6 +120,9 @@ func jsonPos(p *api.Position) map[string]any {
+ 
+ func (t *Term) jsonVar(v *api.Variable, name string) map[string]any {
+ 	r := map[string]any{"type": v.Type, "value": v.StringWithOptions("", "", t.rawStringFlag())}
++	if v.Kind == reflect.Chan && v.Base != 0 {
++		r["addr"] = fmt.Sprintf("%#x", v.Base) // of the runtime's hchan, which *ch prints
++	}
+ 	if name != "" {
+ 		r["name"] = name
+ 	}
+diff --git a/service/api/prettyprint.go b/service/api/prettyprint.go
+index acb3bed..c5e688f 100644
+--- a/service/api/prettyprint.go
++++ b/service/api/prettyprint.go
+@@ -131,15 +131,22 @@ func (v *Variable) writeTo(buf io.Writer, flags PrettyFlags, indent, fmtstr stri
+ 			fmt.Fprintf(buf, "unsafe.Pointer(%#x)", v.Children[0].Addr)
+ 		}
+ 	case reflect.Chan:
+-		if flags.newlines() {
+-			v.writeStructTo(buf, flags, indent, fmtstr)
+-		} else {
+-			if len(v.Children) == 0 {
+-				fmt.Fprintf(buf, "%s nil", v.typeStr(flags))
+-			} else {
+-				fmt.Fprintf(buf, "%s %s/%s", v.typeStr(flags), v.Children[0].Value, v.Children[1].Value)
++		// One line, also where structs take several, there with the
++		// address of the runtime's hchan behind the channel; print *ch
++		// prints the hchan, with its wait queues, lock and synctest bubble.
++		if len(v.Children) == 0 {
++			fmt.Fprintf(buf, "%s nil", v.typeStr(flags))
++			break
++		}
++		fmt.Fprintf(buf, "%s %s/%s", v.typeStr(flags), v.Children[0].Value, v.Children[1].Value)
++		for i := range v.Children {
++			if c := &v.Children[i]; c.Name == "closed" && c.Value != "" && c.Value != "0" {
++				fmt.Fprint(buf, " (closed)")
+ 			}
+ 		}
++		if v.Base != 0 && flags.newlines() {
++			fmt.Fprintf(buf, " at %#x", v.Base)
++		}
+ 	case reflect.Struct:
+ 		if v.Value != "" {
+ 			fmt.Fprintf(buf, "%s(%s)", v.typeStr(flags), v.Value)
+diff --git a/service/debugger/debugger.go b/service/debugger/debugger.go
+index 525cb8a..4c11d07 100644
+--- a/service/debugger/debugger.go
++++ b/service/debugger/debugger.go
+@@ -1448,6 +1448,10 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
+ 			bpi.Variables[i] = api.Variable{Name: bp.Variables[i], Unreadable: fmt.Sprintf("eval error: %v", err)}
+ 		} else {
+ 			bpi.Variables[i] = *api.ConvertVar(v)
++			// Labelled with the expression, not the name evaluation gave
++			// its result: a field read through an interface is named
++			// data.FIELD.
++			bpi.Variables[i].Name = bp.Variables[i]
+ 		}
+ 	}
+ 	if bp.LoadArgs != nil {

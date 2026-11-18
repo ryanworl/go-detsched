@@ -103,7 +103,11 @@ whether it is a generic fix for upstream Delve or specific to detsched:
   counts in builds with `-gcflags=all=-N -l` too;
 - `0009`: detsched: `restart` to a point where its goroutine yields
   stays at the point (`runtime.detDebug.yields`), so that its position
-  is the point's, and names the goroutine's frame.
+  is the point's, and names the goroutine's frame;
+- `0010`: detsched: `detsched.node` is the node's name and
+  `detsched.start` which start of it; generic: a channel prints in one
+  line (`chan int 3/100 (closed) at ADDR`) and `*ch` is its `hchan`, and
+  `on NAME print EXPR` is labelled `EXPR`.
 
 To build dlv for this tree, `delve.bash bin/dlv`. To change the patches,
 copy Delve's module (`go mod download -json

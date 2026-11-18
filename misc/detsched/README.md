@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched23
+v=go1.27.4-detsched24
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -255,11 +255,17 @@ schedule, so dlv reads every local in it. That holds for a program that
 reads its build info, as libraries do to learn their version:
 `debug.ReadBuildInfo` leaves out the `-gcflags` setting in det mode, so
 both builds see the same settings (`go version -m` still prints it).
-`detsched` makes this build in `<outdir>/debug/` while it searches, runs
+It holds too for the caches that reflection-heavy packages such as
+`encoding/gob` and `encoding/json` keep in a `sync.Map` keyed by types,
+and for `reflect.ArrayOf`, `SliceOf`, `PointerTo` and the like: the
+hash tries behind `sync.Map` and `unique`, and reflect's search of the
+binary's types, count no ticks, because how much work they do depends on
+addresses and on what types the binary holds, which differ between the
+builds. `detsched` makes this build in `<outdir>/debug/` while it searches, runs
 seed 1 in it, and from then on prints `debug:` lines that run it. They run the optimized binary instead
 when the build was not ready when the search ended, with `-exec`, or when
 seed 1 ran another schedule in it three times, because the program depends on heap
-addresses (iterating a map keyed by pointers or channels when the order
+addresses (iterating a map or `sync.Map` keyed by pointers, types or channels when the order
 changes the work, printing or hashing pointers), its own stack
 (`runtime.Stack`, `runtime.Callers`, a node's `Stacks`), or memory
 statistics (`runtime.ReadMemStats`, GC counts). In the last case debug the
@@ -332,7 +338,11 @@ The run prints `detsched: trace=0x... switches=N syncs=M` at exit (a hash
 of the schedule, the goroutine switches, and the synchronization points
 passed, which a busy run counts in the hundreds of millions); the replay
 reproduces when that line equals the one in the log (for a branch failure,
-the log's first one, followed by `detsched: branch K`).
+the log's first one, followed by `detsched: branch K`). The lines after it
+are for `detsched`, not for reading: `perturb` is the scheduling strategy
+the seed drew, `busy` the CPU time charged to nodes, `environment read`
+the variables the program read, which replay lines set, and `feedback`
+and `assert` lines the features and assertion counts the search uses.
 
 Change nothing. Another binary (but the one without optimizations below),
 other arguments (even `-test.v` or `-test.run`), another value of a
@@ -342,7 +352,8 @@ schedule. Code that prints diagnostics must run only after an assertion
 has failed (`assert.Failures() > 0`), never behind a variable a passing
 run also reads. Breakpoints, time spent stopped, `GODEBUG=dettrace=2`,
 `GODETSTOP`, `GOTRACEBACK`, attaching a debugger, and copying the binary
-leave the run unchanged.
+leave the run unchanged; add such a variable just before `GODETSEED=`,
+after `env -u NAME`.
 
 The `debug:` line is the replay line with `dlv exec --disable-aslr` before
 the binary, which it replaces with the build without optimizations once
@@ -426,10 +437,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched23:
+and release N's version is v0.N.0, so with go1.27.4-detsched24:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.23.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.24.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass

@@ -8,8 +8,8 @@ knows it debugs a replay:
 
 - every stop and tracepoint line ends with the run's position,
   ` at t25.380001899 s4265 k128779 node server (start 3)`, and
-  `detsched.time`, `detsched.tick`, `detsched.switches` and
-  `detsched.node` read it in expressions
+  `detsched.time`, `detsched.tick`, `detsched.switches`,
+  `detsched.node` and `detsched.start` read it in expressions
   ([Where the run is](#where-the-run-is));
 - `goroutines -with node server` lists one node's goroutines;
 - `restart t9.4`, `restart s4400` or `restart k128779` runs the replay
@@ -158,8 +158,11 @@ Every stop, tracepoint and return line ends with the run's position, as
   start of it; nothing for no node.
 
 In expressions, for `print`, `on` and `cond`: `detsched.time` (seconds,
--1 outside a bubble), `detsched.tick`, `detsched.switches` and
-`detsched.node` (`""` for no node), also on system stacks.
+-1 outside a bubble), `detsched.tick`, `detsched.switches`,
+`detsched.node`, the node's name without its start (`"server"`, `""` for
+no node), and `detsched.start`, which start of it (3, 0 for no node),
+also on system stacks: `cond NAME detsched.node == "server"` holds in
+every start of the node, and `&& detsched.start == 3` in one.
 
 `goroutines` shows each goroutine's node and whether the node crashed or
 is paused. Goroutines of a crashed node are frozen where they were, so
@@ -332,6 +335,14 @@ Each costs a replay up to the point: under a second for
   dynamic type and value, and `print x.Field` reads a field of it.
 - Expressions cannot call functions or methods; read fields. String
   comparisons work: `cond NAME c.name == "TestCompose"`.
+- A channel prints in one line: `chan int 3/100 (closed) at 0xc000123000`,
+  its length, capacity, whether it is closed, and the address of the
+  runtime's `hchan` (in JSON, the value without it and the address in
+  `addr`); `print ch.closed` reads one of its fields, and
+  `print *ch` prints all of them, wait queues and synctest bubble
+  included. A stock Delve prints the whole `hchan` at every `print`.
+- `on NAME print EXPR` labels the value with `EXPR`; a stock Delve labels
+  a field read through an interface, such as `j.env.err`, as `data.err`.
 - Strings print up to 1024 bytes (`print`, `on NAME print`, `args -v`,
   `locals -v`), 256 in a tracepoint's line. Longer values are cut: raise
   `config max-string-len 4096`, `config max-array-values 1000`, or
@@ -350,7 +361,7 @@ prints a source listing at every hit, and needs one `continue` per stop.
 
 ```
 trace st example.com/kv/server.(*Store).apply
-cond st detsched.node == "server (start 3)"
+cond st detsched.node == "server" && detsched.start == 3
 on st print runtime.curg.goid
 on st print string(key)
 on st stack 6
@@ -446,7 +457,7 @@ it is:
 | `return` | a tracepoint's return | the same, with `ret`; `bp` is the tracepoint's name |
 | `break`, `watch` | a stop at a breakpoint or watchpoint | as `trace`; `watch` has `expr` |
 | `stop` | another stop (`next`, `step`, `restart` to a point, `rewind`) | `goroutine`, `func`, `file`, `line`, `pc`, `pos` |
-| `value` | `print` | `expr`, `type`, `value` |
+| `value` | `print` | `expr`, `type`, `value`, and for a channel `addr` |
 | `args`, `locals` | `args`, `locals` | `vars`: `name`, `type`, `value` |
 | `stack` | `stack` | `frames`: `n`, `func`, `file`, `line`, `pc` |
 | `goroutines` | `goroutines` | `goroutines`: `id`, locations, `node`, `node_state`, `wait`, `thread`, `labels`, and `frames` with `-t N` |

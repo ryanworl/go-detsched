@@ -82,7 +82,7 @@ func TestKV(t *testing.T) {
 
 - Set `OnPanic`, with `sim.PanicKind` in the message so that each kind of panic is its own group with its own replay line. Without it, a panic in the SUT ends the program before the harness's diagnostics run. The whole stack is in the run's log either way.
 - Create the World first thing in the bubble, so that the fault timeline's times are the bubble's.
-- Draw everything random from the seed (`sim.Intn`, `math/rand`), including configuration such as cluster size, options and timeouts, and print what was drawn in the failure dump.
+- Draw everything random from the seed (`sim.Intn`, `math/rand`), including configuration such as cluster size, options and timeouts, and print what was drawn in the failure dump. Runs forked after setup share what was drawn before it, and fresh seeds draw it anew, so keep `SetupComplete` where setup ends rather than moving it before the draws.
 - Code that uses the network or the disk runs on a node: in `Start(f)`, goroutines `f` starts, or `Node.Go(f)`; compose runs drivers and checks on its client node (`x.Node()`). Nodes dial IP addresses.
 - Read a SUT node's in-memory state from that node, with `n.Go(f)` and a timeout.
 - Terminal checks (`Eventually`, `Finally`) run on forked branches of the timeline. A branch returns from `c.Run` after its check and runs the rest of the test body, so code after `c.Run` runs in every branch.

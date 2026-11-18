@@ -20,7 +20,10 @@
 // replaced by a local directory, they check locations: a file by its
 // import path, a closure in a closure, a method inlined at an address
 // another tracepoint has, the frames of goroutines -t in JSON, and that
-// a breakpoint's frames have the stack record's shape.
+// a breakpoint's frames have the stack record's shape. TestNodeAndStart
+// checks detsched.node and detsched.start, and on values, a plain program,
+// TestValues checks how channels print and that on ... print is labelled
+// with its expression.
 //
 // $DLV names the dlv to test; the default is dlv next to go. gate.bash
 // runs them when the tree has bin/dlv:
@@ -707,5 +710,111 @@ func TestReturnValues(t *testing.T) {
 		if n != 2 {
 			t.Errorf("got %d prints of main.banner, want 2", n)
 		}
+	}
+}
+
+// detsched.node is the node's name, without the start the position names,
+// and detsched.start that start: a condition on both stops serve only in
+// the second start of the server (the first in a run with one).
+func TestNodeAndStart(t *testing.T) {
+	f := findFailure(t)
+	last := min(2, len(f.starts))
+	script := fmt.Sprintf("trace s simcompose.serve\ncond s detsched.node == \"server\" && detsched.start == %d\non s print detsched.node\non s print detsched.start\ncontinue\nexit\n", last)
+	var hits []record
+	for _, r := range parseJSON(t, runDlv(t, f, script, "--json")) {
+		if r.str("event") == "trace" {
+			hits = append(hits, r)
+		}
+	}
+	if len(hits) != 1 {
+		t.Fatalf("got %d hits of serve with detsched.start == %d, want 1: %v", len(hits), last, hits)
+	}
+	vars, _ := hits[0]["vars"].([]any)
+	var got []string
+	for _, v := range vars {
+		got = append(got, record(v.(map[string]any)).str("value"))
+	}
+	if want := []string{`"server"`, strconv.Itoa(last)}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("detsched.node and detsched.start are %q, want %q", got, want)
+	}
+	if node, want := hits[0].pos().str("node"), fmt.Sprintf("server (start %d)", last); node != want {
+		t.Errorf("the hit's position names node %q, want %q", node, want)
+	}
+}
+
+// A channel prints in one line, with its length, capacity, whether it is
+// closed and, in text or in the JSON record's addr, the address of the
+// runtime's hchan, which *ch prints; and an on
+// ... print is labelled with its expression, also for a field read
+// through an interface. values is a plain program.
+func TestValues(t *testing.T) {
+	dlv := dlvPath(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "values")
+	if out, err := exec.Command("go", "build", "-o", bin, "./values").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	script := filepath.Join(dir, "script.dlv")
+	if err := os.WriteFile(script, []byte(`break w main.work
+on w print j.env.err
+on w print j.env.tries
+on w print ch
+continue
+print ch
+print *ch
+exit
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"exec", bin, "-r", "stdout:" + filepath.Join(dir, "prog.out"), "--init", script, "--allow-non-terminal-interactive=true", "--json"}
+	out, err := exec.Command(dlv, args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("dlv %q: %v\n%s", args, err, out)
+	}
+	addr := regexp.MustCompile(`^0x[0-9a-f]+$`)
+	var labels []string
+	var prints int
+	for _, r := range parseJSON(t, string(out)) {
+		switch r.str("cmd") {
+		case "continue":
+			vars, _ := r["vars"].([]any)
+			for _, v := range vars {
+				v := record(v.(map[string]any))
+				label := v.str("expr") + " = " + v.str("value")
+				if addr.MatchString(v.str("addr")) {
+					label += " at ADDR"
+				}
+				labels = append(labels, label)
+			}
+		case "print ch":
+			prints++
+			if r.str("value") != "chan int 3/100 (closed)" || !addr.MatchString(r.str("addr")) {
+				t.Errorf("print ch: %v, want chan int 3/100 (closed) and the address", r)
+			}
+		case "print *ch":
+			prints++
+			if v := r.str("value"); !strings.Contains(v, "qcount: 3,") || !strings.Contains(v, "closed: 1,") {
+				t.Errorf("print *ch: %q, want the hchan", v)
+			}
+		}
+	}
+	if prints != 2 {
+		t.Errorf("got %d records of print ch and print *ch, want 2:\n%s", prints, out)
+	}
+	want := []string{`j.env.err = error(*errors.errorString) *{s: "boom"}`, `j.env.tries = 2`, `ch = chan int 3/100 (closed) at ADDR`}
+	if fmt.Sprint(labels) != fmt.Sprint(want) {
+		t.Errorf("on w print printed %q, want %q", labels, want)
+	}
+
+	// In text too, where structs print in several lines.
+	if err := os.WriteFile(script, []byte("break w main.work\non w print ch\ncontinue\nprint ch\nexit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = exec.Command(dlv, args[:len(args)-1]...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("dlv %q: %v\n%s", args, err, out)
+	}
+	if n := len(regexp.MustCompile(`(?m)^\t?(ch: )?chan int 3/100 \(closed\) at 0x[0-9a-f]+$`).FindAll(out, -1)); n != 2 || strings.Contains(string(out), "qcount") {
+		t.Errorf("text: got %d one-line channels, want 2, and no hchan:\n%s", n, out)
 	}
 }

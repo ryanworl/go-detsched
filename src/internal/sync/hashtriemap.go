@@ -21,7 +21,7 @@ import (
 type HashTrieMap[K comparable, V any] struct {
 	inited   atomic.Uint32
 	initMu   Mutex
-	root     atomic.Pointer[indirect[K, V]]
+	root     atomicPointer[indirect[K, V]]
 	keyHash  hashFunc
 	valEqual equalFunc
 	seed     uintptr
@@ -90,7 +90,7 @@ func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool)
 	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
 	var i *indirect[K, V]
 	var hashShift uint
-	var slot *atomic.Pointer[node[K, V]]
+	var slot *atomicPointer[node[K, V]]
 	var n *node[K, V]
 	for {
 		// Find the key or a candidate location for insertion.
@@ -207,7 +207,7 @@ func (ht *HashTrieMap[K, V]) Swap(key K, new V) (previous V, loaded bool) {
 	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
 	var i *indirect[K, V]
 	var hashShift uint
-	var slot *atomic.Pointer[node[K, V]]
+	var slot *atomicPointer[node[K, V]]
 	var n *node[K, V]
 	for {
 		// Find the key or a candidate location for insertion.
@@ -423,7 +423,7 @@ func (ht *HashTrieMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 // Returns a non-nil node, which will always be an entry, if found.
 //
 // If i != nil then i.mu is locked, and it is the caller's responsibility to unlock it.
-func (ht *HashTrieMap[K, V]) find(key K, hash uintptr, valEqual equalFunc, value V) (i *indirect[K, V], hashShift uint, slot *atomic.Pointer[node[K, V]], n *node[K, V]) {
+func (ht *HashTrieMap[K, V]) find(key K, hash uintptr, valEqual equalFunc, value V) (i *indirect[K, V], hashShift uint, slot *atomicPointer[node[K, V]], n *node[K, V]) {
 	for {
 		// Find the key or return if it's not there.
 		i = ht.root.Load()
@@ -543,7 +543,7 @@ type indirect[K comparable, V any] struct {
 	dead     atomic.Bool
 	mu       Mutex // Protects mutation to children and any children that are entry nodes.
 	parent   *indirect[K, V]
-	children [nChildren]atomic.Pointer[node[K, V]]
+	children [nChildren]atomicPointer[node[K, V]]
 }
 
 func newIndirectNode[K comparable, V any](parent *indirect[K, V]) *indirect[K, V] {
@@ -563,7 +563,7 @@ func (i *indirect[K, V]) empty() bool {
 // entry is a leaf node in the hash-trie.
 type entry[K comparable, V any] struct {
 	node[K, V]
-	overflow atomic.Pointer[entry[K, V]] // Overflow for hash collisions.
+	overflow atomicPointer[entry[K, V]] // Overflow for hash collisions.
 	key      K
 	value    V
 }
@@ -722,3 +722,23 @@ func (n *node[K, V]) indirect() *indirect[K, V] {
 //
 //go:linkname runtime_rand runtime.rand
 func runtime_rand() uint64
+
+// atomicPointer is atomic.Pointer, declared in this file so that a lookup
+// counts no ticks or synchronization points under GOEXPERIMENT=detsched,
+// as nothing else in this file does (see detFuncPkgCounts in
+// cmd/compile/internal/ir): how many nodes a lookup loads depends on the
+// hash of its key, and so on addresses, which differ between builds.
+type atomicPointer[T any] struct {
+	// Use *T, not T, to avoid spurious recursive type definition errors.
+	_ [0]*T
+
+	v unsafe.Pointer
+}
+
+func (x *atomicPointer[T]) Load() *T { return (*T)(atomic.LoadPointer(&x.v)) }
+
+func (x *atomicPointer[T]) Store(val *T) { atomic.StorePointer(&x.v, unsafe.Pointer(val)) }
+
+func (x *atomicPointer[T]) CompareAndSwap(old, new *T) (swapped bool) {
+	return atomic.CompareAndSwapPointer(&x.v, unsafe.Pointer(old), unsafe.Pointer(new))
+}

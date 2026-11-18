@@ -18,7 +18,7 @@ import (
 // of a canonical *T, and elements of the map are automatically
 // deleted when the canonical *T is no longer referenced.
 type canonMap[T comparable] struct {
-	root atomic.Pointer[indirect[T]]
+	root atomicPointer[indirect[T]]
 	hash func(unsafe.Pointer, uintptr) uintptr
 	seed uintptr
 }
@@ -60,7 +60,7 @@ func (m *canonMap[T]) LoadOrStore(key T) *T {
 
 	var i *indirect[T]
 	var hashShift uint
-	var slot *atomic.Pointer[node[T]]
+	var slot *atomicPointer[node[T]]
 	var n *node[T]
 	for {
 		// Find the key or a candidate location for insertion.
@@ -180,7 +180,7 @@ func (m *canonMap[T]) expand(oldEntry, newEntry *entry[T], newHash uintptr, hash
 func (m *canonMap[T]) cleanup(hash uintptr, wp weak.Pointer[T]) {
 	var i *indirect[T]
 	var hashShift uint
-	var slot *atomic.Pointer[node[T]]
+	var slot *atomicPointer[node[T]]
 	var n *node[T]
 	for {
 		// Find wp in the map by following hash.
@@ -288,7 +288,7 @@ type indirect[T comparable] struct {
 	dead     atomic.Bool
 	parent   *indirect[T]
 	mu       sync.Mutex // Protects mutation to children and any children that are entry nodes.
-	children [nChildren]atomic.Pointer[node[T]]
+	children [nChildren]atomicPointer[node[T]]
 }
 
 func newIndirectNode[T comparable](parent *indirect[T]) *indirect[T] {
@@ -307,7 +307,7 @@ func (i *indirect[T]) empty() bool {
 // entry is a leaf node in the hash-trie.
 type entry[T comparable] struct {
 	node[T]
-	overflow atomic.Pointer[entry[T]] // Overflow for hash collisions.
+	overflow atomicPointer[entry[T]] // Overflow for hash collisions.
 	key      weak.Pointer[T]
 	hash     uintptr
 }
@@ -383,3 +383,23 @@ func (e *entry[T]) prune() *entry[T] {
 //
 //go:linkname runtime_rand runtime.rand
 func runtime_rand() uint64
+
+// atomicPointer is atomic.Pointer, declared in this file so that a lookup
+// counts no ticks or synchronization points under GOEXPERIMENT=detsched,
+// as nothing else in this file does (see detFuncPkgCounts in
+// cmd/compile/internal/ir): how many nodes a lookup loads depends on the
+// hash of its key, and so on addresses, which differ between builds.
+type atomicPointer[T any] struct {
+	// Use *T, not T, to avoid spurious recursive type definition errors.
+	_ [0]*T
+
+	v unsafe.Pointer
+}
+
+func (x *atomicPointer[T]) Load() *T { return (*T)(atomic.LoadPointer(&x.v)) }
+
+func (x *atomicPointer[T]) Store(val *T) { atomic.StorePointer(&x.v, unsafe.Pointer(val)) }
+
+func (x *atomicPointer[T]) CompareAndSwap(old, new *T) (swapped bool) {
+	return atomic.CompareAndSwapPointer(&x.v, unsafe.Pointer(old), unsafe.Pointer(new))
+}

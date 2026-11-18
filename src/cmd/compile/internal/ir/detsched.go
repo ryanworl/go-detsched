@@ -6,6 +6,7 @@ package ir
 
 import (
 	"internal/buildcfg"
+	"strings"
 
 	"cmd/compile/internal/base"
 	"cmd/internal/objabi"
@@ -67,11 +68,35 @@ func DetPkgCounts(path string) bool {
 
 // detFuncPkgCounts reports whether the package whose source holds fn
 // counts ticks: for a closure in an inlined body, the inlined function's.
+// Neither do the files of detNoCountFiles.
 func detFuncPkgCounts(fn *Func) bool {
-	if i := base.Ctxt.PosTable.Pos(fn.Pos()).Base().InliningIndex(); i >= 0 {
+	pos := base.Ctxt.PosTable.Pos(fn.Pos())
+	if i := pos.Base().InliningIndex(); i >= 0 {
 		return DetInlPkgCounts[i]
 	}
-	return DetPkgCounts(fn.Sym().Pkg.Path)
+	path := fn.Sym().Pkg.Path
+	if file, ok := detNoCountFiles[path]; ok && strings.HasSuffix(pos.Base().Filename(), file) {
+		return false
+	}
+	return DetPkgCounts(path)
+}
+
+// detNoCountFiles maps packages to a file of theirs where nothing counts
+// ticks, because how much work its code does depends on addresses or on
+// the set of types in the binary, which differ between an optimized build
+// and one with -N -l. Each file declares its own copy of anything it would
+// otherwise call that counts, such as atomic.Pointer's methods.
+//
+//   - The hash tries of internal/sync (sync.Map, and the caches of
+//     reflect, encoding/json, encoding/gob and others keyed by types) and
+//     of unique: how deep a lookup goes depends on the hash of its key,
+//     which for a pointer, such as a reflect.Type, is its address.
+//   - reflect's typesByString, which ArrayOf, SliceOf, PointerTo and
+//     others call: it binary-searches the types of the binary.
+var detNoCountFiles = map[string]string{
+	"internal/sync": "/hashtriemap.go",
+	"unique":        "/canonmap.go",
+	"reflect":       "/typesbystring.go",
 }
 
 // DetFuncCounts reports whether fn counts ticks and synchronization
