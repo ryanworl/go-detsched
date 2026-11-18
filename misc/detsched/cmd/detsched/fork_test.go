@@ -372,11 +372,7 @@ func TestSearchLeftover(t *testing.T) {
 // TestSearchTimeout checks that a search runs on past -timeout, forking
 // stopped programs it keeps from before then.
 func TestSearchTimeout(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch("../../testdata/bugrarelock", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSearch(t, "../../testdata/bugrarelock")
 	s.workers, s.timeout = 4, time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -392,11 +388,7 @@ func TestSearchTimeout(t *testing.T) {
 // after it may hang, is stopped for its stacks and recorded with a replay
 // line rather than dropped.
 func TestSearchHung(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch("../../testdata/hang", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSearch(t, "../../testdata/hang")
 	s.workers, s.only, s.noFork = 2, armFresh, true
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
@@ -423,11 +415,7 @@ func TestSearchHung(t *testing.T) {
 // deterministic subset: here, by starting a subprocess, at a switch and
 // tick of the run.
 func TestSearchReports(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch("../../testdata/subprocess", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSearch(t, "../../testdata/subprocess")
 	var b strings.Builder
 	s.progress = &b
 	if err := s.run(context.Background(), 1); err != nil {
@@ -450,11 +438,7 @@ func TestSearchReports(t *testing.T) {
 func TestSearchCompose(t *testing.T) {
 	t.Setenv("SIMCOMPOSE_BUG", "1")
 	t.Setenv("SIMCOMPOSE_UNREAD", "1")
-	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch("../../testdata/simcompose", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSearch(t, "../../testdata/simcompose")
 	// Plain runs of fresh seeds, so that the same seeds run every time:
 	// the default mix depends on timing and sometimes misses the bug in
 	// 60 runs. Seeds 2 to 60 fail 7 times on linux/amd64.
@@ -501,11 +485,7 @@ func TestSearchCompose(t *testing.T) {
 // runs another schedule: testdata/stackread's schedule depends on its own
 // stacks.
 func TestSearchDebugFallback(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
-	s, err := newSearch("../../testdata/stackread", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := newTestSearch(t, "../../testdata/stackread")
 	if err := s.run(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}

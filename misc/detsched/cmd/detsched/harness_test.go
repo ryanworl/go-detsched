@@ -273,21 +273,29 @@ func exploreSeeds(cfg config, pkg string, first uint64, n int, perturb string) (
 	return x, nil
 }
 
-// runSearch runs the search on pkg for n runs, 4 at a time.
-func runSearch(t *testing.T, pkg string, n uint64) *search {
+// newTestSearch returns a search on pkg with TMPDIR in the test's
+// temporary directory.
+func newTestSearch(t *testing.T, pkg string) *search {
 	t.Helper()
 	t.Setenv("TMPDIR", t.TempDir())
 	s, err := newSearch(pkg, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.workers = 4
 	// The build without optimizations writes in TMPDIR until it is done.
 	t.Cleanup(func() {
 		if s.debugDone != nil {
 			<-s.debugDone
 		}
 	})
+	return s
+}
+
+// runSearch runs the search on pkg for n runs, 4 at a time.
+func runSearch(t *testing.T, pkg string, n uint64) *search {
+	t.Helper()
+	s := newTestSearch(t, pkg)
+	s.workers = 4
 	if err := s.run(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}

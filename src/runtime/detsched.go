@@ -439,6 +439,44 @@ func detRand() uint64 {
 	}
 }
 
+// detModinfoValue is what debug.ReadBuildInfo parses in det mode, once
+// detModinfo has made it.
+var detModinfoValue struct {
+	s    string
+	done bool
+}
+
+// detModinfo returns modinfo without its -gcflags build setting. The
+// build without optimizations that detsched's debug lines run records
+// -gcflags="all=-N -l", which the optimized build doesn't, and a program
+// that reads its build info, as libraries do to learn their own version,
+// would then see other settings and parse a longer string, counting more
+// ticks, and run another schedule. The binary keeps the setting, which
+// go version -m prints. The copy is not on the heap, so that making it
+// moves no heap object.
+func detModinfo() string {
+	m := &detModinfoValue
+	if m.done {
+		return m.s
+	}
+	m.s, m.done = modinfo, true
+	const key = "\nbuild\t-gcflags="
+	i := stringslite.Index(modinfo, key)
+	if i < 0 {
+		return m.s
+	}
+	j := i + 1 + bytealg.IndexByteString(modinfo[i+1:], '\n')
+	if j <= i {
+		return m.s
+	}
+	n := len(modinfo) - (j - i)
+	b := unsafe.Slice((*byte)(persistentalloc(uintptr(n), 1, &memstats.other_sys)), n)
+	copy(b, modinfo[:i])
+	copy(b[i:], modinfo[j:])
+	m.s = unsafe.String(&b[0], n)
+	return m.s
+}
+
 // cacheRand is cheaprand for typeAssert and interfaceSwitch, which update
 // the cache of a type assertion or type switch at random calls. Optimized
 // code calls them only when the cache misses, and code built with

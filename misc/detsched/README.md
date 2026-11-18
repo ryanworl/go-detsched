@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched22
+v=go1.27.4-detsched23
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -251,9 +251,12 @@ check that its trace line equals the first one in the log.
 ### Debug lines run the optimized binary
 
 A build of the same source with `-gcflags='all=-N -l'` runs the same
-schedule, so dlv reads every local in it; `detsched` builds one in
-`<outdir>/debug/` while it searches, runs seed 1 in it, and from then on
-prints `debug:` lines that run it. They run the optimized binary instead
+schedule, so dlv reads every local in it. That holds for a program that
+reads its build info, as libraries do to learn their version:
+`debug.ReadBuildInfo` leaves out the `-gcflags` setting in det mode, so
+both builds see the same settings (`go version -m` still prints it).
+`detsched` makes this build in `<outdir>/debug/` while it searches, runs
+seed 1 in it, and from then on prints `debug:` lines that run it. They run the optimized binary instead
 when the build was not ready when the search ended, with `-exec`, or when
 seed 1 ran another schedule in it three times, because the program depends on heap
 addresses (iterating a map keyed by pointers or channels when the order
@@ -423,10 +426,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched22:
+and release N's version is v0.N.0, so with go1.27.4-detsched23:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.22.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.23.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass

@@ -186,6 +186,9 @@ func NumGoroutine() int {
 
 //go:linkname debug_modinfo runtime/debug.modinfo
 func debug_modinfo() string {
+	if goexperiment.DetSched {
+		return detModinfo()
+	}
 	return modinfo
 }
 

@@ -1164,6 +1164,32 @@ func TestDetGodebug(t *testing.T) {
 	}
 }
 
+// TestDebugBuildInfo checks that the build without optimizations, which
+// debug lines run, sees the optimized build's build info, which records
+// no -gcflags, so that a program that reads it runs the same schedule
+// (testdata/buildinfo).
+func TestDebugBuildInfo(t *testing.T) {
+	var outs []outcome
+	for _, flags := range [][]string{nil, {"-gcflags=all=-N -l"}} {
+		tmp := t.TempDir()
+		_, bin, err := buildPackage("../../testdata/buildinfo", tmp, flags...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o, _, err := runBin(bin, "GODETSEED=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o.exitCode != 0 {
+			t.Fatalf("buildinfo built with %q: exit status %d\n%s%s", flags, o.exitCode, o.stdout, o.stderr)
+		}
+		outs = append(outs, o)
+	}
+	if outs[1].trace != outs[0].trace || outs[1].stdout != outs[0].stdout {
+		t.Errorf("buildinfo built with -gcflags=all=-N -l: %s, %q; optimized: %s, %q", outs[1].trace, outs[1].stdout, outs[0].trace, outs[0].stdout)
+	}
+}
+
 // TestRangeGC checks that a range loop over a slice whose elements the
 // compiler reaches through a uintptr keeps the slice live where detsched
 // preempts the loop, so that a GC meanwhile does not free it
