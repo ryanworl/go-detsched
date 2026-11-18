@@ -12,17 +12,17 @@
 // Detsched builds the tests of the package (by default, the one in the
 // current directory) with GOEXPERIMENT=detsched, or the package itself if
 // it is a command without tests, and runs the binary once per seed
-// (GODETSEED=1, 2, ...), one run per core at once (-p sets how many), until
-// it is interrupted, -duration passes, or -n seeds have run. Each seed runs
-// another schedule, and with package detsched/sdk/sim, other faults. It
-// groups the failing runs by their first assertion failure, panic, or fatal
-// error, else their first failing test, keeps the output of the first few
-// runs of each group, and prints a command that replays the group's first
-// run: the same binary, directory, arguments, and seed, with GODETBRANCH
-// naming the branch of a detsched/sdk/compose timeline that failed. It runs
-// that command to check that the failure reproduces. To debug the failure,
-// run the command with dlv exec in front of the binary and -- before its
-// arguments.
+// (GODETSEED=1, 2, ...), as many at once as there are cores but one (-p
+// sets how many), until it is interrupted, -duration passes, or -n seeds
+// have run. Each seed runs another schedule, and with package
+// detsched/sdk/sim, other faults. It groups the failing runs by their
+// first assertion failure, panic, or fatal error, else their first failing
+// test, keeps the output of the first few runs of each group, and prints a
+// command that replays the group's first run: the same binary, directory,
+// arguments, and seed, with GODETBRANCH naming the branch of a
+// detsched/sdk/compose timeline that failed. It runs that command to check
+// that the failure reproduces. To debug the failure, run the command with
+// dlv exec in front of the binary and -- before its arguments.
 //
 // To spread a search over several machines, give each its own -seed-base:
 // fresh seeds after seed 1 then start from it, so with -seed-base i<<32,
@@ -66,7 +66,7 @@ var (
 	duration = flag.Duration("duration", 0, "stop after this much time (default: run until interrupted)")
 	seeds    = flag.Uint64("n", 0, "stop after this many seeds (default: run until interrupted)")
 	timeout  = flag.Duration("timeout", 10*time.Minute, "stop a run that takes longer than this, and count it as a failure")
-	procs    = flag.Int("p", runtime.NumCPU(), "run this many programs at once")
+	procs    = flag.Int("p", max(runtime.NumCPU()-1, 1), "run this many programs at once")
 	seedBase = flag.Uint64("seed-base", 0, "add `n` to every seed after seed 1, so machines searching together run disjoint seeds")
 	execFlag = flag.String("exec", "", "run this prebuilt `binary` in the current directory instead of building a package")
 )
@@ -127,21 +127,29 @@ func main() {
 	if len(s.groups) > 0 {
 		os.Exit(1)
 	}
-	os.RemoveAll(s.out) // nothing to replay
+	// Nothing to replay: keep only the summary, whose path the search
+	// printed at its start.
+	entries, _ := os.ReadDir(s.out)
+	for _, e := range entries {
+		if e.Name() != "summary" {
+			os.RemoveAll(filepath.Join(s.out, e.Name()))
+		}
+	}
 }
 
 // A search runs a test binary with one seed after another.
 type search struct {
-	pkg      string
-	dir      string   // the package's directory, where runs start
-	bin      string   // the binary
-	args     []string // its arguments
-	env      []string // variables every run adds to the environment
-	vars     []string // variables of our environment the schedule depends on, which replay lines set
-	out      string   // directory for the binary and the logs
-	timeout  time.Duration
-	workers  int
-	seedBase uint64 // added to every seed after seed 1
+	pkg        string
+	dir        string   // the package's directory, where runs start
+	bin        string   // the binary
+	args       []string // its arguments
+	env        []string // variables every run adds to the environment
+	vars       []string // variables of our environment the schedule depends on, which replay lines set
+	baseOutput []byte   // the output of the base run, seed 1
+	out        string   // directory for the binary and the logs
+	timeout    time.Duration
+	workers    int
+	seedBase   uint64 // added to every seed after seed 1
 
 	progress io.Writer // where to report progress, or nil
 	live     bool      // progress is a terminal, where a status line updates in place
@@ -180,8 +188,9 @@ type search struct {
 	noFork     bool         // run fresh seeds without forking, for measuring
 	roots      map[int]bool // process groups of the fork servers
 	running    map[*liveRun]bool
-	outOfMem   int // runs stopped because memory ran out, not counted as failures
-	features   int // new features recorded during the search
+	outOfMem   int     // runs stopped because memory ran out, not counted as failures
+	bigStopped *result // the one of them that held the most memory
+	features   int     // new features recorded during the search
 	canFork    bool
 	forked     bool   // a fork succeeded
 	refused    int    // forks the program refused
@@ -348,16 +357,18 @@ type result struct {
 	exitCode    int
 	timedOut    bool
 	wall        time.Duration
-	outOfMem    bool  // stopped because memory ran out
-	outputSize  int64 // the bytes of output it wrote, which may be more than output holds
+	outOfMem    bool   // stopped because memory ran out
+	memAtStop   uint64 // the private memory it held then, if known
+	outputSize  int64  // the bytes of output it wrote, which may be more than output holds
 }
 
 var (
 	traceLine     = regexp.MustCompile(`(?m)^detsched: trace=0x[0-9a-f]+ switches=\d+ syncs=\d+$`)
 	traceHash     = regexp.MustCompile(`(?m)^detsched: trace=(0x[0-9a-f]+) `)
-	branchWrapper = regexp.MustCompile(`\(GODETBRANCH=\d+ runs it in place\)$`)
+	branchWrapper = regexp.MustCompile(`\(GODETBRANCH=(\d+) runs it in place\)$`)
 	assertCounts  = regexp.MustCompile(`(?m)^detsched: assert (sometimes|reachable) true=(\d+) false=\d+ (.*)$`)
 	switchesField = regexp.MustCompile(` switches=(\d+) `)
+	envReadLine   = regexp.MustCompile(`(?m)^detsched: environment read: (.*)$`)
 	syncsField    = regexp.MustCompile(` syncs=(\d+)$`)
 	setupLine     = regexp.MustCompile(`(?m)^detsched: setup complete at switch (\d+)$`)
 	deadlockLine  = regexp.MustCompile(`(?m)^detsched: potential deadlock: (.*)$`)
@@ -365,8 +376,9 @@ var (
 	leftReport    = regexp.MustCompile(`(?m)^detsched: .*; the program no longer runs deterministically\n(?:.+\n)*`) // and its stack
 	failureLine   = regexp.MustCompile(`(?m)^(detsched: assertion failed: |panic: |fatal error: ).*`)
 	testFailure   = regexp.MustCompile(`(?m)^\s*--- FAIL: \S+`)
-	branchSet     = regexp.MustCompile(`GODETBRANCH=(\d+)`)
+	branchLine    = regexp.MustCompile(`(?m)^detsched: branch (\d+) \(GODETBRANCH=\d+ runs it in place\)$`)
 	assertDetails = regexp.MustCompile(`^detsched: assertion failed: .*?( map\[| \(and \d+ more failures?\)$)`)
+	errDetails    = regexp.MustCompile(`^map\[err:(.*)\]( \(and \d+ more failures?\))?$`)
 	masked        = regexp.MustCompile(`0x[0-9a-f]+|\b[0-9A-Fa-f]{16,}\b|\d+`)
 )
 
@@ -385,8 +397,9 @@ func (r *result) trace() string { return string(traceLine.Find(r.output)) }
 
 // signature returns the line that tells how the run failed: its first
 // assertion failure, panic, or fatal error (a branch of a composer
-// timeline that fails writes its output first), else its first failing
-// test, else "timeout" or its exit status.
+// timeline that fails writes its output first, unless the timeline had
+// failed before it), else its first failing test, else "timeout" or its
+// exit status.
 func (r *result) signature() string {
 	line := failureLine.Find(r.output)
 	if line == nil {
@@ -409,10 +422,26 @@ func (r *result) key() string { return failureKey(r.signature()) }
 
 // failureKey returns the key of a signature.
 func failureKey(sig string) string {
-	if m := assertDetails.FindStringSubmatchIndex(sig); m != nil {
-		sig = sig[:m[2]]
+	msg, _ := splitSignature(sig)
+	return masked.ReplaceAllString(msg, "N")
+}
+
+// splitSignature splits an assertion failure's signature into its message
+// and its details, which are only the first failure's. When the details
+// are only an error, as a compose check reports its failure, the message
+// keeps the error's first line, so that a check that fails in different
+// ways, such as a safety and a liveness violation, makes a group of each.
+func splitSignature(sig string) (msg, details string) {
+	m := assertDetails.FindStringSubmatchIndex(sig)
+	if m == nil {
+		return sig, ""
 	}
-	return masked.ReplaceAllString(sig, "N")
+	msg, details = sig[:m[2]], sig[m[2]+1:]
+	if e := errDetails.FindStringSubmatch(details); e != nil {
+		err, _, _ := strings.Cut(e[1], "\n")
+		msg += ": " + truncate(err, 160)
+	}
+	return msg, details
 }
 
 // failures returns the run's assertion failures, panics, and fatal
@@ -430,7 +459,21 @@ func (r *result) failures() []string {
 // branch returns the number of the composer branch the failure happened
 // in, or 0 for the timeline itself.
 func (r *result) branch() int {
-	m := branchSet.FindSubmatch(r.output)
+	// The branch whose output comes first, before the timeline's, failed
+	// first: its trace line, the run's first, is followed by its number.
+	// A branch that died before it printed one is named by the run's
+	// first failure, the timeline's report of it.
+	var m [][]byte
+	if first := traceLine.FindIndex(r.output); first != nil {
+		rest := r.output[first[1]:]
+		if next := traceLine.FindIndex(rest); next != nil {
+			rest = rest[:next[0]]
+		}
+		m = branchLine.FindSubmatch(rest)
+	}
+	if m == nil {
+		m = branchWrapper.FindSubmatch([]byte(r.signature()))
+	}
 	if m == nil {
 		return 0
 	}
@@ -483,9 +526,31 @@ func (s *search) replayLine(r *result, debug bool) string {
 	if m := traceHash.FindSubmatch(r.output); m != nil {
 		env = addSearch(env, "trace="+string(m[1]))
 	}
+	env = slices.Concat(env, r.env, s.vars)
+	// Set the variables the program read as the run had them, and unset
+	// those it did not have, since the shell the line runs in may have
+	// others, such as NO_COLOR, which can change the schedule.
+	var unset []string
+	for _, k := range s.envRead(r) {
+		if slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, k+"=") }) {
+			continue
+		}
+		if v, ok := lookupEnv(slices.Concat(os.Environ(), s.env, r.env), k); !ok {
+			unset = append(unset, k)
+		} else if !slices.Contains([]string{"HOME", "PATH", "USER", "LOGNAME", "SHELL", "PWD"}, k) {
+			env = append(env, k+"="+v)
+		}
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "cd %s && ", quote(s.dir))
-	for _, e := range slices.Concat(env, r.env, s.vars) {
+	if len(unset) > 0 {
+		b.WriteString("env")
+		for _, k := range unset {
+			b.WriteString(" -u " + quote(k))
+		}
+		b.WriteString(" ")
+	}
+	for _, e := range env {
 		k, v, _ := strings.Cut(e, "=")
 		fmt.Fprintf(&b, "%s=%s ", k, quote(v))
 	}
@@ -500,6 +565,34 @@ func (s *search) replayLine(r *result, debug bool) string {
 		b.WriteString(" " + quote(a))
 	}
 	return b.String()
+}
+
+// envRead returns the names of the variables the program read, in the
+// base run or in r, which print them (GODETSEARCH's envread), but those
+// that replay lines and debugging set themselves.
+func (s *search) envRead(r *result) []string {
+	var names []string
+	for _, out := range [][]byte{s.baseOutput, r.output} {
+		if m := envReadLine.FindSubmatch(out); m != nil {
+			for _, k := range strings.Fields(string(m[1])) {
+				if !strings.HasPrefix(k, "GODET") && k != "GODEBUG" && !slices.Contains(names, k) {
+					names = append(names, k)
+				}
+			}
+		}
+	}
+	return names
+}
+
+// lookupEnv returns the value of k in env, the last one if it is set more
+// than once, as exec.Cmd does.
+func lookupEnv(env []string, k string) (string, bool) {
+	for i := len(env) - 1; i >= 0; i-- {
+		if v, ok := strings.CutPrefix(env[i], k+"="); ok {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 // splitEnv splits our environment into the variables a new shell of the
@@ -670,7 +763,7 @@ func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
 	}
 	pgid := cmd.Process.Pid
 	defer syscall.Kill(-pgid, syscall.SIGKILL)
-	untrack := s.track(start, func() { syscall.Kill(-pgid, syscall.SIGKILL) })
+	untrack := s.track(start, pgid, func() { syscall.Kill(-pgid, syscall.SIGKILL) })
 	defer untrack()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -695,7 +788,7 @@ func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
 		}
 	}
 	r.wall = time.Since(start)
-	r.outOfMem = untrack()
+	r.outOfMem, r.memAtStop = untrack()
 	r.output, r.outputSize = out.bytes(), out.n
 	if ee, ok := err.(*exec.ExitError); ok {
 		r.exitCode = ee.ExitCode()
@@ -733,6 +826,9 @@ func (s *search) run(ctx context.Context, n uint64) error {
 				return
 			}
 		}
+		s.mu.Lock()
+		s.printf("detsched: the last of the %d runs started; waiting for the runs still going\n", n)
+		s.mu.Unlock()
 	}()
 	var (
 		wg       sync.WaitGroup
@@ -762,6 +858,9 @@ func (s *search) run(ctx context.Context, n uint64) error {
 	// sender may kill it for (as a tool's stop often follows SIGTERM
 	// with SIGKILL a second later).
 	if firstErr == nil && !errors.Is(ctx.Err(), context.Canceled) {
+		s.mu.Lock()
+		s.printf("detsched: %d runs done; running seed 1 once more, to check that its schedule has not changed, before the summary\n", s.runs)
+		s.mu.Unlock()
 		s.recheck()
 	}
 	return firstErr
@@ -806,6 +905,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	if r.outOfMem {
 		s.outOfMem++
+		if s.bigStopped == nil || r.memAtStop > s.bigStopped.memAtStop {
+			s.bigStopped = r
+		}
 		s.mu.Unlock()
 		return nil
 	}
@@ -983,24 +1085,27 @@ func (s *search) status() string {
 	return line
 }
 
-// report prints the status line every second on a terminal, else every
-// 30 seconds, and writes the summary so far to a file every 30 seconds,
-// until the returned function is called.
+// report prints the status line every second on a terminal, else after
+// 5 seconds and then every 30, and writes the summary so far to a file
+// every 30 seconds, until the returned function is called.
 func (s *search) report() (stop func()) {
 	every := 30 * time.Second
 	if s.live {
 		every = time.Second
 	}
 	fmt.Fprintf(s.progress, "detsched: the summary so far is in %s, every 30 seconds\n", s.temp("summary"))
-	t := time.NewTicker(every)
+	t := time.NewTicker(min(every, 5*time.Second))
 	done := make(chan bool)
 	go func() {
 		last := time.Now()
-		for {
+		for first := true; ; first = false {
 			select {
 			case <-done:
 				return
 			case <-t.C:
+			}
+			if first {
+				t.Reset(every)
 			}
 			s.mu.Lock()
 			if s.live {
@@ -1075,6 +1180,9 @@ func (s *search) summary(w io.Writer) {
 	}
 	if s.outOfMem > 0 {
 		fmt.Fprintf(w, "detsched: %d runs were stopped because memory ran out, not counted as failures\n", s.outOfMem)
+		if r := s.bigStopped; r.memAtStop > 0 {
+			fmt.Fprintf(w, "detsched: the largest held %d MB of its own when it was stopped; a run that grows without bound is a bug of the program or the harness:\n\treplay: %s\n", r.memAtStop>>20, s.replayLine(r, false))
+		}
 	}
 	if s.tooLong > 0 {
 		fmt.Fprintf(w, "detsched: %d runs made 1000 times the switches of the first and were stopped, not counted as failures\n", s.tooLong)
@@ -1085,10 +1193,7 @@ func (s *search) summary(w io.Writer) {
 	for _, g := range s.groups {
 		// The heading leaves out the details, which are only the first
 		// run's.
-		msg, details := g.sig, ""
-		if m := assertDetails.FindStringSubmatchIndex(g.sig); m != nil {
-			msg, details = g.sig[:m[2]], g.sig[m[2]+1:]
-		}
+		msg, details := splitSignature(g.sig)
 		fmt.Fprintf(w, "\nFAIL %d of %d runs: %s\n", g.runs, s.runs, msg)
 		if details != "" {
 			fmt.Fprintf(w, "\tits first run: %s\n", details)
@@ -1125,10 +1230,7 @@ func (s *search) kindSummary(w io.Writer) {
 			fmt.Fprintf(w, "\t(and %d more)\n", len(ks)-i)
 			break
 		}
-		msg := k.sig
-		if m := assertDetails.FindStringSubmatchIndex(msg); m != nil {
-			msg = msg[:m[2]]
-		}
+		msg, _ := splitSignature(k.sig)
 		fmt.Fprintf(w, "\t%d: %s\n", k.runs, msg)
 	}
 }

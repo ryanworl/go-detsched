@@ -19,7 +19,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin` on
 your `PATH`; it has `go` and `detsched`:
 
 ```
-v=go1.27.4-detsched15
+v=go1.27.4-detsched16
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -73,6 +73,11 @@ FAIL 174 of 489 runs: panic: computed answer twice [recovered, repanicked]
 The `debug:` line runs Delve's `dlv`, which the release archive has in
 `bin/`, next to `go` and `detsched`.
 
+A search keeps its binary, logs, and summary in a new directory under
+`$TMPDIR` (else `/tmp`), which it prints at its start; set `TMPDIR` to
+keep them elsewhere. A search that finds no failure removes all but the
+summary.
+
 Flags, all optional:
 
 - `-run regexp` runs only the matching tests, as `go test -run` does.
@@ -83,10 +88,12 @@ Flags, all optional:
   summary prints the slowest passing and failing runs to choose it from,
   and the progress line counts the runs going on for over 10 times as long
   as the slowest passing run, which may hang, before `-timeout` stops them.
-- `-p n` (default: the number of CPUs) runs `n` programs at once. Lower it
-  when each run takes enough memory that a run per CPU would make the
-  machine swap. detsched and its runs run at nice 10, so a search yields
-  the CPUs to the rest of the machine's work.
+- `-p n` (default: one fewer than the number of CPUs) runs `n` programs at
+  once. Lower it when each run takes enough memory that a run per CPU would
+  make the machine swap. detsched and its runs run at nice 10, so a search
+  yields the CPUs to the rest of the machine's work, and the CPU it leaves
+  free keeps a virtual machine whose host limits its CPU time as a whole
+  responsive.
 - `-seed-base n` adds `n` to every seed after seed 1, so that machines
   splitting a search run disjoint seeds: with `-seed-base $((i << 32))`,
   shard `i` runs seeds `i<<32+2`, `i<<32+3`, and so on. Replay lines print
@@ -198,10 +205,11 @@ hash (`trace=`): a replay whose schedule differs says so at exit
 printed for`). It also sets the variables of detsched's environment that
 change seed 1's schedule, such as one a test reads to plant a bug, or
 `NO_COLOR`, which logging libraries read at init, which detsched finds by
-running seed 1 without groups of its variables, so the command works in a
-new shell. It cannot unset a variable that your shell has and detsched's
-environment did not: when the warning says the schedule differs, compare
-the two environments and run the line with `env -u NAME`. Change nothing: another binary, other arguments
+running seed 1 without groups of its variables, and every other variable
+the program read (the runtime records their names), unsetting with
+`env -u` those it read that detsched's environment did not have, so the
+command runs the same in a new shell whatever that shell sets. Change
+nothing: another binary, other arguments
 (even `-test.v` or `-test.run`), or a line of debugging output added to the
 program changes the schedule. Code that prints diagnostics should run only
 after an assertion has failed (`assert.Failures`), and never behind an
@@ -231,10 +239,10 @@ goroutine's stack there instead. It does not change the run.
 
 Packages under `sdk` let a test tell detsched what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched15:
+and release N's version is v0.N.0, so with go1.27.4-detsched16:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.15.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.16.0
 ```
 
 Import them as `github.com/ryanworl/go-detsched/misc/detsched/sdk/assert`
@@ -531,10 +539,12 @@ it, so the replay command a failure prints shows the timeline again.
   `FaultsOn`. As in Antithesis, a terminal check runs on a branch of the
   timeline: at random times the composer forks the process
   (`sim.Branch`), the branch runs the check and exits, and the timeline
-  goes on, so one timeline checks recovery from many of its states. Once
-  the timeline has failed it forks no more branches, which would fail the
-  same way, so check a symptom you want counted in every run in an
-  `Anytime` command too. A debugger does not follow the fork: `GODETBRANCH=N`, with the same
+  goes on, so one timeline checks recovery from many of its states. A
+  branch reports only the assertions that fail in it. After the timeline
+  has failed, branches still run, so their checks show the failure's
+  symptoms, such as lost writes: their output comes after the timeline's
+  report, and the summary lists them under the timeline's failure. A
+  debugger does not follow the fork: `GODETBRANCH=N`, with the same
   binary and environment as the failing run, runs the Nth branch in the
   process itself, with the same schedule as the forked branch, and the
   composer's output for a failing branch names its `GODETBRANCH`. The

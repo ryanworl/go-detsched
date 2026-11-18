@@ -5,6 +5,11 @@ type, that memory holds only the variable, so printing an interface field
 of it failed with "error loading module data: read out of bounds" until
 some interface in memory had been printed. Read the process's memory.
 
+It also printed the stack of a tracepoint with an "on NAME stack" command
+twice on each hit: printBreakpointInfo prints it, and printTracepoint
+printed it again for any breakpoint without return values. Print it there
+only for the breakpoints on a function's returns.
+
 --- a/pkg/proc/bininfo.go
 +++ b/pkg/proc/bininfo.go
 @@ -1564,6 +1564,11 @@
@@ -19,3 +24,15 @@ some interface in memory had been printed. Read the process's memory.
  	if bi.moduleDataCache == nil {
  		var err error
  		bi.moduleDataCache, err = LoadModuleData(bi, mem)
+--- a/pkg/terminal/command.go
++++ b/pkg/terminal/command.go
+@@ -3095,7 +3095,8 @@
+ 		// As of now traceFollowCalls and Stacktrace are mutually exclusive options
+ 		return
+ 	}
+-	if th.Breakpoint.TraceReturn || !hasReturnValue {
++	// printBreakpointInfo printed a tracepoint's stack already.
++	if th.Breakpoint.TraceReturn && !th.Breakpoint.Tracepoint {
+ 		if th.BreakpointInfo != nil && th.BreakpointInfo.Stacktrace != nil {
+ 			fmt.Fprintf(t.stdout, "\tStack:\n")
+ 			printStack(t, t.stdout, th.BreakpointInfo.Stacktrace, "\t\t", false)

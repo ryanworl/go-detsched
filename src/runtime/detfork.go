@@ -184,6 +184,23 @@ func detForkCheck() uint64 {
 	return 0
 }
 
+// detForkWhy describes a reason detForkCheck gives.
+func detForkWhy(r uint64) string {
+	switch r {
+	case detForkCgo:
+		return "cgo"
+	case detForkNotM0:
+		return "the P is not on the main thread"
+	case detForkBusyM:
+		return "an M is locked to a goroutine, in a system call, or slow to park"
+	case detForkPollFDs:
+		return "descriptors are registered with the network poller"
+	case detForkSecurity:
+		return "the system's certificate verifier was used"
+	}
+	return "unknown reason"
+}
+
 // detForkMsIdle reports whether every M other than m0 and the watchdog is
 // parked idle.
 func detForkMsIdle() bool {
@@ -311,19 +328,28 @@ func detForkProcess() (pid int64, child bool) {
 // parent, which puts it at the head of its own buffered output, so that a
 // driver sees the branch's failure first, and a process forked from the
 // parent later, such as a search's cell, has the output with the failure.
+// A branch reports only the assertions that fail in it, not those the
+// timeline failed before it forked. When the timeline had failed already,
+// its failure came first, so the branch's output goes after the
+// timeline's report instead (detOut.late), as a symptom of it, and the
+// timeline forks no more branches, which would show the same.
 
 // detsimBranch forks a branch that ends the timeline. In the child it
 // returns the branch's number, from 1, which GODETBRANCH takes to run
 // the branch in place. In the parent it waits for the child and returns
 // 0; a child that exits with a nonzero status records the assertion
 // failure msg in the parent. It returns 0 without forking when the
-// process cannot fork now, is a branch itself, or already failed an
-// assertion, which the branch would only report again. Package sim calls
-// it (see detsim_sdk.go).
+// process cannot fork now, is a branch itself, or a branch failed after it
+// had. Package sim calls it (see detsim_sdk.go).
 func detsimBranch(msg string) int {
-	if detBranchChild || detSDK.failures > 0 || detForkCheck() != 0 {
+	if detBranchChild || detOut.late.head != nil {
 		return 0
 	}
+	// Number the branch before asking whether the process can fork: the
+	// answer can depend on real time, such as how soon another M parks or
+	// whether detWatchdog moved the P off the main thread, so a branch that
+	// did not run must not renumber the ones after it, or GODETBRANCH would
+	// replay another branch than the one that failed.
 	detBranchN++
 	if n, ok := atoi64u(gogetenv("GODETBRANCH")); ok {
 		// Run branch n in this process, as its child would run, and pass
@@ -334,7 +360,12 @@ func detsimBranch(msg string) int {
 			return 0
 		}
 		detBranchChild = true
+		detSDKBranch()
 		return detBranchN
+	}
+	if r := detForkCheck(); r != 0 {
+		print("detsched: branch ", detBranchN, " did not run: the process cannot fork now (", detForkWhy(r), ")\n")
+		return 0
 	}
 	var share *detShare
 	if p, err := mmap(nil, detShareSize, _PROT_READ|_PROT_WRITE, _MAP_ANON|detMAP_SHARED, -1, 0); err == 0 {
@@ -343,6 +374,7 @@ func detsimBranch(msg string) int {
 	pid, child := detForkProcess()
 	if child {
 		detBranchChild = true
+		detSDKBranch()
 		if detFork.fd != 0 {
 			closefd(detFork.fd) // the driver's, as are the feedback descriptor and the seen map
 		}
@@ -380,7 +412,7 @@ func detsimBranch(msg string) int {
 			code, what = uint64(sig), " died of signal "
 		}
 		if share != nil {
-			detOutTakeBranch(share, detBranchN)
+			detOutTakeBranch(share, detBranchN, detSDK.failures > 0)
 		}
 		n := string(itoa(nbuf[:], uint64(detBranchN)))
 		detSDKAssert(detAssertAlways, false, msg, "branch "+n+what+string(itoa(buf[:], code))+" (GODETBRANCH="+n+" runs it in place)")

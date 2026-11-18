@@ -18,11 +18,11 @@ Take the `debug:` line `detsched` prints under the `replay:` line. It is the rep
 
 ```
 cd /abs/pkg && GODETSEED=N GODETBRANCH=K dlv exec --disable-aslr /tmp/detsched-XXXX/pkg.test -r stdout:prog.out -r stderr:prog.err --init cmds.dlv --allow-non-terminal-interactive=true -- -test.run=TestX </dev/null >dlv.out 2>&1
-sed 's/\x1b\[[0-9;]*m//g' dlv.out | grep -a -v '^>>' | grep -a -E $'^> |^\t'
+sed 's/\x1b\[[0-9;]*m//g' dlv.out | grep -a -v '^>>' | grep -a -E $'^> |^\t|^cmds\\.dlv:[0-9]+: '
 grep -a '^detsched: trace=' prog.err
 ```
 
-`-r` keeps the program's own output, which may be megabytes, out of `dlv.out`, which then holds only dlv's: a tracepoint hit is a line starting with `> `, and each of its `on` prints a line starting with a tab, more lines with deeper tabs for a struct. Write the tab in the pattern as `$'\t'`: `grep -E` reads `\t` as the letter `t` and drops every value line.
+`-r` keeps the program's own output, which may be megabytes, out of `dlv.out`, which then holds only dlv's: a tracepoint hit is a line starting with `> `, and each of its `on` prints a line starting with a tab, more lines with deeper tabs for a struct, and a command of the file that failed, such as a tracepoint on a location dlv did not find, prints `cmds.dlv:LINE: ERROR`. Write the tab in the pattern as `$'\t'`: `grep -E` reads `\t` as the letter `t` and drops every value line.
 
 `--disable-aslr` is required on macOS: without it the program re-executes itself without ASLR at startup and none of dlv's breakpoints ever stops. The program then prints `detsched: running again without ASLR, so a debugger loses its breakpoints; start the program without ASLR (dlv exec --disable-aslr)` to stderr and runs to the end; rerun with the flag. It is harmless on Linux. The run under dlv is the same run: breakpoints, prints, and time spent stopped don't change it. Check that its trace line in `prog.err` (or `dlv.out` without `-r`) equals the log's; a replay that runs another schedule also prints `detsched: warning: this run's schedule is not the one its replay line was printed for`. Never rebuild the binary for debugging, including with `-gcflags=all=-N -l`; work with the optimized binary.
 

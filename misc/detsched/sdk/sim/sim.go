@@ -748,17 +748,18 @@ func Rand() uint64 { return runtime_rand() }
 // should run its check and exit, and false in the timeline, which waits
 // for the branch to exit and then goes on as if it had not forked. A
 // branch that exits with a nonzero status fails the assertion msg in the
-// timeline; its output is written only then. Branch returns false without
-// forking where the process cannot fork, such as in stock builds, with
-// cgo, or in a branch, and once an assertion failed, as the branch would
-// fail too.
+// timeline; its output is written only then. A branch reports only the
+// assertions that fail in it, not those the timeline failed before. Branch
+// returns false without forking where the process cannot fork, such as in
+// stock builds, with cgo, or in a branch.
 //
 // A debugger does not follow the fork. With GODETBRANCH=N in the
 // environment, the runtime forks no branch: the Nth branch it would fork
 // runs in the process itself, with the same schedule as the forked child,
 // and every other call returns false, as if its branch had passed.
-// Branches are numbered from 1, in the order the timeline forks them;
-// BranchNumber returns the number in a branch.
+// Branches are numbered from 1, in the order the timeline reaches them,
+// counting those it could not fork, which the runtime reports on standard
+// error; BranchNumber returns the number in a branch.
 func Branch(msg string) bool {
 	n := runtime_branch(msg)
 	if n > 0 {

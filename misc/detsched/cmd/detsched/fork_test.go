@@ -329,13 +329,17 @@ func TestSearchSetup(t *testing.T) {
 }
 
 // TestSearchKinds checks that a search makes a group of the runs that fail
-// each assertion, whatever their details, and that a group lists another
-// assertion its runs fail with the log of the first run that failed it.
+// each assertion, whatever their details, but for each error, numbers
+// aside, of one whose details are only an error, and that a group lists
+// another assertion its runs fail with the log of the first run that
+// failed it.
 func TestSearchKinds(t *testing.T) {
 	s := runSearch(t, "../../testdata/assertkinds", 300)
 	first := findGroup(s, "detsched: assertion failed: the first invariant holds")
 	second := findGroup(s, "detsched: assertion failed: the second invariant holds")
-	if len(s.groups) != 2 || first == nil || second == nil || first == second {
+	leaders := findGroup(s, "detsched: assertion failed: the check succeeds map[err:two leaders")
+	applied := findGroup(s, "detsched: assertion failed: the check succeeds map[err:node")
+	if len(s.groups) != 4 || first == nil || second == nil || first == second || leaders == nil || applied == nil || leaders == applied {
 		t.Fatalf("want a group for each invariant:\n%s", searchReport(s))
 	}
 	a := first.also[failureKey("detsched: assertion failed: the rare symptom is absent map[n:1]")]
@@ -392,7 +396,8 @@ func TestSearchReports(t *testing.T) {
 // TestSearchCompose checks that the search finds simcompose's seeded bug,
 // and that each failure's command replays it in a new shell, in place of
 // the composer branch it failed in, setting the variable that plants the
-// bug and no other.
+// bug and no other, and unsetting the one the program read but the search
+// did not have, which would change the schedule.
 func TestSearchCompose(t *testing.T) {
 	t.Setenv("SIMCOMPOSE_BUG", "1")
 	t.Setenv("SIMCOMPOSE_UNREAD", "1")
@@ -418,6 +423,15 @@ func TestSearchCompose(t *testing.T) {
 		if g.status != "reproduced" {
 			t.Errorf("%s: the replay %s", g.sig, g.status)
 		}
+		if !strings.Contains(g.replay, " env -u SIMCOMPOSE_EXTRA ") {
+			t.Errorf("%s: replay %s does not unset SIMCOMPOSE_EXTRA", g.sig, g.replay)
+		}
+	}
+	cmd := exec.Command("sh", "-c", s.groups[0].replay)
+	cmd.Env = append(os.Environ(), "SIMCOMPOSE_EXTRA=1")
+	out, _ := cmd.CombinedOutput()
+	if !strings.Contains(string(out), s.groups[0].sig) || strings.Contains(string(out), "warning: this run's schedule is not") {
+		t.Errorf("with SIMCOMPOSE_EXTRA=1, %s printed\n%.3000s\nwant %s on the same schedule", s.groups[0].replay, out, s.groups[0].sig)
 	}
 }
 

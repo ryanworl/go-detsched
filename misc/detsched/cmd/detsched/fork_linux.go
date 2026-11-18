@@ -52,6 +52,22 @@ func memory() (avail, total uint64) {
 	return avail, total
 }
 
+// privateMem returns the bytes of memory process pid holds that no other
+// process shares, such as the program it was forked from, or 0 if it
+// cannot tell.
+func privateMem(pid int) uint64 {
+	b, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/smaps_rollup")
+	var n uint64
+	for line := range strings.Lines(string(b)) {
+		k, v, _ := strings.Cut(line, ":")
+		if k == "Private_Clean" || k == "Private_Dirty" {
+			kb, _ := strconv.ParseUint(strings.TrimSuffix(strings.TrimSpace(v), " kB"), 10, 64)
+			n += kb << 10
+		}
+	}
+	return n
+}
+
 // statField returns a field of the cgroup's memory.stat, or 0.
 func statField(dir, key string) uint64 {
 	b, _ := os.ReadFile("/sys/fs/cgroup" + dir + "/memory.stat")

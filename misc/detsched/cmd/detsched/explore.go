@@ -161,7 +161,7 @@ func (s *search) prepare(ctx context.Context) error {
 	if trace == "" {
 		return fmt.Errorf("%s printed no detsched trace line; build it with a detsched toolchain and GOEXPERIMENT=detsched\n%s", s.bin, truncate(string(base.output), 2000))
 	}
-	s.baseTrace = trace
+	s.baseTrace, s.baseOutput = trace, base.output
 	if runs[1].trace() != trace {
 		s.unstable = fmt.Sprintf("seed 1 ran two different schedules (%q, then %q), so failures may not replay; the program depends on something besides its seed, such as real time or the OS", trace, runs[1].trace())
 		s.printf("detsched: warning: %s\n", s.unstable)
@@ -762,7 +762,7 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 	s.mu.Lock()
 	s.forked = true
 	s.mu.Unlock()
-	untrack := s.track(start, func() { syscall.Kill(pid, syscall.SIGKILL) })
+	untrack := s.track(start, pid, func() { syscall.Kill(pid, syscall.SIGKILL) })
 	defer untrack()
 	tape := fmt.Sprintf("%d:%d", at, bseed)
 	if p.tape != "" {
@@ -782,7 +782,8 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 	}
 	hits, _ := os.ReadFile(fb.Name())
 	output, size := readOutput(out.Name())
-	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, wall: time.Since(start), outOfMem: untrack()}
+	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, wall: time.Since(start)}
+	r.outOfMem, r.memAtStop = untrack()
 	var novelAt uint64
 	if len(hits) == len(s.seen)+32 {
 		r.exitCode = int(int64(binary.LittleEndian.Uint64(hits[len(s.seen):])))
@@ -863,32 +864,38 @@ func (s *search) memLow() bool {
 	return low
 }
 
-// A liveRun is a running program, which guardMem may stop.
+// A liveRun is a running program, process pid, which guardMem may stop.
 type liveRun struct {
 	start   time.Time
+	pid     int
 	kill    func()
 	stopped bool
+	mem     uint64 // the private memory it held when guardMem stopped it
 }
 
-// track records a running program that kill stops, until the returned
-// function is called, which reports whether guardMem stopped it.
-func (s *search) track(start time.Time, kill func()) (untrack func() bool) {
-	l := &liveRun{start: start, kill: kill}
+// track records a running program, process pid, that kill stops, until
+// the returned function is called, which reports whether guardMem stopped
+// it and how much private memory it held then.
+func (s *search) track(start time.Time, pid int, kill func()) (untrack func() (bool, uint64)) {
+	l := &liveRun{start: start, pid: pid, kill: kill}
 	s.mu.Lock()
 	s.running[l] = true
 	s.mu.Unlock()
-	return func() bool {
+	return func() (bool, uint64) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		delete(s.running, l)
-		return l.stopped
+		return l.stopped, l.mem
 	}
 }
 
-// guardMem stops the run that has run longest whenever less than a tenth
-// of the memory is available, until ctx is done, so that the search
+// guardMem stops the run that holds the most private memory, or where
+// that is unknown the one that has run longest, whenever less than a
+// tenth of the memory is available, until ctx is done, so that the search
 // cannot run the machine out of memory: a run that takes much more memory
-// than others, or many kept cells at once.
+// than others, or many kept cells at once. A forked run shares most of its
+// pages with the program it was forked from, so stopping the oldest would
+// free little while a runaway run went on growing.
 func (s *search) guardMem(ctx context.Context) {
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
@@ -902,15 +909,20 @@ func (s *search) guardMem(ctx context.Context) {
 			continue
 		}
 		s.mu.Lock()
-		var oldest *liveRun
+		var pick *liveRun
+		var pickMem uint64
 		for l := range s.running {
-			if !l.stopped && (oldest == nil || l.start.Before(oldest.start)) {
-				oldest = l
+			if l.stopped {
+				continue
+			}
+			m := privateMem(l.pid)
+			if pick == nil || m > pickMem || m == pickMem && l.start.Before(pick.start) {
+				pick, pickMem = l, m
 			}
 		}
-		if oldest != nil {
-			oldest.stopped = true
-			oldest.kill()
+		if pick != nil {
+			pick.stopped, pick.mem = true, pickMem
+			pick.kill()
 		}
 		s.mu.Unlock()
 	}
@@ -946,6 +958,6 @@ func (s *search) plain(seed uint64, env ...string) *exec.Cmd {
 	cmd := exec.Command(s.bin, s.args...)
 	cmd.Dir = s.dir
 	cmd.Env = append(append(os.Environ(), s.env...), "PWD="+s.dir, fmt.Sprintf("GODETSEED=%d", seed))
-	cmd.Env = append(cmd.Env, env...)
+	cmd.Env = addSearch(append(cmd.Env, env...), "envread")
 	return cmd
 }

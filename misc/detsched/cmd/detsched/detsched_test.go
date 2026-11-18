@@ -490,17 +490,41 @@ func TestSimBranchInline(t *testing.T) {
 		env    []string
 		forked outcome
 		m      []string
+		late   []string // a seed whose timeline failed before its branch did
 	)
-	for seed := 1; seed <= 200 && m == nil; seed++ {
-		env = []string{fmt.Sprintf("GODETSEED=%d", seed), "SIMCOMPOSE_BUG=1"}
-		forked, _, err = runBin(bin, env...)
+	for seed := 1; seed <= 200 && (m == nil || late == nil); seed++ {
+		e := []string{fmt.Sprintf("GODETSEED=%d", seed), "SIMCOMPOSE_BUG=1"}
+		o, _, err := runBin(bin, e...)
 		if err != nil {
 			t.Fatal(err)
 		}
-		m = regexp.MustCompile(`compose: branch (\d+) runs the terminal phase; .* with (GODETBRANCH=(\d+)) added`).FindStringSubmatch(forked.stdout)
+		bm := regexp.MustCompile(`compose: branch (\d+) runs the terminal phase; .* with (GODETBRANCH=(\d+)) added`).FindStringSubmatch(o.stdout)
+		if bm == nil {
+			continue
+		}
+		// The branch failed first unless the run's first failure is an
+		// anytime check's, in the timeline.
+		_, first, _ := strings.Cut(o.stderr, "detsched: assertion failed: ")
+		if !strings.HasPrefix(first, "compose: anytime") {
+			if m == nil {
+				env, forked, m = e, o, bm
+			}
+		} else if late == nil {
+			late = e
+			// The timeline's failure comes first, then the branch's
+			// output, after the timeline's report.
+			anytime := strings.Index(o.stderr, "detsched: assertion failed: compose: anytime")
+			branchTimeline := strings.Index(o.stderr, "sim: fault timeline of branch ")
+			if anytime < 0 || branchTimeline < anytime || !strings.Contains(o.stderr[branchTimeline:], "detsched: assertion failed: compose: finally") {
+				t.Errorf("%s: the timeline failed, but its branch's failure does not follow its report:\n%s", strings.Join(e, " "), o.stderr)
+			}
+		}
 	}
 	if m == nil || m[1] != m[3] {
 		t.Fatalf("no failing terminal branch names its GODETBRANCH setting in seeds 1 to 200:\n%s%s", forked.stdout, forked.stderr)
+	}
+	if late == nil {
+		t.Errorf("no seed from 1 to 200 has a branch that failed after its timeline")
 	}
 	// The branch writes its output, then the timeline's.
 	branch, _, _ := strings.Cut(forked.stdout, "\nFAIL\n")
@@ -617,6 +641,13 @@ func TestSimPrograms(t *testing.T) {
 		// A goroutine waiting for a mutex that a crashed node's sleeping
 		// goroutine holds gets it once the holder wakes and releases it.
 		{pkg: "simsharedlock", want: []string{"b took the lock"}},
+		// A branch the process cannot fork keeps its number. Before, the
+		// failing branch after it was named GODETBRANCH=1, which runs
+		// the first.
+		{pkg: "simbranchskip", exit: 3, want: []string{
+			"detsched: branch 1 did not run: the process cannot fork now",
+			"the second branch passes branch 2 exited with status 1 (GODETBRANCH=2 runs it in place)",
+		}},
 	} {
 		if tc.seeds == nil {
 			tc.seeds = []string{"1"}

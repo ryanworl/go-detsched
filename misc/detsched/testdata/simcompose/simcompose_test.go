@@ -11,7 +11,8 @@
 //
 // SIMCOMPOSE_BUG=1 makes the server acknowledge a put before it syncs
 // it, syncing every 50ms instead, so that a power failure loses puts it
-// acknowledged.
+// acknowledged. SIMCOMPOSE_EXTRA, when set, starts one more goroutine,
+// which changes the schedule, as NO_COLOR can a logger's.
 package simcompose
 
 import (
@@ -147,6 +148,9 @@ func call(req string) (string, error) {
 func TestCompose(t *testing.T) {
 	if !sim.Supported() {
 		t.Skip("requires GOEXPERIMENT=detsched")
+	}
+	if os.Getenv("SIMCOMPOSE_EXTRA") != "" {
+		go func() {}()
 	}
 	synctest.Test(t, func(t *testing.T) {
 		// The server does not survive disk errors: it ignores a failed

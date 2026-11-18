@@ -24,6 +24,11 @@ func controlSockets() ([2]int, error) {
 	return fds, nil
 }
 
+// privateMem returns the bytes of memory process pid holds that no other
+// process shares, or 0 if it cannot tell, as here: guardMem then stops
+// the oldest run.
+func privateMem(pid int) uint64 { return 0 }
+
 // memory returns how many bytes of memory are available to programs, and
 // how many there are, or zeros if it cannot tell.
 func memory() (avail, total uint64) {

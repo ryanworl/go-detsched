@@ -29,6 +29,8 @@ var (
 
 func runtime_envs() []string // in package runtime
 
+func runtimeEnvRead(key string) // in package runtime, which records the names looked up in det mode
+
 var copyenv = sync.OnceFunc(func() {
 	hint := 0
 	if goexperiment.DetSched {
@@ -72,6 +74,9 @@ func Getenv(key string) (value string, found bool) {
 	copyenv()
 	if len(key) == 0 {
 		return "", false
+	}
+	if goexperiment.DetSched {
+		runtimeEnvRead(key)
 	}
 
 	envLock.RLock()

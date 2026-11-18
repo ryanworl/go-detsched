@@ -606,6 +606,7 @@ type detAssertion struct {
 var detSDK struct {
 	asserts  [256]detAssertion
 	failures int
+	base     int // in a branch, the failures of the timeline before it forked
 
 	// Each failing assertion's message and first details, cut to 512
 	// bytes, after a header of detAllHeader bytes: their length and the
@@ -664,12 +665,19 @@ func detAssertFailed(msg, details string) {
 	detSDK.allCount++
 }
 
-// testing_detAssertFailures returns how many assertions have failed, so
-// that package testing can fail a test during which one failed, and so
-// print its log.
+// testing_detAssertFailures returns how many assertions have failed, in a
+// branch since it forked, so that package testing can fail a test during
+// which one failed, and so print its log.
 //
 //go:linkname testing_detAssertFailures testing.detAssertFailures
-func testing_detAssertFailures() int { return detSDK.failures }
+func testing_detAssertFailures() int { return detSDK.failures - detSDK.base }
+
+// detSDKBranch starts a branch's record of failures afresh, so that it
+// reports only the assertions that fail in it (see detsimBranch).
+func detSDKBranch() {
+	detSDK.base = detSDK.failures
+	detSDK.allN, detSDK.allCount = 0, 0
+}
 
 // detSDKAssert records an assertion of kind with message msg evaluated to
 // cond. details describes a failing assertion; it is empty otherwise.
@@ -741,7 +749,7 @@ func detSDKReport() {
 		}
 		i += detAllHeader + k
 	}
-	if n := detSDK.failures - detSDK.allCount; n > 0 {
+	if n := detSDK.failures - detSDK.base - detSDK.allCount; n > 0 {
 		print("detsched: and ", n, " more assertion failures\n")
 	}
 	if !detFeed.on {

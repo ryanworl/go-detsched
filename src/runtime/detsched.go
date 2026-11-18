@@ -242,7 +242,7 @@ var detQuantum int32 = 100000
 
 // detExit is called by runExitHooks.
 func detExit(code int) {
-	if code == 0 && detSDK.failures > 0 {
+	if code == 0 && detSDK.failures > detSDK.base {
 		code = 3
 	}
 	detOutputFlush(code)
@@ -253,6 +253,7 @@ func detExit(code int) {
 	detTraceReport()
 	detFeedReport(code)
 	detSDKReport()
+	detOut.late.write()
 	if code == 3 {
 		exit(3)
 	}
@@ -269,6 +270,7 @@ func detPanic() {
 	detTraceReport()
 	detFeedReport(2)
 	detSDKReport()
+	detOut.late.write()
 }
 
 // detTraceSwitch records in pp's schedule hash that gp is about to run.
@@ -549,6 +551,8 @@ func detSearchInit() {
 			detMaxSwitches, ok = atoi64u(v)
 		case "trace":
 			detExpectTrace, ok = detParseHex(v)
+		case "envread":
+			detEnvRead.report = true
 		case "quantum":
 			var n uint64
 			n, ok = atoi64u(v)
@@ -675,6 +679,11 @@ func detTraceReport() {
 	if detBranchChild {
 		print("detsched: branch ", detBranchN, " (GODETBRANCH=", detBranchN, " runs it in place)\n")
 	}
+	if detEnvRead.report && detEnvRead.n > 0 {
+		print("detsched: environment read: ")
+		gwrite(detEnvRead.buf[:detEnvRead.n])
+		print("\n")
+	}
 	if len(detTape) > 0 {
 		print("detsched: tape")
 		for i, b := range detTape {
@@ -727,6 +736,9 @@ var detOut struct {
 	// branch is the number of the branch whose output the timeline took,
 	// which heads the buffered output, or 0.
 	branch int
+	// late holds the output of the branches that failed after the
+	// timeline had, which is written after the timeline's report.
+	late detChunks
 }
 
 // detChunks is a list of chunks of buffered output.
@@ -800,7 +812,7 @@ func (s *detShare) write(fd uintptr, p unsafe.Pointer, n int) {
 // head of the buffered output, as it would have come first had the branch
 // written it, so that every process forked later, such as a cell of a
 // search, writes it with the failure the branch left.
-func detOutTakeBranch(s *detShare, n int) {
+func detOutTakeBranch(s *detShare, n int, late bool) {
 	var l detChunks
 	end := min(s.n.Load(), uint64(len(s.data)))
 	for i := uint64(0); i+5 <= end; {
@@ -816,6 +828,15 @@ func detOutTakeBranch(s *detShare, n int) {
 		l.add(2, []byte("detsched: the branch's output was cut at 64 MiB\n"))
 	}
 	if l.head == nil {
+		return
+	}
+	if late {
+		if detOut.late.tail == nil {
+			detOut.late.head = l.head
+		} else {
+			detOut.late.tail.next = l.head
+		}
+		detOut.late.tail = l.tail
 		return
 	}
 	l.tail.next = detOut.head
@@ -873,7 +894,12 @@ func detOutputFlush(code int) {
 	if detOut.onFailure && code == 0 {
 		return
 	}
-	for c := detOut.head; c != nil; c = c.next {
+	detOut.write()
+}
+
+// write writes the output l holds.
+func (l *detChunks) write() {
+	for c := l.head; c != nil; c = c.next {
 		for i := 0; i < c.n; {
 			fd := uintptr(c.data[i])
 			n := int(c.data[i+1]) | int(c.data[i+2])<<8 | int(c.data[i+3])<<16 | int(c.data[i+4])<<24
@@ -1756,9 +1782,9 @@ var detFork struct {
 }
 
 // detBranchChild reports whether this process is a branch that ends the
-// timeline, and detBranchN counts the branches the timeline forked up to
-// it; see detsimBranch. With GODETBRANCH=N, the timeline runs its Nth
-// branch in place instead of forking.
+// timeline, and detBranchN counts the branches the timeline reached up to
+// it, forked or not; see detsimBranch. With GODETBRANCH=N, the timeline
+// runs its Nth branch in place instead of forking.
 var (
 	detBranchChild bool
 	detBranchN     int
@@ -1784,6 +1810,48 @@ const (
 	detEnvCap   = 1024     // variables
 	detEnvBytes = 64 << 10 // bytes of variables
 )
+
+// detEnvRead holds the names of the variables the program looked up with
+// package syscall's Getenv, such as NO_COLOR, separated by spaces. With
+// GODETSEARCH's envread the run prints them at exit, so that a search's
+// replay lines can set them as the run had them, or unset them, whatever
+// the shell they run in has. The names are copied outside the heap, so
+// recording them changes nothing the schedule depends on.
+var detEnvRead struct {
+	lock   mutex
+	report bool
+	n      int
+	buf    [4096]byte
+}
+
+//go:linkname syscall_runtimeEnvRead syscall.runtimeEnvRead
+func syscall_runtimeEnvRead(key string) {
+	lock(&detEnvRead.lock)
+	defer unlock(&detEnvRead.lock)
+	for s := unsafe.String(&detEnvRead.buf[0], detEnvRead.n); s != ""; {
+		name := s
+		if i := bytealg.IndexByteString(s, ' '); i >= 0 {
+			name, s = s[:i], s[i+1:]
+		} else {
+			s = ""
+		}
+		if name == key {
+			return
+		}
+	}
+	n := detEnvRead.n
+	if n > 0 {
+		n++
+	}
+	if n+len(key) > len(detEnvRead.buf) || bytealg.IndexByteString(key, ' ') >= 0 {
+		return
+	}
+	if n > 0 {
+		detEnvRead.buf[n-1] = ' '
+	}
+	copy(detEnvRead.buf[n:], key)
+	detEnvRead.n = n + len(key)
+}
 
 // detEnvHidden is the environment variable that the runtime added to its
 // own environment, if any, which the program does not see (see detNoASLR).

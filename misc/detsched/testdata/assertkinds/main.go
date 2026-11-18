@@ -4,10 +4,13 @@
 
 // Assertkinds fails one of two assertions, each with details, in most
 // runs: the first many times, and in a few of its runs a third, rarer one
-// too, as a symptom of the first.
+// too, as a symptom of the first. In others it fails a check, as a compose
+// check fails, with only an error for details, in one of two ways.
 package main
 
 import (
+	"errors"
+	"fmt"
 	"math/rand/v2"
 
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/assert"
@@ -25,5 +28,11 @@ func main() {
 		}
 	case n < 80:
 		assert.Always(false, "the second invariant holds", map[string]any{"n": n})
+	case n < 90:
+		err := fmt.Errorf("node %d has not applied index %d", n%3, n*7)
+		if n%2 == 0 {
+			err = errors.New("two leaders in one term")
+		}
+		assert.Always(false, "the check succeeds", map[string]any{"err": err.Error()})
 	}
 }
