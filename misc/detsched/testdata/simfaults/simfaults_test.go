@@ -1229,6 +1229,13 @@ func TestForwardSkips(t *testing.T) {
 // disk returns when the fault ends, also when a calm ends it early, while
 // the node's other goroutines and the other nodes run on, and fsyncs on a
 // slowed disk take longer.
+//
+// The goroutine that called fsync reads the time after it returns, and
+// it may first pay CPU time it owes (busy time) at its next tick, which
+// is the call of time.Now. Node a's processor is pinned to unlimited
+// cores at the reference speed, so that such a payment takes from one
+// quantum (a millisecond) to a few microseconds more, never waiting for a
+// core, and an fsync woken late by a disk latency of another length shows.
 func TestDiskFaults(t *testing.T) {
 	if !sim.Supported() {
 		t.Skip("needs GOEXPERIMENT=detsched")
@@ -1238,6 +1245,7 @@ func TestDiskFaults(t *testing.T) {
 		w := sim.NewWorld(sim.Config{})
 		defer w.Close()
 		a := w.AddNode("a", "10.0.0.1")
+		a.SetCPU(sim.UnlimitedCores, 1)
 		b := w.AddNode("b", "10.0.0.2")
 		type span struct {
 			start, end time.Time
@@ -1300,7 +1308,8 @@ func TestDiskFaults(t *testing.T) {
 				fastSum, fastN = fastSum+s.end.Sub(s.start), fastN+1
 			case faults[i].stall:
 				stalledSyncs++
-				wake = wake && s.end.Equal(faults[i].end)
+				late := s.end.Sub(faults[i].end)
+				wake = wake && (late == 0 || late >= time.Millisecond && late < time.Millisecond+50*time.Microsecond)
 			default:
 				slowSum, slowN = slowSum+s.end.Sub(s.start), slowN+1
 			}

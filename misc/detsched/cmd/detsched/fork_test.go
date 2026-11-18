@@ -320,13 +320,17 @@ func TestSearchDirected(t *testing.T) {
 }
 
 // TestSearchSetup checks that the search starts its runs right after the
-// program's setup, and that an assertion failure counts as a failure that
-// its command replays.
+// program's setup, that an assertion failure counts as a failure that its
+// command replays, and that the summary says how many runs evaluated the
+// always assertion.
 func TestSearchSetup(t *testing.T) {
 	s := runSearch(t, "../../testdata/sdk", 200)
 	g := findGroup(s, "detsched: assertion failed: no increment is lost")
 	if s.stop < 2 || g == nil || g.status != "reproduced" || g.runs == s.runs {
 		t.Errorf("want some but not all runs failing the assertion, replayed:\n%s", searchReport(s))
+	}
+	if r := searchReport(s); !regexp.MustCompile(`\ndetsched: runs that evaluated each always assertion .*: "no increment is lost" [1-9]\d*\n`).MatchString(r) {
+		t.Errorf("summary does not count the runs that evaluated the always assertion:\n%s", r)
 	}
 }
 

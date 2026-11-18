@@ -93,7 +93,9 @@ Then the statistics:
   replay line of the slowest passing run when it took 5 seconds or more;
 - the program's `assert.Sometimes` and `assert.Reachable` assertions,
   never-true ones first, with the runs each was reached and held in (one
-  no run reached is not listed), and on one line each, the runs that
+  no run reached is not listed), the runs that evaluated each
+  `assert.Always`, which a search with no failures shows its checks ran
+  in, and on one line each, the runs that
   reached each fault the simulation injected (`fault:`), each nemesis
   fault, each compose feature, and each kind of node panic;
 - when runs failed more than one way, the runs that failed each way, first

@@ -241,7 +241,7 @@ type search struct {
 	predicted   []string                // deadlocks the lock order predicts
 	directed    [2]int                  // runs directed at predicted deadlocks, and those that failed
 	bigOutput   int64                   // the most output a run wrote
-	asserts     map[string]*assertCount // sometimes and reachable assertions, by kind and message
+	asserts     map[string]*assertCount // always, sometimes and reachable assertions, by kind and message
 }
 
 // An assertCount counts the runs that reached an assertion, and the runs
@@ -419,7 +419,7 @@ var (
 	traceLine     = regexp.MustCompile(`(?m)^detsched: trace=0x[0-9a-f]+ switches=\d+ syncs=\d+$`)
 	traceHash     = regexp.MustCompile(`(?m)^detsched: trace=(0x[0-9a-f]+) `)
 	branchWrapper = regexp.MustCompile(`\(GODETBRANCH=(\d+) runs it in place\)( \(and \d+ more failures?\))?$`)
-	assertCounts  = regexp.MustCompile(`(?m)^detsched: assert (sometimes|reachable) true=(\d+) false=\d+ (.*)$`)
+	assertCounts  = regexp.MustCompile(`(?m)^detsched: assert (always|always-or-unreachable|sometimes|reachable) true=(\d+) false=\d+ (.*)$`)
 	switchesField = regexp.MustCompile(` switches=(\d+) `)
 	envReadLine   = regexp.MustCompile(`(?m)^detsched: environment read: (.*)$`)
 	syncsField    = regexp.MustCompile(` syncs=(\d+)$`)
@@ -1516,7 +1516,7 @@ func (s *search) fallbacks() []fallback {
 			"run a replay line and check that its trace line equals the first one in the log")
 	}
 	// With -exec, the user built the binary, and the debug line runs it.
-	if len(s.groups) > 0 && s.debugBin == "" && s.built {
+	if s.debugBin == "" && s.built && (s.debugNote != "" || len(s.groups) > 0) {
 		why, fix := s.debugNote, "debug the optimized binary: read values at function entries, where arguments are readable"
 		if why == "" {
 			why = "the build without optimizations was not ready when the search ended"
@@ -1723,7 +1723,7 @@ func (s *search) kindSummary(w io.Writer) {
 	}
 }
 
-// countAsserts counts the sometimes and reachable assertions of a run's
+// countAsserts counts the always, sometimes and reachable assertions of a run's
 // reports: the timeline's, at the end of its output, and those of the
 // branches it forked that failed, which come first. An assertion is
 // reached, or true, in the run if it was in any of them. s.mu must be
@@ -1753,12 +1753,13 @@ func (s *search) countAsserts(out []byte) {
 var sdkAsserts = []string{"fault: ", "nemesis: ", "compose: ", "node panicked: "}
 
 // assertSummary prints the sometimes and reachable assertions, those never
-// true first, and then on one line those of the SDK. s.mu must be held.
+// true first, then on one line how many runs evaluated each always
+// assertion, and on one line those of the SDK. s.mu must be held.
 func (s *search) assertSummary(w io.Writer) {
 	cs := slices.SortedFunc(maps.Values(s.asserts), func(a, b *assertCount) int {
 		return cmp.Or(cmp.Compare(min(a.held, 1), min(b.held, 1)), strings.Compare(a.kind, b.kind), strings.Compare(a.msg, b.msg))
 	})
-	var own []string
+	var own, always []string
 	sdk := make([][]string, len(sdkAsserts))
 	for _, c := range cs {
 		if c.msg == setupAssert {
@@ -1766,6 +1767,8 @@ func (s *search) assertSummary(w io.Writer) {
 		}
 		i := slices.IndexFunc(sdkAsserts, func(p string) bool { return strings.HasPrefix(c.msg, p) })
 		switch {
+		case strings.HasPrefix(c.kind, "always"):
+			always = append(always, fmt.Sprintf("%q %d", c.msg, c.runs))
 		case i >= 0:
 			if c.held > 0 {
 				sdk[i] = append(sdk[i], fmt.Sprintf("%s %d", strings.TrimPrefix(c.msg, sdkAsserts[i]), c.held))
@@ -1787,6 +1790,12 @@ func (s *search) assertSummary(w io.Writer) {
 			}
 			fmt.Fprintf(w, "\t%s\n", l)
 		}
+	}
+	if len(always) > 0 {
+		if len(always) > 40 {
+			always = append(always[:40], fmt.Sprintf("and %d more", len(always)-40))
+		}
+		fmt.Fprintf(w, "detsched: runs that evaluated each always assertion (one no run evaluated is not listed): %s\n", strings.Join(always, ", "))
 	}
 	for i, l := range sdk {
 		if len(l) > 0 {
