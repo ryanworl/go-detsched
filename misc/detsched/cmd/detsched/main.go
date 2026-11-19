@@ -8,6 +8,7 @@
 // Usage:
 //
 //	detsched [-run regexp] [-duration d] [-n seeds] [-seed-base n] [-timeout d] [-p n] [-exec binary | package]
+//	detsched -check [-run regexp] [-n seeds] [-timeout d] [-p n] [package]
 //
 // Detsched builds the tests of the package (by default, the one in the
 // current directory) with GOEXPERIMENT=detsched, or the package itself if
@@ -33,6 +34,11 @@
 //
 // A run that takes longer than -timeout (default 10m) is stopped with
 // SIGQUIT, which prints its goroutines, and counts as a failure.
+//
+// With -check, detsched checks that the tests can fail: it plants one
+// mistake at a time in the code under test, such as a dropped lock or an
+// ignored error, searches each such mutant, and reports those no run
+// caught.
 //
 // Detsched exits with status 1 if any run failed.
 package main
@@ -69,6 +75,7 @@ var (
 	procs    = flag.Int("p", max(runtime.NumCPU()-1, 1), "run this many programs at once")
 	seedBase = flag.Uint64("seed-base", 0, "add `n` to every seed after seed 1, so machines searching together run disjoint seeds")
 	execFlag = flag.String("exec", "", "run this prebuilt `binary` in the current directory instead of building a package")
+	checkFlg = flag.Bool("check", false, "check that the tests can fail: plant one mistake at a time in the code under test, run -n runs (default 100) of each, and report which no run caught")
 )
 
 func main() {
@@ -89,6 +96,19 @@ func main() {
 	pkg := "."
 	if flag.NArg() == 1 {
 		pkg = flag.Arg(0)
+	}
+	if *checkFlg {
+		if *execFlag != "" {
+			fmt.Fprintf(os.Stderr, "detsched: -check builds the package, so it takes no -exec\n")
+			os.Exit(2)
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		code, err := mutationCheck(ctx, pkg, *runFlag, *seeds, max(*procs, 1), *timeout, os.Stdout)
+		stop()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "detsched: %v\n", err)
+		}
+		os.Exit(code)
 	}
 	s, err := newSearch(pkg, *execFlag, *runFlag)
 	if err != nil {
@@ -232,7 +252,6 @@ type search struct {
 	skipWhy     map[uint64]int // those runs, by why
 	cut         int            // runs whose output was cut
 	passed      int            // runs that passed
-	passFaults  map[string]int // faults that fired in passing runs, by assertion message
 	yieldSites  []string
 	predicted   []string                // deadlocks the lock order predicts
 	directed    [2]int                  // runs directed at predicted deadlocks, and those that failed
@@ -243,6 +262,9 @@ type search struct {
 	noFaultRuns int                     // those that ended before any fault was injected
 	calmRuns    int                     // those whose nemesis drew a run without faults
 	injected    map[string]bool         // faults some run injected, by faultName
+	attribSem   chan bool               // held by the group whose faults are being found (see attrib.go)
+	attribWG    sync.WaitGroup          // the groups whose faults are being found
+	inCheck     bool                    // a search of -check's
 }
 
 // An assertCount counts the runs that reached an assertion, and the runs
@@ -265,7 +287,7 @@ type group struct {
 	also   map[string]*also // other failures in its runs, by key
 	left   string           // for a deadlock at the end of the test, the goroutines left
 	where  string           // for a run that did not finish, the goroutines its last switches went to
-	faults map[string]int   // faults that fired in its runs, by assertion message
+	attrib string           // the faults it needs, once found (see attrib.go), or ""
 }
 
 // An also is a failure of another kind in a group's runs, such as a
@@ -301,10 +323,10 @@ func newSearch(pkg, bin, run string) (*search, error) {
 		injected: map[string]bool{},
 		rng:      rand.New(rand.NewPCG(1, 2)),
 
-		refusals:   map[uint64]int{},
-		skipWhy:    map[uint64]int{},
-		passFaults: map[string]int{},
-		only:       -1,
+		refusals:  map[uint64]int{},
+		skipWhy:   map[uint64]int{},
+		attribSem: make(chan bool, 1),
+		only:      -1,
 	}
 	if bin != "" {
 		// Runs and replay lines use a copy, so that rebuilding the
@@ -1035,6 +1057,14 @@ func (s *search) run(ctx context.Context, n uint64) error {
 		}()
 	}
 	wg.Wait()
+	// A search of n runs waits for the faults of its groups to be found;
+	// a search that ended stops finding them.
+	s.mu.Lock()
+	if slices.ContainsFunc(s.groups, func(g *group) bool { return g.attrib == "being found" }) && ctx.Err() == nil {
+		s.printf("detsched: finding the faults that failures need, before the summary\n")
+	}
+	s.mu.Unlock()
+	s.attribWG.Wait()
 	// Stopped by a signal, the search ends at once, before what the
 	// sender may kill it for (as a tool's stop often follows SIGTERM
 	// with SIGKILL a second later).
@@ -1108,12 +1138,8 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		s.mu.Unlock()
 		return os.WriteFile(s.temp("memory.log"), append([]byte("# "+line+"\n"), r.output...), 0o666)
 	}
-	faults := faultsOf(r.output)
 	if !r.failed() {
 		s.passed++
-		for _, f := range faults {
-			s.passFaults[f]++
-		}
 		if r.wall > s.slowPass {
 			s.slowPass, s.slowPassRun = r.wall, r
 		}
@@ -1133,7 +1159,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	g := s.byKey[r.key()]
 	first := g == nil
 	if first {
-		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}, faults: map[string]int{}}
+		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}}
 		if strings.Contains(g.sig, "blocked goroutines remain") {
 			g.left = leftGoroutines(r.output)
 		}
@@ -1144,9 +1170,6 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		s.groups = append(s.groups, g)
 	}
 	g.runs++
-	for _, f := range faults {
-		g.faults[f]++
-	}
 	counted := map[string]bool{g.key: true}
 	if s.kinds[g.key] == nil {
 		s.kinds[g.key] = &also{sig: g.sig}
@@ -1244,6 +1267,11 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	s.mu.Lock()
 	g.status = status
+	if status == "reproduced" && len(injectedFaults(r.output)) > 0 {
+		g.attrib = "being found"
+		s.attribWG.Add(1)
+		go s.attribute(ctx, g, r)
+	}
 	s.printf("FAIL %s\n%s\tlog:    %s\n\treplay: %s\n\tdebug:  %s\n\t%s\n", g.sig, firstAlso, g.logs[0], g.replay, s.debugLine(g), replayVerdict(status))
 	s.mu.Unlock()
 	return nil
@@ -1626,6 +1654,9 @@ func (s *search) summary(w io.Writer, final bool) {
 	if len(s.groups) > 0 && !slices.ContainsFunc(s.groups, func(g *group) bool { return g.status != "reproduced" }) {
 		fmt.Fprintf(w, "detsched: every failure's replay line reproduced it in a new shell\n")
 	}
+	if final && len(s.groups) == 0 && s.runs > 0 && !s.inCheck {
+		fmt.Fprintf(w, "detsched: no run failed, which does not show that the tests can fail; detsched -check plants one mistake at a time in the code under test and reports those no run caught\n")
+	}
 	for _, g := range s.groups {
 		// The heading leaves out the details, which are only the first
 		// run's.
@@ -1640,8 +1671,8 @@ func (s *search) summary(w io.Writer, final bool) {
 		if g.where != "" {
 			fmt.Fprintf(w, "\t%s\n", g.where)
 		}
-		if f := s.faultLine(g); f != "" {
-			fmt.Fprintf(w, "\tfaults in its runs: %s\n", f)
+		if g.attrib != "" {
+			fmt.Fprintf(w, "\tfaults: %s\n", g.attrib)
 		}
 		more := ""
 		if len(g.logs) > 1 {
@@ -1664,44 +1695,6 @@ func (s *search) summary(w io.Writer, final bool) {
 			}
 		}
 	}
-}
-
-// faultLine describes the faults that fired in most of a group's runs, in
-// at least 3, and in a share of them at least 25 points above the share
-// of passing runs they fired in, most frequent first, as "SITE in N of M
-// (P% of passing runs)". s.mu must be held.
-func (s *search) faultLine(g *group) string {
-	type corr struct {
-		name       string
-		n          int
-		lift, pass float64
-	}
-	var cs []corr
-	for f, n := range g.faults {
-		share := float64(n) / float64(g.runs)
-		pass := 0.0
-		if s.passed > 0 {
-			pass = float64(s.passFaults[f]) / float64(s.passed)
-		}
-		if n >= 3 && 2*n >= g.runs && share-pass >= 0.25 && !strings.HasPrefix(f, "nemesis: a ") && f != "nemesis: overlapping faults" {
-			cs = append(cs, corr{strings.Replace(strings.TrimPrefix(f, "fault: "), "nemesis: ", "nemesis ", 1), n, share - pass, pass})
-		}
-	}
-	slices.SortFunc(cs, func(a, b corr) int {
-		return cmp.Or(b.n-a.n, cmp.Compare(b.lift, a.lift), strings.Compare(a.name, b.name))
-	})
-	var parts []string
-	for i, c := range cs {
-		if i == 3 {
-			break
-		}
-		p := "no run passed"
-		if s.passed > 0 {
-			p = fmt.Sprintf("%.0f%% of passing runs", 100*c.pass)
-		}
-		parts = append(parts, fmt.Sprintf("%s in %d of %d (%s)", c.name, c.n, g.runs, p))
-	}
-	return strings.Join(parts, ", ")
 }
 
 // kindSummary prints how many runs failed each way, first or after

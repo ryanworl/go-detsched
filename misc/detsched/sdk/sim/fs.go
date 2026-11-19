@@ -560,8 +560,10 @@ func (d *disk) powerFail() {
 	torn := buggify.Active("sim.disk.torn")
 	switch {
 	case torn:
+		injected("fault: sim.disk.torn")
 		world.logEvent(d.nodeName(), "power failure keeps some unsynced sectors")
 	case partial:
+		injected("fault: sim.disk.partialcrash")
 		world.logEvent(d.nodeName(), "power failure keeps some unsynced writes")
 	}
 	var walk func(n, parent *inode)

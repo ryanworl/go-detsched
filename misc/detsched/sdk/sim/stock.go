@@ -41,3 +41,5 @@ func runtime_busyStats() (uint64, uint64, int64, int64, int32) {
 }
 
 func runtime_watch(*uint32, func(unsafe.Pointer, int32) (string, bool)) {}
+
+func runtime_faultOff(string, string) bool { return false }

@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched26
+v=go1.27.4-detsched27
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -106,7 +106,7 @@ Then one block per group:
 ```
 FAIL 82 of 6848 runs: detsched: assertion failed: acknowledged write survives
 	its first run: map[acked:199 got:[198]]
-	faults in its runs: sim.disk.fsyncfail in 82 of 82 (26% of passing runs)
+	faults: needs: sim.disk.fsyncfail (0 of 8 fail without it); not needed: nemesis kill (7 of 8), nemesis clockskip (6 of 8); 7 of 8 fail with every fault, in variants of its first run reseeded at setup's end (switch 412)
 	log:    /tmp/detsched-2884579083/fail-1-1.log (and 9 more of these runs: ...)
 	replay: cd ... && GODETSEED=4 GODETBRANCH=0 GODETSEARCH='tape=... trace=0x...' /tmp/.../store.test
 	debug:  cd ... && GODETSEED=4 GODETBRANCH=0 GODETSEARCH='tape=... trace=0x...' dlv exec --disable-aslr /tmp/.../debug/store.test
@@ -120,10 +120,21 @@ FAIL 82 of 6848 runs: detsched: assertion failed: acknowledged write survives
   except that when the only detail is `err`, as a compose check reports
   its failure, the first line of the error is part of it. The next line
   gives the first run's details, which other runs need not share.
-- `faults in its runs` names the simulation's faults and nemesis faults
-  that fired in at least half of the group's runs, and in a share at
-  least 25 points above their share of passing runs: the faults the
-  failure likely needs.
+- `faults` says which of the faults that came with the failure it
+  needs. Once the group's replay reproduces it, `detsched` runs, in the
+  background, 8 variants of the group's first run, reseeded at its last
+  branch point (at setup's end without one) so that only what comes
+  after differs, then the same 8 with one kind of fault turned off after
+  that point, for the 6 kinds that fired in the most variants. A kind
+  without which a third as many variants fail, or fewer, is one the
+  failure `needs`; one without which as many fail is `not needed`. When
+  fewer than 3 of 8 variants fail, it reseeds the first run later,
+  halfway and then three quarters of the way to its failure. A fault
+  that fired before the reseed stays in there, so the line says so
+  instead of calling it not needed. A search of `-n` runs waits for this
+  before its summary; a search that ends otherwise says it was not
+  found. Plain loss on a link (`Link.Drop`) counts as the fault
+  `sim.net.loss`.
 - For a deadlock at the end of a test (`blocked goroutines remain`), a
   line names the goroutines left, by where they wait and what created
   them.
@@ -460,6 +471,42 @@ All are optional.
   failure rates over the same `-n`. `detsched` runs a copy it keeps, which
   replay lines name. Build it as `detsched` does, in the package's
   directory: `GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o pkg.test`.
+- `-check` checks that the tests can fail; see
+  [Checking that the tests can fail](#checking-that-the-tests-can-fail).
+
+## Checking that the tests can fail
+
+A search without failures shows that the tests found nothing, not that
+they could. `detsched -check ./pkg` plants one mistake at a time in the
+code under test and searches each such mutant:
+
+```
+detsched -check: caught 6 of 12 mistakes planted in code the passing runs reached, with 100 runs each (1 more did not compile and was skipped)
+	survived: store.go:36 drop the Lock and Unlock of c.mu
+	caught:   store.go:65 ignore the error in err != nil: detsched: assertion failed: the log counts the syncs that succeeded
+```
+
+- It first searches the unmutated program with the same runs, and stops
+  if any run fails: fix those failures first, since a mutant's could not
+  be told from them.
+- The code under test is the non-test Go files of the tests' module that
+  the test binary links, but detsched's SDK. A coverage build's runs of
+  seeds 1 to 8 pick the lines to mutate: only those a passing run reached.
+- The mistakes: drop a `Lock` and its `Unlock`, buffer an unbuffered
+  channel or unbuffer a buffered one, drop a `close`, flip `<` to `<=` and
+  the like, ignore an `err != nil` check, and drop a `Sync` call as if it
+  succeeded. Up to 20 that compile, spread over these kinds; one that does
+  not compile, such as a variable left unused, is skipped.
+- Each mutant runs `-n` runs (default 100) and stops at its first
+  failure; `-run`, `-p` and `-timeout` apply as to a search. The mutants
+  are built through `go build -overlay`, so the source is untouched.
+- It exits with status 1 when a mutant survived. A survivor is a mistake
+  the tests cannot see: make the workload run that code concurrently and
+  under faults, and assert what it must keep. A survivor that breaks
+  nothing the code promises, such as a buffer it does not depend on, needs
+  nothing. A dropped lock around code with no channel operation, atomic,
+  or other lock inside often survives: detsched switches goroutines mostly
+  at those.
 
 ## The search
 
@@ -494,10 +541,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched26:
+and release N's version is v0.N.0, so with go1.27.4-detsched27:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.26.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.27.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
@@ -696,7 +743,8 @@ is set, as on a passing seed's replay line to check what the harness did.
   `sim.disk.bitflip`, and `sim.disk.misdirect`. They fire only once setup
   has completed (see [No faults](#no-faults)) and outside a nemesis's
   calms, and each one that fires is reported as the assertion
-  `fault: SITE`, which the summary correlates with each group.
+  `fault: SITE`. A link's `Drop` loss is reported as `fault: sim.net.loss`.
+  The summary says which of them each group needs.
   `buggify.Disable` turns off a fault a system does not claim to survive.
 - **Nemesis.** `World.NewNemesis` injects Antithesis's fault catalog, each
   fault for a random duration: partitions, clogs, and cut links in the
@@ -857,7 +905,8 @@ package comment says what it exercises and which test runs it.
 - The simulation: the `sim*` packages, such as `simfaults` for each fault
   and `simcompose` for `sdk/compose`.
 - Harness mistakes, which the summary must name: `runaway` (runs that
-  do not finish), `hang` and `badharness`.
+  do not finish), `hang` and `badharness`; and `mutate`, whose weak
+  harness `-check` must find out.
 - `delve`: the bundled Delve's tests on a failing replay of `simcompose`.
 
 `go test` in `cmd/detsched` runs the corpus and checks the command itself,

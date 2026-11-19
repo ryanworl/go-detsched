@@ -52,6 +52,9 @@ func runtime_setNode(node int32) int32
 
 // runtime_call runs f at once, on the system stack.
 //
+//go:linkname runtime_faultOff
+func runtime_faultOff(group, name string) bool
+
 //go:linkname runtime_call
 //go:noescape
 func runtime_call(f func())

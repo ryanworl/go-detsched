@@ -647,6 +647,7 @@ func detRandInit(pp *p) {
 //	maxtime=NS            stop when virtual time passes NS
 //	maxheap=B             stop when a GC finds more than B bytes live
 //	stopat=N              stop at switch N
+//	faultoff=NAME,...     inject none of these faults past the tape (see detFaultOff)
 //	perturb=off|walk|pct  use one strategy instead of drawing one per run
 //	quantum=N             ticks per quantum without perturbation (see detQuantum)
 //	trace=0xH             the schedule hash the run should have (see detExpectTrace)
@@ -694,6 +695,8 @@ func detSearchInit() {
 		case "stopat":
 			detRunaway.at, ok = atoi64u(v)
 			detRunaway.on = true
+		case "faultoff":
+			detFaultsOff = v
 		case "trace":
 			detExpectTrace, ok = detParseHex(v)
 		case "envread":
@@ -722,6 +725,37 @@ func detSearchInit() {
 			fatal("GODETSEARCH has an unknown field or a bad value")
 		}
 	}
+}
+
+// detFaultsOff is GODETSEARCH's faultoff: the comma-separated names of
+// faults the simulation must not inject, such as sim.disk.fsyncfail or
+// nemesis:partition, or * for all of them, with which the detsched
+// command replays variants of a failing run to find which faults the
+// failure needs.
+var detFaultsOff string
+
+// detFaultOff reports whether the fault named group+name is in
+// GODETSEARCH's faultoff and the run is past its tape's last branch
+// point, where the variants of a run part, so that the faults before it
+// stay in. Packages detsched/sdk/buggify and sim call it where they
+// decide to inject a fault; it allocates nothing, so a run's heap, and so
+// its schedule, is the same with and without faultoff.
+func detFaultOff(group, name string) bool {
+	if detFaultsOff == "" || detTapeNext < len(detTape) {
+		return false
+	}
+	for s := detFaultsOff; s != ""; {
+		f := s
+		if i := bytealg.IndexByteString(s, ','); i >= 0 {
+			f, s = s[:i], s[i+1:]
+		} else {
+			s = ""
+		}
+		if f == "*" || len(f) == len(group)+len(name) && f[:len(group)] == group && f[len(group):] == name {
+			return true
+		}
+	}
+	return false
 }
 
 // detExpectTrace is the schedule hash of the run a replay line replays,

@@ -64,7 +64,7 @@ type Link struct {
 	Jitter time.Duration
 	// Drop is the probability that a packet is lost. Over TCP, a lost
 	// packet shows up as a retransmission delay, from 200ms, doubling
-	// for each further loss.
+	// for each further loss. Loss is reported as the fault sim.net.loss.
 	Drop float64
 	// MTU is the largest IP packet the path carries, 1500 bytes if 0. A
 	// UDP datagram that would make a larger packet is lost.

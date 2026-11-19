@@ -435,7 +435,8 @@ func (w *World) udpRoute(src, dst *Node, dg dgram) {
 		if len(dg.data)+udpHeader > mtu {
 			return
 		}
-		if l.Drop > 0 && chance(l.Drop) {
+		if l.Drop > 0 && chance(l.Drop) && !runtime_faultOff("", "sim.net.loss") {
+			injected("fault: sim.net.loss")
 			return
 		}
 		if fault("sim.net.udpdrop", "fault: sim.net.udpdrop", 0.05) {
@@ -444,8 +445,10 @@ func (w *World) udpRoute(src, dst *Node, dg dgram) {
 		if dg.tos != 0 {
 			switch {
 			case buggify.Active("sim.net.ecnbleach"):
+				injected("fault: sim.net.ecnbleach")
 				dg.tos = 0
 			case buggify.Active("sim.net.ecnmangle") && dg.tos == 2:
+				injected("fault: sim.net.ecnmangle")
 				dg.tos = 1
 			}
 		}

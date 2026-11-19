@@ -519,6 +519,9 @@ func (nm *Nemesis) inject() {
 	}
 	kind := nm.pickKind()
 	dur := expRand(nm.dur)
+	if runtime_faultOff("nemesis:", kind) {
+		return // GODETSEARCH's faultoff
+	}
 	ev := Event{Kind: kind, Start: true}
 	var undo func()
 	switch kind {

@@ -7,7 +7,7 @@ The README's "Reading the summary" section says what each line of a group means,
 1. The log's first lines: the replay line and the run's failures, each after `# `.
 2. The first failure in the output, with its details.
 3. The fault timeline at the end of the log (`sim: SECONDS NODE: EVENT`), around the failure's time: crashes, restarts, partitions, pauses, clock skips, disk faults, and the first failure of each assertion. For a branch failure, the branch's timeline comes first.
-4. The group's `faults in its runs` line: the faults it likely needs.
+4. The group's `faults` line: the faults it needs and those it does not, from replays with each kind turned off.
 5. The group's `also in N of these runs` lines: other kinds of failure in the same runs. They may be the same bug's symptoms or another bug; each has its own replay line.
 
 Many failures explain themselves from these. For a run that did not finish (`did not finish: livelock`, `ran N× the longest passing run`, `memory`, `still running`), the group's `of its last N switches` line names the goroutines that kept running, and the log ends with every goroutine's stack; goroutines of a crashed node say so in their header and are frozen.

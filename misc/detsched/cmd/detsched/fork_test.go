@@ -479,7 +479,11 @@ func TestSearchRunaway(t *testing.T) {
 // assertions no run reached, a Sometimes that never held, runs that end
 // before any fault, and faults the harness cannot get; and that t.Fatal on
 // a simulated node's goroutine fails the run there, naming the call,
-// where before the test waited for good and the run ended as a deadlock.
+// where before the test waited for good and the run ended as a deadlock;
+// and that of the faults that come with a failure, the summary names the
+// one it needs, where before it named those that fired more often in
+// failing runs than in passing ones, such as clock skips that come in the
+// same storms.
 func TestSearchBadHarness(t *testing.T) {
 	search := func(t *testing.T, test string, n uint64) *search {
 		t.Setenv("TMPDIR", t.TempDir())
@@ -529,6 +533,17 @@ func TestSearchBadHarness(t *testing.T) {
 		}
 		if !regexp.MustCompile(`detsched: \S*badharness\.TestFatalOnNode\.func1\.3 at \S*/fatal_test\.go:\d+ called t\.FailNow`).Match(log) {
 			t.Errorf("log does not name the call:\n%s", log)
+		}
+	})
+	t.Run("TestSlowServer", func(t *testing.T) {
+		s := search(t, "TestSlowServer", 40)
+		r := searchReport(s)
+		if len(s.groups) != 1 || s.groups[0].status != "reproduced" {
+			t.Fatalf("want one group, reproduced:\n%s", r)
+		}
+		needs, not, _ := strings.Cut(s.groups[0].attrib, "; not needed: ")
+		if !strings.HasPrefix(needs, "needs: nemesis pause (0 of 8 fail without it)") || strings.Contains(needs, "clockskip") || !strings.Contains(not, "nemesis clockskip (") || strings.Contains(r, "faults in its runs") {
+			t.Errorf("want the group to need pauses, and not clock skips:\n%s", r)
 		}
 	})
 }
@@ -710,4 +725,53 @@ func (s *forkServer) branchOutcome(seed, steps uint64) (outcome, error) {
 		return outcome{}, err
 	}
 	return newOutcome(string(out), string(errOut), code), nil
+}
+
+// TestMutationCheck runs -check on harnesses of one package: a strong one
+// that tests the code concurrently and with failing syncs, which must
+// catch a dropped lock and an ignored error, and a weak one that calls it
+// from one goroutine, whose clean searches prove nothing, which must
+// let them survive. A mutant that does not compile is skipped, and a
+// harness that fails without mutations must be fixed first.
+func TestMutationCheck(t *testing.T) {
+	check := func(t *testing.T, pkg, test string) (int, string) {
+		t.Setenv("TMPDIR", t.TempDir())
+		var b strings.Builder
+		code, err := mutationCheck(context.Background(), pkg, "^"+test+"$", 40, 4, time.Minute, &b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return code, b.String()
+	}
+	t.Run("TestStrong", func(t *testing.T) {
+		code, out := check(t, "../../testdata/mutate", "TestStrong")
+		for _, want := range []string{
+			"(1 more did not compile and was skipped)",
+			"drop the Lock and Unlock of c.mu: detsched: assertion failed: the count is the sum of the adds",
+			"ignore the error in err != nil: detsched: assertion failed: the log counts the syncs that succeeded",
+			"drop w.Sync(), as if it succeeded: detsched: assertion failed: the log counts the syncs that succeeded",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("exit status %d, want %q in:\n%s", code, want, out)
+			}
+		}
+	})
+	t.Run("TestWeak", func(t *testing.T) {
+		code, out := check(t, "../../testdata/mutate", "TestWeak")
+		for _, want := range []string{
+			"caught 2 of 10 mistakes",
+			"survived: store.go:36 drop the Lock and Unlock of c.mu",
+			"survived: store.go:65 ignore the error in err != nil",
+		} {
+			if code != 1 || !strings.Contains(out, want) {
+				t.Errorf("exit status %d, want 1 and %q in:\n%s", code, want, out)
+			}
+		}
+	})
+	t.Run("TestFatalOnNode", func(t *testing.T) {
+		code, out := check(t, "../../testdata/badharness", "TestFatalOnNode")
+		if code != 1 || !strings.Contains(out, "the program fails without mutations; fix these failures first") || strings.Contains(out, "caught") {
+			t.Errorf("exit status %d, want 1 and no mutants:\n%s", code, out)
+		}
+	})
 }

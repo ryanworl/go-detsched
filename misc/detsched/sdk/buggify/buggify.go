@@ -85,7 +85,7 @@ func Enable(sites ...string) { optIn.set(true, sites...) }
 // OptIn is Active for a site that is never enabled unless a program
 // allows it with Enable.
 func OptIn(site string) bool {
-	return forced.has(site) || optIn.has(site) && Active(site)
+	return forced.has(site) && !runtime_faultOff(site) || optIn.has(site) && Active(site)
 }
 
 // Disable turns the given sites off in every run, for a test that does not
@@ -108,18 +108,22 @@ func Disable(sites ...string) {
 // On reports whether to inject the fault at site: the site is enabled in
 // this run, and fires with probability 1/4.
 func On(site string) bool {
-	return forced.has(site) || Active(site) && runtime_rand()&3 == 0
+	return forced.has(site) && !runtime_faultOff(site) || Active(site) && runtime_rand()&3 == 0
 }
 
 // OnChance reports whether to inject the fault at site: the site is enabled
 // in this run, and fires with probability p.
 func OnChance(site string, p float64) bool {
-	return forced.has(site) || Active(site) && float64(runtime_rand()>>11)/(1<<53) < p
+	return forced.has(site) && !runtime_faultOff(site) || Active(site) && float64(runtime_rand()>>11)/(1<<53) < p
 }
 
 // Active reports whether site is enabled in this run, which a quarter of
-// the sites are.
+// the sites are. A site the detsched command turned off, to find which
+// faults a failure needs (GODETSEARCH's faultoff), is not.
 func Active(site string) bool {
+	if runtime_faultOff(site) {
+		return false
+	}
 	if forced.has(site) {
 		return true
 	}

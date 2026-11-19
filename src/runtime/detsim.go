@@ -933,7 +933,8 @@ func detsimBuggifyRand() uint64 { return detsimRand() }
 
 func detsimBuggifyEpoch() uint64 { return detsim.epoch }
 
-func detsimBuggifyCall(f func()) { detsimCall(f) }
+func detsimBuggifyCall(f func())             { detsimCall(f) }
+func detsimBuggifyFaultOff(site string) bool  { return detFaultOff("", site) }
 
 func detsimSetClock(on bool, skew int64) { detsim.clock, detsim.skew = on, skew }
 

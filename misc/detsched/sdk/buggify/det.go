@@ -21,3 +21,6 @@ func runtime_epoch() uint64
 //go:linkname runtime_call
 //go:noescape
 func runtime_call(f func())
+
+//go:linkname runtime_faultOff
+func runtime_faultOff(site string) bool

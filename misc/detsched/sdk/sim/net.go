@@ -141,8 +141,17 @@ func (w *World) latency(a, b *Node) int64 {
 	d := int64(l.Latency)
 	d += int64(expRand(l.Jitter))
 	if l.Drop > 0 {
+		// The fault site sim.net.loss, which GODETSEARCH's faultoff
+		// turns off without changing the draws.
+		off, lost := runtime_faultOff("", "sim.net.loss"), false
 		for rto := int64(200e6); rto < int64(tcpTimeout) && chance(l.Drop); rto *= 2 {
-			d += rto
+			if !off {
+				d += rto
+				lost = true
+			}
+		}
+		if lost {
+			injected("fault: sim.net.loss")
 		}
 	}
 	if a != b && fault("sim.net.retransmit", "fault: sim.net.retransmit", 0.05) {
