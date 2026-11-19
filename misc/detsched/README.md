@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched25
+v=go1.27.4-detsched26
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -127,6 +127,8 @@ FAIL 82 of 6848 runs: detsched: assertion failed: acknowledged write survives
 - For a deadlock at the end of a test (`blocked goroutines remain`), a
   line names the goroutines left, by where they wait and what created
   them.
+- For a run that [did not finish](#runs-that-did-not-finish), a line
+  names the goroutines its last switches went to, and where each is.
 - `detsched` keeps the logs of the group's first ten runs, as
   `fail-G-1.log` and on, and of the first run with each other kind of
   failure. A log starts with the run's replay line and its failures, each
@@ -227,6 +229,39 @@ run got there: call `lifecycle.SetupComplete(nil)` once setup is done.
 The fault timeline says when it happened (`world: setup complete: faults
 on`).
 
+### Assertions never reached
+
+`detsched` lists the `sdk/assert` calls with a constant message in the
+packages of the program's module (with `-run`, those in the tests it
+selects), and warns of those no run reached. An `Always` that no run
+evaluates checks nothing; a `Reachable` no run reaches marks a path the
+workload never took. A search with no failures says nothing about them.
+
+### Sometimes never true
+
+A `Sometimes` assertion that runs reached but that never held marks a
+state the search never got to, and nothing after that state was tested.
+Make the workload reach it, or check that the condition can hold.
+
+### Runs end before faults
+
+Of the runs that set up a simulation, a quarter or more ended before it
+injected any fault (counted without the runs whose nemesis drew a run
+without faults, by design). Those runs tested only the fault-free path:
+the workload ends too soon after setup. A Nemesis can start with a calm of
+up to 30 seconds, and buggify faults fire on a small share of operations.
+
+### Faults never injected
+
+Faults the simulation could have injected in 20 runs or more and never
+did (a nemesis kind its storms could pick, a buggify site that runs
+reached), and faults the harness keeps out, with why: a nemesis without
+`NemesisConfig.Restart` kills, crashes, and stops no node; partitions and
+cut links need 2 nodes in `NemesisConfig.Nodes`; node faults need a node
+that `NemesisConfig.Exclude` leaves. Turn off the faults the program does
+not claim to survive with `NemesisConfig.Disable` or `buggify.Disable`,
+which this entry then leaves out.
+
 ### Branch did not run
 
 A composer timeline forks a branch for each terminal check. Where the
@@ -284,39 +319,52 @@ cgroup) is available, `detsched` closes its stopped programs and starts no
 runs; below a tenth, it stops the run holding the most private memory,
 with `SIGQUIT`, so that its log (`memory.log`, for the largest) shows
 where it was, and counts it as neither pass nor failure. A seed 1 stopped
-this way ends the search with its replay line. A run that grows without
-bound is a bug of the harness or the program, such as a history it
-keeps forever; bound it, or lower `-p`. On Linux the replay line of the
+this way ends the search with its replay line. A run whose memory grows
+without bound usually fails first as one that
+[did not finish](#runs-that-did-not-finish); this fallback is for runs
+that stay under that limit but together fill the machine, and for runs
+before any passed: bound what they keep, or lower `-p`. On Linux the replay line of the
 largest runs it in a subshell with `ulimit -v` set above the size it was
 stopped at, so that it ends with `fatal error: out of memory` and its
 stacks instead of exhausting the machine.
-
-### Switch limit
-
-A forked run that makes 1000 times the goroutine switches of a whole run
-that passed (counted since its last fork) is taken to spin, usually a
-loop in virtual time such as a retry without a backoff or a timer that
-keeps firing, and is stopped, not counted as a failure. `detsched` keeps
-the first one's log (`spin.log`) and replays it: its replay line carries
-the same limit (`maxswitches=` in `GODETSEARCH`), so it stops at the same
-switch with the same trace line. If the run loops forever, it is a
-liveness bug.
-
-### Still running
-
-When a search is cut short (`-duration`, a signal), runs going on for over
-10 times as long as the slowest passing run (and at least 10 seconds),
-which the status line counts while it runs, are stopped with `SIGQUIT`
-and grouped as `still running when the search ended`, with their stacks
-in their logs. A replay that ends was only slow; one that does not hangs.
-Shorter runs are dropped. Runs that pass `-timeout` are stopped the same
-way and grouped as `timeout`.
 
 ### Output cut
 
 A run keeps at most 16 MB of its output, its first and last 8 MB, with a
 line where the rest was cut. Print diagnostics once per run, after an
 assertion failed (`assert.Failures() > 0`), not on every failure.
+
+## Runs that did not finish
+
+Every run after the first that passed runs with limits set from the
+most any passing run went, and a run that passes one fails as one that
+did not finish, at a switch that its replay line stops at too. Each way a
+run does not finish is a group:
+
+- `did not finish: livelock at t=...`: while virtual time stayed put, the
+  run's goroutines blocked and woke each other (switches other than
+  preemptions) 10 times more often than in any passing run, and at least
+  100,000 times, such as a retry without a backoff while what it waits
+  for needs time to pass.
+- `did not finish: ran N× the longest passing run`: 20 times its switches
+  (at least a million; a forked run counts from its fork) or its virtual
+  time (at least an hour), such as a poll whose condition never comes
+  true or a timer that keeps firing.
+- `did not finish: memory`: a GC found 20 times more memory live (at
+  least 320 MB) than any passing run held, such as a history the harness
+  keeps forever. Its debug line stops at the same switch (`stopat=`), as
+  the build without optimizations has another heap.
+- `did not finish: still running when the search ended` or `at -timeout`:
+  the run was stopped from outside, with `SIGQUIT`, for its stacks. When a
+  search ends, only runs going on for 10 times as long as the slowest
+  passing run (and at least 10 seconds), which the status line counts,
+  are kept; shorter ones are dropped. Its replay line stops at the switch
+  it was stopped at (`stopat=`). A run blocked in real time, outside the
+  deterministic subset, stops there too: read its stacks.
+
+The group's line `of its last N switches, ...` names the goroutines most
+of the run's last switches went to, and the first function outside the
+runtime each is in. Its log ends with every goroutine's stack.
 
 ## Replaying a failure
 
@@ -328,8 +376,9 @@ kept binary, and its arguments. It sets:
   itself rather than in a forked child, or 0 to run the timeline without
   forking any branch;
 - `GODETSEARCH`, quoted, for a run forked from another (`tape=`, its fork
-  points), directed at a deadlock (`yield=`), or stopped at the switch
-  limit (`maxswitches=`), and the run's schedule hash (`trace=`): a replay
+  points), directed at a deadlock (`yield=`), or one that did not finish
+  (the limit it passed, such as `maxstuck=`, or `stopat=`), and the run's
+  schedule hash (`trace=`): a replay
   whose schedule differs says so at exit
   (`detsched: warning: this run's schedule is not the one its replay line
   was printed for`);
@@ -394,7 +443,7 @@ All are optional.
   before the summary; a signal skips that run.
 - `-timeout d` (default 10m) stops a run that takes longer, with
   `SIGQUIT`, so that its log has every goroutine's stack, and counts it as
-  a failure.
+  a failure that [did not finish](#runs-that-did-not-finish).
 - `-p n` (default: one fewer than the CPUs) runs `n` programs at once.
   Lower it when runs take enough memory to make the machine swap.
   `detsched` and its runs run at nice 10, so a search yields the CPUs to
@@ -442,10 +491,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched25:
+and release N's version is v0.N.0, so with go1.27.4-detsched26:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.25.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.26.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
@@ -476,6 +525,14 @@ with stock Go. `go doc -all` on each documents its API.
   simulation injects faults; `Branches` tells a test with a fixed-length
   workload to count it from the last fork.
 - `sim` and `compose` simulate a cluster; see below.
+
+Under the experiment, `t.Fatal`, `t.FailNow`, `t.Skip`, and `t.SkipNow` on
+a goroutine other than the test's fail the run at the call, which a line
+before `fatal error: detsched: t.FailNow or t.SkipNow on a goroutine that
+is not the test's` names: in stock Go they end only that goroutine, so
+the test goes on, or waits for it for good, and `go vet` does not see the
+goroutines that `Node.Go` starts. Send the error to the test's goroutine,
+or check with `assert`.
 
 ## Simulating a cluster
 
@@ -796,6 +853,8 @@ package comment says what it exercises and which test runs it.
   depends on the binary, so on the architecture.
 - The simulation: the `sim*` packages, such as `simfaults` for each fault
   and `simcompose` for `sdk/compose`.
+- Harness mistakes, which the summary must name: `runaway` (runs that
+  do not finish), `hang` and `badharness`.
 - `delve`: the bundled Delve's tests on a failing replay of `simcompose`.
 
 `go test` in `cmd/detsched` runs the corpus and checks the command itself,

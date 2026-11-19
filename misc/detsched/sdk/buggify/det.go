@@ -17,3 +17,7 @@ func runtime_rand() uint64
 
 //go:linkname runtime_epoch
 func runtime_epoch() uint64
+
+//go:linkname runtime_call
+//go:noescape
+func runtime_call(f func())

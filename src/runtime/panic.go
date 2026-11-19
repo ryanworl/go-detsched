@@ -682,6 +682,9 @@ func deferreturn() {
 //
 // It crashes if called from a thread not created by the Go runtime.
 func Goexit() {
+	if goexperiment.DetSched {
+		detGoexitCheck() // see detsched.go
+	}
 	// Create a panic object for Goexit, so we can recognize when it might be
 	// bypassed by a recover().
 	var p _panic

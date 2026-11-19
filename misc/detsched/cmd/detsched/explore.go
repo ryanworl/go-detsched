@@ -103,17 +103,17 @@ func (c *cell) weight() float64 { return (c.found + 1) / (c.secs + 1) }
 // A proc is a program stopped by its fork server, which launches fork:
 // a setup root or a cell's program.
 type proc struct {
-	mu          sync.Mutex // serializes commands to srv
-	srv         *forkServer
-	pid         int
-	tape        string    // the branch points the stopped program applied
-	parent      *proc     // the server that forked it, or nil
-	ready       chan bool // closed once srv is stopped, or failed with err
-	err         error
-	busy        int       // launches forking it
-	maxSwitches uint64    // the maxswitches it runs with
-	used        time.Time // the last launch it served
-	closed      bool
+	mu     sync.Mutex // serializes commands to srv
+	srv    *forkServer
+	pid    int
+	tape   string    // the branch points the stopped program applied
+	parent *proc     // the server that forked it, or nil
+	ready  chan bool // closed once srv is stopped, or failed with err
+	err    error
+	busy   int       // launches forking it
+	limits limits    // the limits it runs with
+	used   time.Time // the last launch it served
+	closed bool
 }
 
 // feedbackKinds are the runtime's feedback feature kinds, in its order
@@ -368,11 +368,14 @@ func (s *search) launch(ctx context.Context, seed uint64) error {
 func (s *search) plainLaunch(ctx context.Context, a int, seed uint64, yield string) (float64, error) {
 	fb := s.temp(fmt.Sprintf("plain-%d.feedback", seed))
 	defer os.Remove(fb)
-	r, err := s.exec(ctx, s.plain(seed, addSearch(nil, append(yieldField(yield), "feedback="+fb)...)...))
+	s.mu.Lock()
+	lim := s.limits()
+	s.mu.Unlock()
+	r, err := s.exec(ctx, s.plain(seed, addSearch(nil, slices.Concat(yieldField(yield), []string{"feedback=" + fb}, lim.fields)...)...))
 	if err != nil {
 		return 0, err
 	}
-	r.seed, r.yield = seed, yield
+	r.seed, r.yield, r.limits = seed, yield, lim
 	cells := 0
 	if hits, _ := os.ReadFile(fb); !r.failed() && s.canFork {
 		if novel := s.claim(hits); len(novel) > 0 {
@@ -539,7 +542,7 @@ func yieldField(yield string) []string {
 // worth: one for each cell, and ten for a new failure signature.
 func (s *search) reward(cells int, r *result) float64 {
 	x := float64(cells)
-	if r != nil && r.failed() && !r.tooLong() {
+	if r != nil && r.failed() && !r.runaway() {
 		s.mu.Lock()
 		if s.byKey[r.key()] == nil {
 			x += 10
@@ -611,9 +614,9 @@ func (s *search) materialize(ctx context.Context, c *cell) (*proc, error) {
 // state, in p.
 func (s *search) stopCell(ctx context.Context, c *cell, p *proc) error {
 	s.mu.Lock()
-	p.maxSwitches = s.maxSwitches
+	p.limits = s.limits()
 	s.mu.Unlock()
-	fields := append(yieldField(c.yield), "feedback=1", fmt.Sprintf("maxswitches=%d", p.maxSwitches))
+	fields := append(append(yieldField(c.yield), "feedback=1"), p.limits.fields...)
 	if c.tape != "" {
 		fields = append(fields, "tape="+c.tape)
 	}
@@ -814,7 +817,7 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 	}
 	hits, _ := os.ReadFile(fb.Name())
 	output, size := readOutput(out.Name())
-	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, hung: hung, wall: time.Since(start), maxSwitches: p.maxSwitches}
+	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, hung: hung, wall: time.Since(start), limits: p.limits}
 	r.outOfMem, r.memAtStop = untrack()
 	var novelAt uint64
 	if len(hits) == len(s.seen)+32 {
@@ -1017,6 +1020,6 @@ func (s *search) plain(seed uint64, env ...string) *exec.Cmd {
 	cmd := exec.Command(s.bin, s.args...)
 	cmd.Dir = s.dir
 	cmd.Env = append(append(os.Environ(), s.env...), "PWD="+s.dir, fmt.Sprintf("GODETSEED=%d", seed))
-	cmd.Env = addSearch(append(cmd.Env, env...), "envread")
+	cmd.Env = addSearch(append(cmd.Env, env...), "envread", "extent")
 	return cmd
 }

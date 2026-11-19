@@ -412,8 +412,43 @@ func (nm *Nemesis) swarm() {
 		}
 		allowed = append(allowed, k)
 	}
+	runtime_call(nm.reportKinds) // on the system stack, which counts no ticks
 	nm.kinds = pickSome(allowed)
 	nm.modes = pickSome([]Mode{Slowed, Jammed, Stopped})
+}
+
+// reportKinds reports each fault kind a storm could pick, and each that
+// the configuration keeps out, with why, for the detsched command's
+// warning of faults no run injected.
+func (nm *Nemesis) reportKinds() {
+	net, nodes := len(nm.netTargets()), len(nm.nodeTargets())
+	for _, k := range allFaults {
+		if k == FaultRestore || slices.Contains(nm.cfg.Disable, k) {
+			continue
+		}
+		why := ""
+		switch k {
+		case FaultKill, FaultKillProcess, FaultStop:
+			if nm.cfg.Restart == nil {
+				why = "NemesisConfig.Restart is nil"
+				break
+			}
+			fallthrough
+		case FaultPause, FaultThrottle, FaultDisk:
+			if nodes == 0 {
+				why = "NemesisConfig.Exclude has every node"
+			}
+		case FaultPartition, FaultLink:
+			if net < 2 {
+				why = "fewer than 2 nodes"
+			}
+		}
+		if why != "" {
+			assert.Reachable("sim: cannot inject: nemesis: "+k+": "+why, nil)
+		} else {
+			assert.Reachable("sim: can inject: nemesis: "+k, nil)
+		}
+	}
 }
 
 // pickSome returns each element of xs with probability 1/2, and at least

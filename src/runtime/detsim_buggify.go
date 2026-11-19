@@ -14,3 +14,4 @@ import _ "unsafe" // for go:linkname
 
 //go:linkname detsimBuggifyRand github.com/ryanworl/go-detsched/misc/detsched/sdk/buggify.runtime_rand
 //go:linkname detsimBuggifyEpoch github.com/ryanworl/go-detsched/misc/detsched/sdk/buggify.runtime_epoch
+//go:linkname detsimBuggifyCall github.com/ryanworl/go-detsched/misc/detsched/sdk/buggify.runtime_call

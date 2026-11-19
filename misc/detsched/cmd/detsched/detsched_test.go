@@ -680,6 +680,10 @@ func TestSimPrograms(t *testing.T) {
 		{pkg: "simfinalizer", search: "perturb=pct", seeds: []string{"1", "3"}},
 		// The CPU work of a simulation's nodes takes simulated time.
 		{pkg: "simbusy"},
+		// A run in which only the simulation's events run collects their
+		// garbage. Before, a week of idle keepalives grew the heap by
+		// 561 MB without a GC.
+		{pkg: "simidlegc"},
 		// A crash stops the node's tickers. Before, the ticker kept the
 		// clock jumping from tick to tick: an hour of microsecond ticks
 		// hit the switch limit.

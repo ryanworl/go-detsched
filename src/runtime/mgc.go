@@ -2073,6 +2073,9 @@ func gcMark(startTime int64) {
 
 	// Reset controller state.
 	gcController.resetLive(work.bytesMarked)
+	if goexperiment.DetSched && detRunaway.on {
+		detRunawayHeap(work.bytesMarked)
+	}
 }
 
 // gcSweep must be called on the system stack because it acquires the heap

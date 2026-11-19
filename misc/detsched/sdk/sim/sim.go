@@ -131,14 +131,15 @@ const (
 
 // World is a simulated network of nodes.
 type World struct {
-	cfg    Config
-	nodes  []*Node
-	byIP   map[[4]byte]*Node
-	incs   map[int32]*incarnation // by node handle
-	failed map[string]bool        // assertions that failed, which the timeline shows
-	quiet  int64                  // no buggify faults before then (calm)
-	setup  bool                   // true until setup completes (see calm)
-	sites  bool                   // a fault site was reached, in setup or after (see fault)
+	cfg       Config
+	nodes     []*Node
+	byIP      map[[4]byte]*Node
+	incs      map[int32]*incarnation // by node handle
+	failed    map[string]bool        // assertions that failed, which the timeline shows
+	quiet     int64                  // no buggify faults before then (calm)
+	setup     bool                   // true until setup completes (see calm)
+	sites     bool                   // a fault site was reached, in setup or after (see fault)
+	canInject []string               // fault sites reached (see fault)
 
 	fds map[int]*fdesc
 

@@ -109,10 +109,14 @@ func TestFaults(t *testing.T) {
 		// disk faults off until the first fsync.
 		w.SetCalm(false)
 
-		// as runs f as node a and waits for it.
+		// as runs f as node a and waits for it, also when f calls
+		// t.Fatal, which ends only f's goroutine.
 		as := func(f func()) {
 			done := make(chan bool)
-			a.Go(func() { f(); done <- true })
+			a.Go(func() {
+				defer func() { done <- true }()
+				f()
+			})
 			<-done
 		}
 		// Each start of a node is a process with its own process ID,
@@ -214,9 +218,10 @@ func TestFaults(t *testing.T) {
 		})
 		w.SetLink(a, c, sim.Link{Latency: 10 * time.Millisecond, Drop: 0.5})
 		as(func() {
+			// A dial times out when enough SYNs or SYN-ACKs in a row are lost.
 			c2, err := net.Dial("tcp", "10.0.0.3:7")
-			if err != nil {
-				t.Fatal(err)
+			for err != nil {
+				c2, err = net.Dial("tcp", "10.0.0.3:7")
 			}
 			var sum int64
 			for range 10 {

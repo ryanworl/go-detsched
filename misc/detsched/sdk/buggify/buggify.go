@@ -26,6 +26,8 @@ package buggify
 import (
 	"sync"
 	"sync/atomic"
+
+	"github.com/ryanworl/go-detsched/misc/detsched/sdk/assert"
 )
 
 // The sites that Disable, Enable, and Force name. The simulation
@@ -89,7 +91,19 @@ func OptIn(site string) bool {
 // Disable turns the given sites off in every run, for a test that does not
 // want those faults, such as a failing fsync in a program that is meant to
 // stop on one. Call it before the sites are evaluated.
-func Disable(sites ...string) { off.set(true, sites...) }
+func Disable(sites ...string) {
+	off.set(true, sites...)
+	if supported {
+		// For the detsched command, which leaves disabled faults out of
+		// its warning of faults no run injected. On the system stack,
+		// which counts no ticks.
+		runtime_call(func() {
+			for _, site := range sites {
+				assert.Reachable("buggify: disabled: "+site, nil)
+			}
+		})
+	}
+}
 
 // On reports whether to inject the fault at site: the site is enabled in
 // this run, and fires with probability 1/4.

@@ -399,12 +399,15 @@ func TestSearchHung(t *testing.T) {
 	if err := s.run(ctx, 0); err != nil {
 		t.Fatalf("%v\n%s", err, searchReport(s))
 	}
-	g := findGroup(s, "still running when the search ended")
+	g := findGroup(s, "did not finish: still running when the search ended")
 	if g == nil {
 		t.Fatalf("no group for runs still going:\n%s", searchReport(s))
 	}
-	if !strings.Contains(g.replay, "GODETSEED=") {
-		t.Errorf("replay line %q", g.replay)
+	if !strings.Contains(g.replay, "GODETSEED=") || !strings.Contains(g.replay, "stopat=") {
+		t.Errorf("replay line %q, want one that stops at the switch the run was stopped at", g.replay)
+	}
+	if fs := s.fallbacks(); slices.ContainsFunc(fs, func(f fallback) bool { return strings.Contains(f.what, "still running") }) {
+		t.Errorf("the group is reported again as a fallback:\n%s", searchReport(s))
 	}
 	log, err := os.ReadFile(g.logs[0])
 	if err != nil {
@@ -413,6 +416,118 @@ func TestSearchHung(t *testing.T) {
 	if !bytes.Contains(log, []byte("main.main()")) {
 		t.Errorf("log has no stack of main.main:\n%s", log)
 	}
+}
+
+// TestSearchRunaway runs harnesses whose runs do not finish on every
+// fourth seed: a livelock, where virtual time stays put; a poll that
+// goes on forever as virtual time moves; and a history that grows without
+// bound. Before, each such run went on until -timeout or the search's
+// end, and was reported as a group and again as a fallback. Each must
+// now stop at a limit set from the passing runs, as one group that names
+// the limit and where its switches went, with a replay line that stops at
+// the same switch. A computation that takes 10 times longer on those
+// seeds is none of these, and passes.
+func TestSearchRunaway(t *testing.T) {
+	for _, tc := range []struct{ test, sig, field, where, search string }{
+		{"TestLivelock", "did not finish: livelock at t=0.000s: virtual time stayed put for ", "maxstuck=", "runaway.TestLivelock.func1.2 (runaway_test.go:", ""},
+		{"TestPoll", "did not finish: ran ", "maxswitches=", "runaway.TestPoll.func1 (runaway_test.go:", ""},
+		{"TestHistory", "did not finish: memory: ", "maxheap=", "runaway.TestHistory.func1 (runaway_test.go:", ""},
+		{"TestCompute", "", "", "", "perturb=off quantum=100"},
+	} {
+		t.Run(tc.test, func(t *testing.T) {
+			s := newTestSearch(t, "../../testdata/runaway")
+			s.workers, s.args = 4, []string{"-test.run=^" + tc.test + "$"}
+			if tc.search != "" {
+				s.env = []string{"GODETSEARCH=" + tc.search}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := s.run(ctx, 24); err != nil {
+				t.Fatalf("%v\n%s", err, searchReport(s))
+			}
+			r := searchReport(s)
+			if tc.sig == "" {
+				if len(s.groups) > 0 {
+					t.Errorf("want no failures:\n%s", r)
+				}
+				return
+			}
+			if len(s.groups) != 1 || !strings.HasPrefix(s.groups[0].sig, tc.sig) {
+				t.Fatalf("want one group, %q...:\n%s", tc.sig, r)
+			}
+			g := s.groups[0]
+			if g.status != "reproduced" || !strings.Contains(g.replay, tc.field) || !strings.Contains(g.where, tc.where) || len(g.also) > 0 {
+				t.Errorf("want the replay, with %s, to reproduce it, and the switches to go to %s:\n%s", tc.field, tc.where, r)
+			}
+			// The build without optimizations has another heap, but the
+			// same switches.
+			if want := tc.field; want == "maxheap=" && (strings.Contains(g.debug, want) || !strings.Contains(g.debug, "stopat=")) || want != "maxheap=" && !strings.Contains(g.debug, want) {
+				t.Errorf("debug line %q, want it to stop with %s, or stopat= for maxheap=", g.debug, want)
+			}
+			if slices.ContainsFunc(s.fallbacks(), func(f fallback) bool { return f.anchor != "debug-lines-run-the-optimized-binary" }) {
+				t.Errorf("want no fallbacks:\n%s", r)
+			}
+		})
+	}
+}
+
+// TestSearchBadHarness runs harnesses with mistakes that a search without
+// failures used to hide, and checks that the summary names each:
+// assertions no run reached, a Sometimes that never held, runs that end
+// before any fault, and faults the harness cannot get; and that t.Fatal on
+// a simulated node's goroutine fails the run there, naming the call,
+// where before the test waited for good and the run ended as a deadlock.
+func TestSearchBadHarness(t *testing.T) {
+	search := func(t *testing.T, test string, n uint64) *search {
+		t.Setenv("TMPDIR", t.TempDir())
+		s, err := newSearch("../../testdata/badharness", "", "^"+test+"$")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if s.debugDone != nil {
+				<-s.debugDone
+			}
+		})
+		s.workers = 4
+		if err := s.run(context.Background(), n); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	t.Run("TestCoverage", func(t *testing.T) {
+		s := search(t, "TestCoverage", 200)
+		r := searchReport(s)
+		want := map[string]string{
+			"assertions-never-reached": `no run reached 1 of the program's 4 assertions: always "a client past 3 responses keeps its connection" (coverage_test.go:`,
+			"sometimes-never-true":     `"a client saw more than 3 responses" (coverage_test.go:`,
+			"runs-end-before-faults":   "no fault was injected before the run ended",
+			"faults-never-injected":    "faults the harness cannot get: nemesis kill, killprocess, stop (NemesisConfig.Restart is nil); nemesis link, partition (fewer than 2 nodes)",
+		}
+		for _, f := range s.fallbacks() {
+			if w, ok := want[f.anchor]; ok && strings.Contains(f.what, w) {
+				delete(want, f.anchor)
+			}
+		}
+		if len(want) > 0 || len(s.groups) > 0 {
+			t.Errorf("no failures and these warnings missing, %v:\n%s", want, r)
+		}
+	})
+	t.Run("TestFatalOnNode", func(t *testing.T) {
+		s := search(t, "TestFatalOnNode", 8)
+		r := searchReport(s)
+		g := findGroup(s, "fatal error: detsched: t.FailNow or t.SkipNow on a goroutine that is not the test's")
+		if len(s.groups) != 1 || g == nil || g.status != "reproduced" {
+			t.Fatalf("want one group for t.Fatal on a node's goroutine, reproduced:\n%s", r)
+		}
+		log, err := os.ReadFile(g.logs[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !regexp.MustCompile(`detsched: \S*badharness\.TestFatalOnNode\.func1\.3 at \S*/fatal_test\.go:\d+ called t\.FailNow`).Match(log) {
+			t.Errorf("log does not name the call:\n%s", log)
+		}
+	})
 }
 
 // TestSearchReports checks that the search prints where seed 1 leaves the

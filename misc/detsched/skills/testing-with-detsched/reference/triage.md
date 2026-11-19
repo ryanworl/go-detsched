@@ -10,7 +10,7 @@ The README's "Reading the summary" section says what each line of a group means,
 4. The group's `faults in its runs` line: the faults it likely needs.
 5. The group's `also in N of these runs` lines: other kinds of failure in the same runs. They may be the same bug's symptoms or another bug; each has its own replay line.
 
-Many failures explain themselves from these. For a run that timed out or hung, the log ends with every goroutine's stack; goroutines of a crashed node say so in their header and are frozen.
+Many failures explain themselves from these. For a run that did not finish (`did not finish: livelock`, `ran N× the longest passing run`, `memory`, `still running`), the group's `of its last N switches` line names the goroutines that kept running, and the log ends with every goroutine's stack; goroutines of a crashed node say so in their header and are frozen.
 
 ## SUT, harness, or detsched?
 
@@ -24,7 +24,7 @@ Decide from evidence, not from the message. Assume the harness until the evidenc
 
 - A stall after a crash, or `a goroutine waits for a mutex that a crashed node holds`: a package variable or harness lock shared between nodes.
 - Live goroutines in `chan send (durable)` or `chan receive (durable)` inside a lock that a crashed node's frozen goroutine holds: a lock made of a channel; use a `sync.Mutex`.
-- A timeout with little output: a nemesis callback waiting for a node, a harness lock held by a paused node, or a slow checker.
+- `did not finish` with little output: a nemesis callback waiting for a node, a harness lock held by a paused node, a harness loop that polls for a condition with no deadline, or a slow checker. A livelock in the SUT, such as a retry without a backoff, is a real bug.
 - `concurrent map writes` in harness code; socket calls failing with `EPERM` (code on a goroutine of no node).
 - `blocked goroutines remain`: a goroutine still running when the test body returned, which the summary names: an unjoined harness goroutine, or one the SUT's `Close` does not wait for.
 - A failure only with a backward clock skip: a check comparing wall-clock times.

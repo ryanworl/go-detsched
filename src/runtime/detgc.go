@@ -105,6 +105,19 @@ func detGCMark() {
 	}
 }
 
+// detGCAfterTimers starts the cycle that the allocations of the timers a
+// bubble's clock just fired made due. They ran on the system stack, where
+// gcStart starts none: the simulation's events, such as packets and
+// keepalives, allocate there, and a run in which only they run, such as
+// one whose goroutines wait while idle connections send keepalives for
+// days of virtual time, would grow without bound. Called by synctestRun
+// in the bubble's root goroutine, after the timers ran.
+func detGCAfterTimers() {
+	if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+		gcStart(t)
+	}
+}
+
 // detGCEpochDue runs the epoch due at this tick in gp, if gp can run a GC
 // here, and sets the tick of the next one. Called by detPreempt.
 func detGCEpochDue(gp *g) {

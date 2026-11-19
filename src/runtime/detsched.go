@@ -198,17 +198,18 @@ type detRandState struct {
 	cheaprand64 uint64
 }
 
-// detMaxSwitches is GODETSEARCH's maxswitches: a run fails when it makes more
+// detMaxSwitches is GODETSEARCH's maxswitches: a run stops when it makes more
 // switches since its last branch (detBranchSwitch), so that a program
 // looping in virtual time ends, and a run branched from deep in a guided
-// search is not cut short by the switches of the runs before it.
+// search is not cut short by the switches of the runs before it (see
+// detrunaway.go).
 var detMaxSwitches uint64
 
 // detExecute is called by execute when gp is about to run on pp.
 func detExecute(pp *p, gp *g, inheritTime bool) {
 	detTraceSwitch(pp, gp)
-	if detMaxSwitches != 0 && detP(pp).switches-detBranchSwitch > detMaxSwitches {
-		throw("detsched: the run made more switches than maxswitches")
+	if detRunaway.on {
+		detRunawayExecute(pp, gp) // see detrunaway.go
 	}
 	if detFeed.on {
 		detFeedMaxOf(detFeedMaxGoroutines, uint64(gcount(false)))
@@ -280,9 +281,48 @@ func detPanic() {
 	detOutputFlush(2)
 	detsimFailLog(2)
 	detTraceReport()
+	detRunawayReport()
 	detFeedReport(2)
 	detSDKReport()
 	detOut.late.write()
+}
+
+// detGoexitCheck fails the program when package testing's FailNow or
+// SkipNow, which t.Fatal and t.Skip call, ends a goroutine other than a
+// test's own. It would end only that goroutine, so the test would go on
+// as if the call had not been made, or wait for good for the goroutine,
+// as a harness that runs code on a simulated node and waits for it does.
+// go vet reports some such calls; this reports each one a run makes.
+func detGoexitCheck() {
+	var pcs [64]uintptr
+	n := callers(2, pcs[:]) // Goexit's caller first, each inlined call a frame
+	if n == 0 || n == len(pcs) {
+		return // too deep to tell whether a test runs it
+	}
+	site := -1
+	for i, pc := range pcs[:n] {
+		f := findfunc(pc)
+		if !f.valid() {
+			return
+		}
+		u, uf := newInlineUnwinder(f, pc-1)
+		name := u.srcFunc(uf).name()
+		switch {
+		case i == 0 && name != "testing.(*common).FailNow" && name != "testing.(*common).SkipNow":
+			return
+		case name == "testing.tRunner" || stringslite.HasPrefix(name, "testing.(*B)."):
+			return // a test's goroutine, or a benchmark's, which runs b.N iterations
+		case site < 0 && !stringslite.HasPrefix(name, "testing.") && !stringslite.HasPrefix(name, "runtime."):
+			site = i
+		}
+	}
+	if site >= 0 {
+		pc := pcs[site]
+		u, uf := newInlineUnwinder(findfunc(pc), pc-1)
+		file, line := u.fileLine(uf)
+		print("detsched: ", u.srcFunc(uf).name(), " at ", file, ":", line, " called t.FailNow or t.SkipNow (as t.Fatal and t.Skip do) on a goroutine that is not the test's: it would end only this goroutine, and the test would go on, or wait for it for good. Send the error to the test's goroutine, such as over a channel, and fail there, or check with sdk/assert\n")
+	}
+	throw("detsched: t.FailNow or t.SkipNow on a goroutine that is not the test's")
 }
 
 // detTraceSwitch records in pp's schedule hash that gp is about to run:
@@ -358,6 +398,7 @@ func detPreempt_m(gp *g) {
 	if detPerturb.pct {
 		detPCTPreempt(gp)
 	}
+	detRunaway.preempted = true // see detRunawayExecute
 	goschedImpl(gp, true)
 }
 
@@ -600,14 +641,19 @@ func detRandInit(pp *p) {
 //	feedback=1|PATH       record features (see detFeedInit)
 //	cover=1|counts        record coverage features (see detFeedCoverInit)
 //	yield=0xA,...         hold locks acquired at these sites (see detFeedYieldInit)
-//	maxswitches=N         fail after N switches since the last branch
+//	extent                report how far the run went (see detrunaway.go)
+//	maxswitches=N         stop after N switches since the last branch
+//	maxstuck=N            stop after N switches while virtual time stays put
+//	maxtime=NS            stop when virtual time passes NS
+//	maxheap=B             stop when a GC finds more than B bytes live
+//	stopat=N              stop at switch N
 //	perturb=off|walk|pct  use one strategy instead of drawing one per run
 //	quantum=N             ticks per quantum without perturbation (see detQuantum)
 //	trace=0xH             the schedule hash the run should have (see detExpectTrace)
 //
 // Replaying a run needs the fields that change what it does: all but
-// fork, feedback, cover, and trace, which a replay line adds to check the
-// replay.
+// fork, feedback, cover, and extent, and trace, which a replay line adds
+// to check the replay.
 func detSearchInit() {
 	s := gogetenv("GODETSEARCH")
 	for s != "" {
@@ -631,8 +677,23 @@ func detSearchInit() {
 			detFeedCoverInit(v)
 		case "yield":
 			detFeedYieldInit(v)
+		case "extent":
+			detRunaway.on = true
 		case "maxswitches":
 			detMaxSwitches, ok = atoi64u(v)
+			detRunaway.on = true
+		case "maxstuck":
+			detRunaway.maxStuck, ok = atoi64u(v)
+			detRunaway.on = true
+		case "maxtime":
+			detRunaway.maxTime, ok = atoi64u(v)
+			detRunaway.on = true
+		case "maxheap":
+			detRunaway.maxHeap, ok = atoi64u(v)
+			detRunaway.on = true
+		case "stopat":
+			detRunaway.at, ok = atoi64u(v)
+			detRunaway.on = true
 		case "trace":
 			detExpectTrace, ok = detParseHex(v)
 		case "envread":
@@ -800,6 +861,7 @@ func detTraceReport() {
 		unlock(&allpLock)
 	}
 	print("detsched: trace=", hex(h), " switches=", n, " syncs=", detSyncStep(), "\n")
+	detRunawayExtent()
 	if detExpectTrace != 0 && h != detExpectTrace {
 		print("detsched: warning: this run's schedule is not the one its replay line was printed for (trace=", hex(detExpectTrace), "), so it may not do what that run did. Its environment, the files it reads, or the binary differ from the search's: a variable set here that the search's environment did not have, such as NO_COLOR, can change the schedule; unset it with env -u NAME\n")
 	}
@@ -1114,6 +1176,9 @@ func detTraceTime(bubble *synctestBubble) {
 	pp := getg().m.p.ptr()
 	detP(pp).trace = detMix(detMix(detP(pp).trace, bubble.id), uint64(bubble.now))
 	detFeedMaxOf(detFeedMaxTime, uint64(bubble.now-946684800000000000)) // since synctest's base time
+	if detRunaway.on {
+		detRunawayTime(bubble)
+	}
 	if debug.dettrace >= 2 {
 		print("detsched: bubble ", bubble.id, " time ", bubble.now, "\n")
 	}
@@ -1124,6 +1189,7 @@ func detTraceTime(bubble *synctestBubble) {
 var detBubbles *synctestBubble
 
 func detBubblesAdd(bubble *synctestBubble) {
+	detRunawayBubble(true)
 	pb := &detBubbles
 	for *pb != nil {
 		pb = &(*pb).detNext
@@ -1132,6 +1198,7 @@ func detBubblesAdd(bubble *synctestBubble) {
 }
 
 func detBubblesRemove(bubble *synctestBubble) {
+	detRunawayBubble(false)
 	for pb := &detBubbles; *pb != nil; pb = &(*pb).detNext {
 		if *pb == bubble {
 			*pb = bubble.detNext

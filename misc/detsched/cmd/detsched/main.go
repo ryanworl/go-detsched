@@ -176,20 +176,18 @@ type search struct {
 	live     bool            // progress is a terminal, where a status line updates in place
 
 	// Set up by prepare.
-	setup       bool   // the program reports the end of its setup
-	stop        uint64 // the switch right after setup, which setup roots stop at
-	maxSwitches uint64 // maxswitches of forked runs
-	novelty     string // what counts as a new feature
-	seen        []byte // features recorded so far, shared with every fork
-	seenFile    *os.File
+	setup    bool   // the program reports the end of its setup
+	stop     uint64 // the switch right after setup, which setup roots stop at
+	novelty  string // what counts as a new feature
+	seen     []byte // features recorded so far, shared with every fork
+	seenFile *os.File
 
 	mu          sync.Mutex
 	start       time.Time
 	rng         *rand.Rand
 	runs        int
 	failed      int
-	tooLong     int           // runs stopped for too many switches, not counted as failures
-	tooLongRun  *result       // the first of them
+	longest     extent        // the most any passing run went, each measure on its own
 	slowPass    time.Duration // the longest passing run
 	slowPassRun *result       // that run
 	slowFail    time.Duration // the longest failing run, timeouts aside
@@ -223,8 +221,6 @@ type search struct {
 	memWait     time.Duration // time waitMem kept runs from starting
 	memWaiting  int           // workers waitMem keeps waiting
 	memWaitFrom time.Time     // when they started to
-	tooLongLog  string        // the log of tooLongRun
-	tooLongStat string        // whether its replay reproduced it
 	features    int           // new features recorded during the search
 	canFork     bool
 	forked      bool           // a fork succeeded
@@ -242,6 +238,11 @@ type search struct {
 	directed    [2]int                  // runs directed at predicted deadlocks, and those that failed
 	bigOutput   int64                   // the most output a run wrote
 	asserts     map[string]*assertCount // always, sometimes and reachable assertions, by kind and message
+	catalog     []assertSite            // the assertion calls in the program's source, if built here
+	simRuns     int                     // runs that set up a simulation
+	noFaultRuns int                     // those that ended before any fault was injected
+	calmRuns    int                     // those whose nemesis drew a run without faults
+	injected    map[string]bool         // faults some run injected, by faultName
 }
 
 // An assertCount counts the runs that reached an assertion, and the runs
@@ -263,6 +264,7 @@ type group struct {
 	index  int              // its number, from 1, which its logs' names have
 	also   map[string]*also // other failures in its runs, by key
 	left   string           // for a deadlock at the end of the test, the goroutines left
+	where  string           // for a run that did not finish, the goroutines its last switches went to
 	faults map[string]int   // faults that fired in its runs, by assertion message
 }
 
@@ -286,17 +288,18 @@ func newSearch(pkg, bin, run string) (*search, error) {
 		return nil, err
 	}
 	s := &search{
-		pkg:     pkg,
-		out:     out,
-		timeout: 10 * time.Minute,
-		workers: runtime.NumCPU(),
-		byKey:   map[string]*group{},
-		kinds:   map[string]*also{},
-		roots:   map[int]bool{},
-		running: map[*liveRun]bool{},
-		claimed: map[int]bool{},
-		asserts: map[string]*assertCount{},
-		rng:     rand.New(rand.NewPCG(1, 2)),
+		pkg:      pkg,
+		out:      out,
+		timeout:  10 * time.Minute,
+		workers:  runtime.NumCPU(),
+		byKey:    map[string]*group{},
+		kinds:    map[string]*also{},
+		roots:    map[int]bool{},
+		running:  map[*liveRun]bool{},
+		claimed:  map[int]bool{},
+		asserts:  map[string]*assertCount{},
+		injected: map[string]bool{},
+		rng:      rand.New(rand.NewPCG(1, 2)),
 
 		refusals:   map[uint64]int{},
 		skipWhy:    map[uint64]int{},
@@ -322,6 +325,10 @@ func newSearch(pkg, bin, run string) (*search, error) {
 	}
 	if run != "" {
 		s.args = []string{"-test.run=" + run}
+	}
+	if s.built {
+		sites, _ := catalogAsserts(pkg, "", catalogEnv())
+		s.catalog = runSites(sites, run)
 	}
 	return s, nil
 }
@@ -412,7 +419,7 @@ type result struct {
 	outOfMem    bool   // stopped because memory ran out
 	memAtStop   uint64 // the private memory it held then, if known
 	outputSize  int64  // the bytes of output it wrote, which may be more than output holds
-	maxSwitches uint64 // the maxswitches it ran with, or 0
+	limits      limits // the limits it ran with
 }
 
 var (
@@ -423,6 +430,9 @@ var (
 	switchesField = regexp.MustCompile(` switches=(\d+) `)
 	envReadLine   = regexp.MustCompile(`(?m)^detsched: environment read: (.*)$`)
 	syncsField    = regexp.MustCompile(` syncs=(\d+)$`)
+	extentLine    = regexp.MustCompile(`(?m)^detsched: extent time=(\d+) stuck=(\d+) heap=(\d+)$`)
+	stopLine      = regexp.MustCompile(`(?m)^detsched: did not finish: (\w+): (\d+) .*\) at switch (\d+), virtual time (\S+)s$`)
+	lastSwitches  = regexp.MustCompile(`(?m)^detsched: the last (\d+) switches went to:\n((?:detsched: \t.*\n)+)`)
 	setupLine     = regexp.MustCompile(`(?m)^detsched: setup complete at switch (\d+)$`)
 	deadlockLine  = regexp.MustCompile(`(?m)^detsched: potential deadlock: (.*)$`)
 	directiveLine = regexp.MustCompile(`(?m)^detsched: deadlock directive yield=(\S+)$`)
@@ -438,22 +448,16 @@ var (
 
 func (r *result) failed() bool { return r.exitCode != 0 || r.timedOut }
 
-// tooLong reports whether the run was stopped for making too many
-// switches since its last branch, which is not a failure of the program:
-// a run that loops in virtual time, or one forked from deep in a search.
-func (r *result) tooLong() bool {
-	return r.exitCode != 0 && bytes.Contains(r.output, []byte("more switches than maxswitches"))
-}
-
 // trace returns the run's first trace line, which is that of the
 // branch whose output comes first, or "".
 func (r *result) trace() string { return string(traceLine.Find(r.output)) }
 
-// spun returns the branch of the composer timeline that a run stopped for
-// too many switches stopped in, or 0 for the timeline, and the trace line
-// printed where it stopped.
-func (r *result) spun() (int, string) {
-	i := bytes.Index(r.output, []byte("more switches than maxswitches"))
+// stopped returns the branch of the composer timeline that a run
+// stopped at one of its limits stopped in, or 0 for the timeline, and
+// the trace line printed where it stopped, or for another run, those of
+// its failure.
+func (r *result) stopped() (int, string) {
+	i := bytes.Index(r.output, []byte("detsched: did not finish: "))
 	if i < 0 {
 		return r.branch(), r.trace()
 	}
@@ -473,11 +477,16 @@ func (r *result) spun() (int, string) {
 // signature returns the line that tells how the run failed: its first
 // assertion failure, panic, or fatal error (a branch of a composer
 // timeline that fails writes its output first, unless the timeline had
-// failed before it), else its first failing test, else "timeout", or
-// for a run the search's end stopped, which may hang, "still running when
-// the search ended", or its exit status.
+// failed before it), or for a run stopped at one of its limits, which
+// limit, else its first failing test, else for a run stopped from
+// outside that it was still running, or its exit status.
 func (r *result) signature() string {
 	line := failureLine.Find(r.output)
+	if string(line) == "fatal error: detsched: did not finish" {
+		if m := stopLine.FindSubmatch(r.output); m != nil {
+			return r.limits.explain(string(m[1]), atou(string(m[2])), string(m[3]), string(m[4]))
+		}
+	}
 	if line == nil {
 		line = bytes.TrimSpace(testFailure.Find(r.output))
 	}
@@ -485,12 +494,16 @@ func (r *result) signature() string {
 	case line != nil:
 		return truncate(string(line), 600)
 	case r.hung:
-		return "still running when the search ended"
+		return "did not finish: still running when the search ended"
 	case r.timedOut:
-		return "timeout"
+		return "did not finish: still running at -timeout"
 	}
 	return fmt.Sprintf("exit status %d", r.exitCode)
 }
+
+// runaway reports whether the run did not finish: it was stopped at one
+// of its limits, or from outside, still running.
+func (r *result) runaway() bool { return strings.HasPrefix(r.signature(), "did not finish: ") }
 
 // key returns the signature with the numbers in it masked, so that one
 // bug makes one group.
@@ -530,7 +543,7 @@ func splitSignature(sig string) (msg, details string) {
 func (r *result) failures() []string {
 	var lines []string
 	for _, line := range failureLine.FindAll(r.output, -1) {
-		if l := truncate(string(line), 600); !slices.Contains(lines, l) {
+		if l := truncate(string(line), 600); !slices.Contains(lines, l) && l != "fatal error: detsched: did not finish" {
 			lines = append(lines, l)
 		}
 	}
@@ -596,21 +609,22 @@ func (s *search) temp(name string) string { return filepath.Join(s.out, name) }
 // the branch of a composer timeline it failed in, if any. With debug, it
 // runs it under Delve instead: --disable-aslr because on macOS the
 // program re-executes itself without ASLR, which loses Delve's
-// breakpoints. A run stopped for too many switches replays with the same
-// limit, so that it stops at the same switch; one stopped because memory
-// ran out replays in a subshell that caps its memory, on Linux.
+// breakpoints. A run that did not finish replays with the same limits,
+// so that it stops at the same switch, and one stopped from outside stops
+// at the switch it was stopped at; one stopped because memory ran out
+// replays in a subshell that caps its memory, on Linux.
 func (s *search) replayLine(r *result, debug bool) string {
-	branch, trace := r.branch(), r.trace()
-	if r.tooLong() {
-		branch, trace = r.spun()
-	}
+	branch, trace := r.stopped()
 	env := []string{fmt.Sprintf("GODETSEED=%d", r.seed), fmt.Sprintf("GODETBRANCH=%d", branch)}
 	if r.tape != "" {
 		env = addSearch(env, "tape="+r.tape)
 	}
 	env = addSearch(env, yieldField(r.yield)...)
-	if r.tooLong() {
-		env = addSearch(env, fmt.Sprintf("maxswitches=%d", r.maxSwitches))
+	if r.runaway() {
+		env = addSearch(env, r.limits.field(r.output, debug)...)
+		if m := switchesField.FindStringSubmatch(trace); m != nil && r.timedOut {
+			env = addSearch(env, "stopat="+m[1])
+		}
 	}
 	// The schedule the line replays, which the run checks its own against,
 	// unless the run was stopped from outside, where the replay goes on.
@@ -1060,6 +1074,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	s.mu.Lock()
 	s.predict(r.output)
 	s.countAsserts(r.output)
+	s.countFaults(r.output)
 	s.countSkipped(r.output)
 	s.bigOutput = max(s.bigOutput, r.outputSize)
 	if r.outputSize > maxOutput {
@@ -1068,32 +1083,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	s.runs++
 	if a == armDirected {
 		s.directed[0]++
-		if r.failed() && !r.tooLong() && !r.outOfMem {
+		if r.failed() && !r.runaway() && !r.outOfMem {
 			s.directed[1]++
 		}
-	}
-	if r.tooLong() {
-		s.tooLong++
-		if s.tooLongRun != nil {
-			s.mu.Unlock()
-			return nil
-		}
-		s.tooLongRun, s.tooLongLog, s.tooLongStat = r, s.temp("spin.log"), "replaying"
-		line := s.replayLine(r, false)
-		s.mu.Unlock()
-		if err := os.WriteFile(s.tooLongLog, append([]byte("# "+line+"\n"), r.output...), 0o666); err != nil {
-			return err
-		}
-		status, err := s.replay(ctx, line, r)
-		if errors.Is(err, errCanceled) {
-			status = "was not run: the search ended first"
-		} else if err != nil {
-			return err
-		}
-		s.mu.Lock()
-		s.tooLongStat = status
-		s.mu.Unlock()
-		return nil
 	}
 	if r.outOfMem {
 		s.outOfMem++
@@ -1115,10 +1107,8 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		if r.wall > s.slowPass {
 			s.slowPass, s.slowPassRun = r.wall, r
 		}
-		// A run that makes 1000 times the switches of a whole run that
-		// passed spins; stopCell passes the limit to forked runs.
-		if m := switchesField.FindStringSubmatch(r.trace()); m != nil && s.maxSwitches == 0 {
-			s.maxSwitches = 1000 * max(atou(m[1]), 1000)
+		if e, ok := extentOf(r.output); ok {
+			s.longest.grow(e)
 		}
 		s.mu.Unlock()
 		return nil
@@ -1136,6 +1126,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}, faults: map[string]int{}}
 		if strings.Contains(g.sig, "blocked goroutines remain") {
 			g.left = leftGoroutines(r.output)
+		}
+		if r.runaway() {
+			g.where = whereOf(r.output)
 		}
 		s.byKey[g.key] = g
 		s.groups = append(s.groups, g)
@@ -1290,12 +1283,16 @@ func (s *search) replay(ctx context.Context, line string, r *result) (string, er
 	if err != nil {
 		return "", err
 	}
-	want, got := r.trace(), again.trace()
-	if r.tooLong() {
-		_, want = r.spun()
-		_, got = again.spun()
-	}
+	again.limits = r.limits
+	_, want := r.stopped()
+	_, got := again.stopped()
 	switch {
+	case r.timedOut && r.runaway():
+		// Stopped from outside, the run replays to the switch it was
+		// stopped at, if it was still running there.
+		if !strings.HasPrefix(again.signature(), "did not finish: still running at switch") {
+			return fmt.Sprintf("did not reach the switch the run was stopped at: it ended with %q", again.signature()), nil
+		}
 	case again.key() != r.key():
 		return fmt.Sprintf("did not reproduce the failure: it ended with %q", again.signature()), nil
 	case got != want && !r.timedOut: // a run stopped from outside stops anywhere
@@ -1540,17 +1537,7 @@ func (s *search) fallbacks() []fallback {
 		}
 		add("memory", what, "fewer runs, and stopped runs count as neither pass nor failure, so the search lost what they would have found", fix)
 	}
-	if s.tooLong > 0 {
-		add("switch-limit", fmt.Sprintf("%d runs made over 1000 times the switches of a passing run and were stopped, not counted as failures; the first one's log is %s, and its replay %s", s.tooLong, s.tooLongLog, strings.TrimPrefix(replayVerdict(s.tooLongStat), "the replay ")),
-			"a run that loops forever in virtual time is a liveness bug that the search did not count",
-			"read its log's stacks, or replay it, which stops at the same switch: "+s.replayLine(s.tooLongRun, false))
-	}
-	if g := s.byKey[failureKey("still running when the search ended")]; g != nil {
-		limit, why := s.hangLimit()
-		add("still-running", fmt.Sprintf("%d runs were still running after %v%s when the search ended: group %d", g.runs, limit.Round(time.Second), why, g.index),
-			"they may hang, or only be slow",
-			"read the stacks in the group's logs; a replay that ends was only slow")
-	}
+	fs = append(fs, s.coverage()...)
 	if s.cut > 0 {
 		add("output-cut", fmt.Sprintf("%d runs wrote more than %d MB of output; their logs keep the first and last %d MB", s.cut, maxOutput>>20, maxOutput>>21),
 			"the middle of their output is lost",
@@ -1639,6 +1626,9 @@ func (s *search) summary(w io.Writer, final bool) {
 		}
 		if g.left != "" {
 			fmt.Fprintf(w, "\tthe goroutines left in the bubble, by where they wait and what created them: %s\n", g.left)
+		}
+		if g.where != "" {
+			fmt.Fprintf(w, "\t%s\n", g.where)
 		}
 		if f := s.faultLine(g); f != "" {
 			fmt.Fprintf(w, "\tfaults in its runs: %s\n", f)
@@ -1762,8 +1752,8 @@ func (s *search) assertSummary(w io.Writer) {
 	var own, always []string
 	sdk := make([][]string, len(sdkAsserts))
 	for _, c := range cs {
-		if c.msg == setupAssert {
-			continue // a fallback when never true
+		if c.msg == setupAssert || strings.HasPrefix(c.msg, canInject) || strings.HasPrefix(c.msg, cannotInject) || strings.HasPrefix(c.msg, disabledSite) {
+			continue // fallbacks
 		}
 		i := slices.IndexFunc(sdkAsserts, func(p string) bool { return strings.HasPrefix(c.msg, p) })
 		switch {
@@ -1818,7 +1808,7 @@ func (g *group) msg() string {
 // summaryReplays reports whether the summary prints a replay line of a
 // run that did not fail, which names the kept binary.
 func (s *search) summaryReplays() bool {
-	return s.tooLong > 0 || s.outOfMem > 0 && s.bigStopped != nil && s.bigStopped.memAtStop > 0 || s.slowPassRun != nil && s.slowPass >= 5*time.Second
+	return s.outOfMem > 0 && s.bigStopped != nil && s.bigStopped.memAtStop > 0 || s.slowPassRun != nil && s.slowPass >= 5*time.Second
 }
 
 // goroutineHeader matches a goroutine's header in a traceback, with its

@@ -933,6 +933,8 @@ func detsimBuggifyRand() uint64 { return detsimRand() }
 
 func detsimBuggifyEpoch() uint64 { return detsim.epoch }
 
+func detsimBuggifyCall(f func()) { detsimCall(f) }
+
 func detsimSetClock(on bool, skew int64) { detsim.clock, detsim.skew = on, skew }
 
 // detsimStartNano is package time's startNano, from which time.Time

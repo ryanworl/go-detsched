@@ -223,6 +223,9 @@ func synctestRun(f func()) {
 			gp.bubble.timers.check(bubble.now, bubble)
 			gp.m.curg = curg
 		})
+		if goexperiment.DetSched {
+			detGCAfterTimers()
+		}
 		gopark(synctestidle_c, nil, waitReasonSynctestRun, traceBlockSynctest, 0)
 		lock(&bubble.mu)
 		if bubble.active < 0 {
