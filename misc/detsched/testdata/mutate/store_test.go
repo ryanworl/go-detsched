@@ -33,14 +33,18 @@ func (d *disk) Sync() error {
 // TestStrong runs the code concurrently, with syncs that fail.
 func TestStrong(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		c, l, d := NewCounter(1000), &Log{}, &disk{}
+		c, l, d, st := NewCounter(1000), &Log{}, &disk{}, &Store{}
 		Fanout(4, func(i int) {
 			for range 50 {
 				c.Add("k", 1)
 				l.Commit(d)
+				tx := st.Begin()
+				c.Get("k") // work in the transaction
+				tx.Commit(1)
 			}
 		})
 		assert.Always(c.Get("k") == 200, "the count is the sum of the adds", map[string]any{"got": c.Get("k")})
+		assert.Always(st.Value() == 200, "the store's value is the sum of the commits", map[string]any{"got": st.Value()})
 		assert.Always(l.Synced() == d.ok, "the log counts the syncs that succeeded", map[string]any{"synced": l.Synced(), "ok": d.ok})
 		q, ran := NewQueue(), 0
 		for range 10 {

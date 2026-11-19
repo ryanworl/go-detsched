@@ -558,20 +558,14 @@ func (d *disk) powerFail() {
 	clear(d.truncated)
 	partial := buggify.Active("sim.disk.partialcrash")
 	torn := buggify.Active("sim.disk.torn")
-	switch {
-	case torn:
-		injected("fault: sim.disk.torn")
-		world.logEvent(d.nodeName(), "power failure keeps some unsynced sectors")
-	case partial:
-		injected("fault: sim.disk.partialcrash")
-		world.logEvent(d.nodeName(), "power failure keeps some unsynced writes")
-	}
+	unsynced := false // writes the power failure could keep some of
 	var walk func(n, parent *inode)
 	walk = func(n, parent *inode) {
 		n.parent = parent
 		if !n.dir {
 			data := slices.Clone(n.ddata)
 			kept := false // a write survived, so ddata changes too
+			unsynced = unsynced || len(n.pending) > 0
 			for _, w := range n.pending {
 				switch {
 				case torn && !w.trunc:
@@ -611,6 +605,15 @@ func (d *disk) powerFail() {
 		}
 	}
 	walk(d.root, d.root)
+	// A fault without unsynced writes did nothing.
+	switch {
+	case torn && unsynced:
+		injected("fault: sim.disk.torn")
+		world.logEvent(d.nodeName(), "power failure keeps some unsynced sectors")
+	case partial && unsynced:
+		injected("fault: sim.disk.partialcrash")
+		world.logEvent(d.nodeName(), "power failure keeps some unsynced writes")
+	}
 	// The directories in the tree have all their entries durable now, and
 	// those out of it keep theirs for relist.
 	clear(d.dirty)

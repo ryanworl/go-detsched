@@ -8,8 +8,10 @@
 // run the debug: line it prints with scripts, as a user or an agent does.
 // They check what the docs promise: the run's position on every hit, which
 // the runtime's own GODETSTOP stop line confirms; goroutines by node;
-// restart to a checkpoint, a position and rewind; the JSON output mode;
-// the trace line at exit, unchanged by the breakpoints; and that the
+// restart to a checkpoint, by its ID or note, and to a position, and
+// rewind, also to the stop of a restart; the JSON output mode; the trace
+// line at exit, unchanged by the breakpoints, also at the end of a JSON
+// script without exit; and that the
 // runtime-counted hit count stops at the hit stock Delve's counting does.
 // On a small program of its own, promoted, they check that the hits of a
 // method inlined into compiler-generated wrappers name the method, and
@@ -23,7 +25,9 @@
 // a breakpoint's frames have the stack record's shape. TestNodeAndStart
 // checks detsched.node and detsched.start, and on values, a plain program,
 // TestValues checks how channels print and that on ... print is labelled
-// with its expression.
+// with its expression. On generic, TestGenericNames checks that a
+// breakpoint on a generic method names its instantiations, and on environ
+// TestEnvironment that a program under dlv has the environment dlv has.
 //
 // $DLV names the dlv to test; the default is dlv next to go. gate.bash
 // runs them when the tree has bin/dlv:
@@ -250,6 +254,73 @@ func TestExitTraceLine(t *testing.T) {
 			t.Errorf("script %q: no exit with the replay's trace line %q:\n%s", script, f.trace, out)
 		}
 	}
+	// In the JSON mode a script without exit ends at the end of its input,
+	// with the exit record, and no prompt comes before a record, which
+	// parseJSON would refuse.
+	recs := parseJSON(t, runDlv(t, f, "break s simcompose.serve\ncontinue\nprint detsched.time\n", "--json"))
+	if last := recs[len(recs)-1]; last.str("event") != "exit" || last.str("trace") != f.trace {
+		t.Errorf("dlv --json at the end of its input: the last record is %v, want an exit record with the trace line %q", last, f.trace)
+	}
+}
+
+// restart takes a checkpoint's note, and refuses another word rather than
+// running the program with it as its arguments; rewind goes back to the
+// stop of a restart to a position, the last stop before the checkpoint.
+func TestRestartNoteAndRewind(t *testing.T) {
+	f := findFailure(t)
+	// The ticks of the first two starts of the server.
+	out := runDlv(t, f, "trace s simcompose.serve\ncontinue\nexit\n")
+	ks := regexp.MustCompile(`(?m)^> goroutine\(\d+\): \[s\] .* at t[0-9.]+ s\d+ k(\d+) node server `).FindAllStringSubmatch(out, 2)
+	if len(ks) < 2 {
+		t.Fatalf("want two starts of the server:\n%s", out)
+	}
+	k0, _ := strconv.ParseUint(ks[0][1], 10, 64)
+	k1, _ := strconv.ParseUint(ks[1][1], 10, 64)
+	point := fmt.Sprintf("k%d", (k0+k1)/2)
+	out = runDlv(t, f, `restart `+point+`
+break s simcompose.serve
+continue
+checkpoint second start
+restart nosuch
+restart second start
+rewind
+rewind
+exit
+`, "--json")
+	defer func() {
+		if t.Failed() {
+			t.Logf("the replay: %s\ndlv's output:\n%s", f.replay, out)
+		}
+	}()
+	stops := map[string][]uint64{} // the ticks of each command's stops
+	var errs []string
+	var exit record
+	for _, r := range parseJSON(t, out) {
+		switch r.str("event") {
+		case "stop", "break":
+			stops[r.str("cmd")] = append(stops[r.str("cmd")], r.pos().num("k"))
+		case "error":
+			errs = append(errs, r.str("cmd"))
+		case "exit":
+			exit = r
+		}
+	}
+	at := stops["restart "+point]
+	if len(at) != 1 || at[0] <= k0 || at[0] >= k1 {
+		t.Fatalf("restart %s stopped at ticks %v, want one between the starts at k%d and k%d", point, at, k0, k1)
+	}
+	if fmt.Sprint(errs) != "[restart nosuch]" {
+		t.Errorf("got errors for %q, want one for restart nosuch", errs)
+	}
+	if got := stops["restart second start"]; fmt.Sprint(got) != fmt.Sprintf("[%d]", k1) {
+		t.Errorf("restart second start stopped at ticks %v, want the checkpoint's k%d", got, k1)
+	}
+	if got, want := fmt.Sprint(stops["rewind"]), fmt.Sprintf("[%d 0]", at[0]); got != want {
+		t.Errorf("rewind twice stopped at ticks %s, want the restart's and then the start, %s", got, want)
+	}
+	if exit.str("trace") != f.trace {
+		t.Errorf("exit record %v, want the trace line %q", exit, f.trace)
+	}
 }
 
 // Checkpoints, restart to them, also after the program exited, and to a
@@ -267,6 +338,7 @@ func TestCheckpointJSON(t *testing.T) {
 continue
 continue
 checkpoint second
+checkpoints
 print detsched.tick
 goroutines -with node server
 continue
@@ -312,6 +384,24 @@ exit
 		}
 	}
 	second := strconv.FormatUint(stops[1].pos().num("k"), 10)
+	// checkpoint and checkpoints print typed records, which the filter
+	// of delve.md, select(.event != "output" and .event != "ok"), keeps.
+	cp := byCmd["checkpoint second"]
+	if len(cp) != 1 || cp[0].str("event") != "checkpoint" || cp[0].str("id") != "c1" || cp[0].str("note") != "second" ||
+		strconv.FormatUint(cp[0].pos().num("k"), 10) != second || cp[0].num("goroutine") != stops[1].num("goroutine") {
+		t.Errorf("checkpoint second printed %v, want a checkpoint record of c1, note second, at the second stop's k%s and goroutine", cp, second)
+	}
+	cps := byCmd["checkpoints"]
+	if len(cps) != 1 || cps[0].str("event") != "checkpoints" {
+		t.Fatalf("checkpoints printed %v, want a checkpoints record", cps)
+	}
+	cplist, _ := cps[0]["checkpoints"].([]any)
+	if len(cplist) != 1 {
+		t.Fatalf("checkpoints listed %v, want c1", cplist)
+	}
+	if l := record(cplist[0].(map[string]any)); l.str("id") != "c1" || l.str("note") != "second" || fmt.Sprint(l.pos()) != fmt.Sprint(cp[0].pos()) || l.str("when") != cp[0].str("when") {
+		t.Errorf("checkpoints listed %v, want the fields of the checkpoint record %v", l, cp[0])
+	}
 	values := byCmd["print detsched.tick"]
 	if len(values) != 4 {
 		t.Fatalf("got %d records for print detsched.tick, want 4: %v", len(values), values)
@@ -528,6 +618,99 @@ exit
 	}
 	if inlined != 4 || rets != 2 {
 		t.Errorf("dlv --json: %d hits of a with inlined_in, want 4; %d returns, want 2", inlined, rets)
+	}
+}
+
+// A breakpoint on a method of a generic type names each function it has
+// addresses in with its type arguments, and which one is the wrapper of
+// the go.shape body.
+func TestGenericNames(t *testing.T) {
+	dlv := dlvPath(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "generic")
+	if out, err := exec.Command("go", "build", "-o", bin, "./generic").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	script := filepath.Join(dir, "script.dlv")
+	if err := os.WriteFile(script, []byte("break l main.(*lease).take\nbreakpoints\nexit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(flags ...string) string {
+		args := append([]string{"exec", bin, "-r", "stdout:" + filepath.Join(dir, "prog.out"), "--init", script, "--allow-non-terminal-interactive=true"}, flags...)
+		out, err := exec.Command(dlv, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("dlv %q: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	body, wrapper := "main.(*lease[go.shape.string]).take", "main.(*lease[string]).take"
+	out := run()
+	set := regexp.MustCompile(`(?m)^Breakpoint l set at .*$`).FindString(out)
+	if !strings.Contains(set, " for "+body+"(),") && !strings.Contains(set, " for "+body+"() ./") || !strings.Contains(set, " for "+wrapper+"() (wrapper)") {
+		t.Errorf("the breakpoint's confirmation %q does not name %s and %s (wrapper):\n%s", set, body, wrapper, out)
+	}
+	var funcs []any
+	for _, r := range parseJSON(t, run("--json")) {
+		if r.str("event") == "breakpoints" {
+			for _, bp := range r["breakpoints"].([]any) {
+				if bp := record(bp.(map[string]any)); bp.str("name") == "l" {
+					funcs, _ = bp["funcs"].([]any)
+				}
+			}
+		}
+	}
+	if got := fmt.Sprint(funcs); !strings.Contains(got, body) || !strings.Contains(got, wrapper) || len(funcs) != 2 {
+		t.Errorf("the breakpoints record's funcs of l are %v, want %s and %s", funcs, body, wrapper)
+	}
+}
+
+// A program dlv exec starts has exactly the environment dlv was given, in
+// its order, as when it runs without dlv: a detsched program that does
+// more or less work for another environment, as the runtime does when it
+// first reads it, runs another schedule.
+func TestEnvironment(t *testing.T) {
+	dlv := dlvPath(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "environ")
+	if out, err := exec.Command("go", "build", "-o", bin, "./environ").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	script := filepath.Join(dir, "script.dlv")
+	if err := os.WriteFile(script, []byte("continue\nexit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Few variables, and no PWD or CGO_CFLAGS, which dlv or os/exec could
+	// add.
+	env := []string{"HOME=" + os.Getenv("HOME"), "PATH=" + os.Getenv("PATH"), "DETSCHED_ENV_TEST=a b"}
+	if tmp := os.Getenv("TMPDIR"); tmp != "" {
+		env = append(env, "TMPDIR="+tmp)
+	}
+	plain := exec.Command(bin)
+	plain.Env = env
+	want, err := plain.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog.out")
+	args := []string{"exec", "--disable-aslr", bin, "-r", "stdout:" + out, "--init", script, "--allow-non-terminal-interactive=true"}
+	cmd := exec.Command(dlv, args...)
+	cmd.Env, cmd.Dir = env, dir
+	if log, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("dlv %q: %v\n%s", args, err, log)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		names := func(b []byte) (s []string) {
+			for _, kv := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+				k, _, _ := strings.Cut(kv, "=")
+				s = append(s, k)
+			}
+			return s
+		}
+		t.Errorf("under dlv the program has the variables %q, run plainly %q", names(got), names(want))
 	}
 }
 

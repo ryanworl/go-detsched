@@ -33,6 +33,9 @@ func TestStore(t *testing.T) {
 Then run it on one sim node, even if it does no I/O. On a node, CPU work takes simulated time as on a real machine; outside one it is free, so a loop that re-arms a timer for "now" spins at one instant until the search stops it, where a real machine would move on. A node also lets the search fork a library that writes files (it cannot fork a program that used the real file system), and lets crashes and disk faults reach it:
 
 ```go
+if !sim.Supported() { // sim.NewWorld panics under stock Go
+	t.Skip("requires GOEXPERIMENT=detsched")
+}
 w := sim.NewWorld(sim.Config{})
 defer w.Close()
 n := w.AddNode("db", "10.0.0.1")
@@ -133,14 +136,12 @@ func TestKV(t *testing.T) {
 
 ## Comparing the SUT before and after a fix
 
-Build a binary from each version, as `detsched` builds, and search each with the same `-n`:
+Search the package with each version and the same `-n`, giving the before version its own go.mod with `GOFLAGS`, so that each search builds its debug binary too (with `-exec`, debug lines run the optimized binary):
 
 ```
 cd /abs/harness
-GOFLAGS=-modfile=go.before.mod GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o before.test .
-GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o after.test .
-detsched -exec ./before.test -n 3000
-detsched -exec ./after.test -n 3000
+GOFLAGS=-modfile=go.before.mod detsched -n 3000 .
+detsched -n 3000 .
 ```
 
-`go.before.mod` is a copy of go.mod whose `replace` points at an unchanged copy of the SUT, next to a copy of go.sum named `go.before.sum`. Compare failure rates, not seeds: a fix changes the schedules, and a fixed run goes on where the buggy one failed, so the same `-n` can take longer. A flag the harness reads works the same way with one binary.
+`go.before.mod` is a copy of go.mod whose `replace` points at an unchanged copy of the SUT, next to a copy of go.sum named `go.before.sum`. Compare failure rates, not seeds: a fix changes the schedules, and a fixed run goes on where the buggy one failed, so the same `-n` can take longer. A flag the harness reads works the same way with one package.

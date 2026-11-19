@@ -36,6 +36,7 @@ type assertSite struct {
 	msg  string // cut at 120 bytes, as the runtime keeps it
 	pos  string // file:line
 	fn   string // the top-level function it is in, or ""
+	no   bool   // an Always whose condition is the constant false
 }
 
 // assertKinds are the runtime's names of the assertion functions that
@@ -120,7 +121,11 @@ func catalogAsserts(pkg, dir string, env []string) ([]assertSite, error) {
 				msg = msg[:120]
 			}
 			p := fset.Position(call.Pos())
-			sites = append(sites, assertSite{kind: kind, msg: msg, pos: fmt.Sprintf("%s:%d", filepath.Base(p.Filename), p.Line), fn: fn})
+			no := false
+			if id, ok := call.Args[0].(*ast.Ident); ok && kind == "always" {
+				no = id.Name == "false"
+			}
+			sites = append(sites, assertSite{kind: kind, msg: msg, pos: fmt.Sprintf("%s:%d", filepath.Base(p.Filename), p.Line), fn: fn, no: no})
 			return true
 		})
 	}
@@ -245,7 +250,11 @@ func (s *search) coverage() []fallback {
 		}
 		pos[k] = a.pos
 		if s.asserts[k] == nil {
-			unreached = append(unreached, fmt.Sprintf("%s %q (%s)", a.kind, a.msg, a.pos))
+			fix := ""
+			if a.no {
+				fix = "; for a branch no run should reach, use assert.Unreachable"
+			}
+			unreached = append(unreached, fmt.Sprintf("%s %q (%s%s)", a.kind, a.msg, a.pos, fix))
 		}
 	}
 	for _, c := range slices.SortedFunc(maps.Values(s.asserts), func(a, b *assertCount) int { return strings.Compare(a.msg, b.msg) }) {

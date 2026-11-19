@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched27
+v=go1.27.4-detsched28
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -122,17 +122,17 @@ FAIL 82 of 6848 runs: detsched: assertion failed: acknowledged write survives
   gives the first run's details, which other runs need not share.
 - `faults` says which of the faults that came with the failure it
   needs. Once the group's replay reproduces it, `detsched` runs, in the
-  background, 8 variants of the group's first run, reseeded at its last
-  branch point (at setup's end without one) so that only what comes
-  after differs, then the same 8 with one kind of fault turned off after
-  that point, for the 6 kinds that fired in the most variants. A kind
-  without which a third as many variants fail, or fewer, is one the
-  failure `needs`; one without which as many fail is `not needed`. When
-  fewer than 3 of 8 variants fail, it reseeds the first run later,
-  halfway and then three quarters of the way to its failure. A fault
-  that fired before the reseed stays in there, so the line says so
-  instead of calling it not needed. A search of `-n` runs waits for this
-  before its summary; a search that ends otherwise says it was not
+  background, variants of the group's first run reseeded at setup's end
+  (at its start without setup), then the same variants with one kind of
+  fault turned off for the rest of the run, for the 6 kinds that fired
+  in the most variants. It runs 8 variants, and more, up to 64, until 4
+  fail. A kind without which a third as many variants fail, or fewer, is
+  one the failure `needs`; one without which as many fail is `not
+  needed`. Variants part at setup's end because a failure noticed long
+  after its cause, such as a stall caught at a deadline, would fail in
+  every variant reseeded later. When too few variants fail, the line
+  says `not found` and how many did. A search of `-n` runs waits for
+  this before its summary; a search that ends otherwise says it was not
   found. Plain loss on a link (`Link.Drop`) counts as the fault
   `sim.net.loss`.
 - For a deadlock at the end of a test (`blocked goroutines remain`), a
@@ -204,8 +204,19 @@ depend on where it is loaded. A set-user-ID program never does it.
 differs there, it looks for the variables of its own environment that the
 schedule depends on and sets them on replay lines (such as a harness flag
 `SIMCOMPOSE_BUG=1`, or `NO_COLOR`, which logging libraries read at init).
-This entry means it could not find them: run replay lines from the shell
-that ran `detsched`.
+This entry means it could not find them, as for a program that ranges
+over `os.Environ()`: run replay lines from the shell that ran
+`detsched`. In det mode `os.Environ()` leaves out the variables replay
+lines, `dlv` and the shell set differently from the search's runs
+(`GODET*`, a `GODEBUG` of only `det` settings, `_` and `OLDPWD`), so from
+that shell the line replays the run; `os.Getenv` still reads them.
+
+### Tests share a fork point
+
+One process runs the package's tests one after another, and only the
+first `lifecycle.SetupComplete` of a process is a fork point. When later
+tests complete setup too, every run pays their setup again, under the
+faults the first setup turned on. Search one test at a time with `-run`.
 
 ### Fork refused
 
@@ -247,6 +258,8 @@ packages of the program's module (with `-run`, those in the tests it
 selects), and warns of those no run reached. An `Always` that no run
 evaluates checks nothing; a `Reachable` no run reaches marks a path the
 workload never took. A search with no failures says nothing about them.
+An `Always(false, ...)` marks a branch no run should reach: write it as
+`assert.Unreachable`, which the warning leaves out.
 
 ### Sometimes never true
 
@@ -322,6 +335,9 @@ addresses (printing pointers, hashing or sorting them as numbers), its own stack
 statistics (`runtime.ReadMemStats`, GC counts). In the last case debug the
 optimized binary; otherwise build one yourself
 ([delve.md](delve.md#read-locals-replay-a-build-without-optimizations)).
+The warning names the first switch where the builds part, with each
+build's tick and position in the goroutine that ran before it; when
+nothing above explains it, report it as a detsched bug.
 
 ### Memory
 
@@ -377,8 +393,11 @@ group:
   deterministic subset, stops there too: read its stacks.
 
 The group's line `of its last N switches, ...` names the goroutines most
-of the run's last switches went to, and the first function outside the
-runtime each is in. Its log ends with every goroutine's stack.
+of the run's last switches went to, and the innermost function of the
+code under test each is in (the tests' module and the modules it
+replaces with a local directory), else the innermost one outside the
+runtime. Switches to goroutines that have exited count together, with the
+functions they started in. Its log ends with every goroutine's stack.
 
 ## Replaying a failure
 
@@ -467,10 +486,14 @@ All are optional.
   `-seed-base $((i << 32))` runs seeds `i<<32+2`, `i<<32+3`, and on.
 - `-exec binary` runs a prebuilt binary in the current directory instead
   of building a package, so that one job builds it and every shard runs
-  the same file, or two versions of the code are compared by their
-  failure rates over the same `-n`. `detsched` runs a copy it keeps, which
-  replay lines name. Build it as `detsched` does, in the package's
-  directory: `GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o pkg.test`.
+  the same file. `detsched` runs a copy it keeps, which replay lines
+  name, and debug lines run it too, with optimizations. Build it as
+  `detsched` does, in the package's directory:
+  `GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o pkg.test`. To
+  compare two versions of the code by their failure rates over the same
+  `-n`, search the package with each instead, giving one its own go.mod
+  (`GOFLAGS=-modfile=go.before.mod detsched -n 3000 .`), so that debug
+  lines keep the build without optimizations.
 - `-check` checks that the tests can fail; see
   [Checking that the tests can fail](#checking-that-the-tests-can-fail).
 
@@ -489,14 +512,19 @@ detsched -check: caught 6 of 12 mistakes planted in code the passing runs reache
 - It first searches the unmutated program with the same runs, and stops
   if any run fails: fix those failures first, since a mutant's could not
   be told from them.
-- The code under test is the non-test Go files of the tests' module that
-  the test binary links, but detsched's SDK. A coverage build's runs of
+- The code under test is the non-test Go files that the test binary
+  links of the tests' module and of the modules its go.mod replaces with
+  a local directory, such as a harness module's copy of the code it
+  tests, but detsched's SDK. A coverage build's runs of
   seeds 1 to 8 pick the lines to mutate: only those a passing run reached.
-- The mistakes: drop a `Lock` and its `Unlock`, buffer an unbuffered
-  channel or unbuffer a buffered one, drop a `close`, flip `<` to `<=` and
-  the like, ignore an `err != nil` check, and drop a `Sync` call as if it
-  succeeded. Up to 20 that compile, spread over these kinds; one that does
-  not compile, such as a variable left unused, is skipped.
+- The mistakes: drop a `Lock` and its `Unlock`, drop every `Lock` and
+  `Unlock` of one mutex across the package (one locked in one method and
+  unlocked in another), buffer an unbuffered channel or unbuffer a
+  buffered one, drop a `close`, drop a `Sync` call as if it succeeded,
+  flip `<` to `<=` and the like, and ignore an `err != nil` check whose
+  error path a passing run took. Up to 20 that compile, spread over these
+  kinds, concurrency and durability first; one that does not compile,
+  such as a variable left unused, is skipped.
 - Each mutant runs `-n` runs (default 100) and stops at its first
   failure; `-run`, `-p` and `-timeout` apply as to a search. The mutants
   are built through `go build -overlay`, so the source is untouched.
@@ -541,14 +569,17 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched27:
+and release N's version is v0.N.0, so with go1.27.4-detsched28:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.27.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.28.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
-with stock Go. `go doc -all` on each documents its API.
+with stock Go, except `sim.NewWorld`, which panics: start a test that
+uses `sim` or `compose` with
+`if !sim.Supported() { t.Skip("requires GOEXPERIMENT=detsched") }`.
+`go doc -all` on each documents its API.
 
 - `assert`, after the Antithesis SDK: `Always`, `AlwaysOrUnreachable`,
   `Sometimes`, `Reachable`, and `Unreachable`, identified by their

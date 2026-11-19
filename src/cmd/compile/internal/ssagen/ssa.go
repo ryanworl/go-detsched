@@ -1823,8 +1823,12 @@ func (s *state) stmt(n ir.Node) {
 		if lab.target == nil {
 			lab.target = s.f.NewBlock(ssa.BlockPlain)
 		}
-		if lab.defined && s.detCounts(n.Pos()) {
-			s.detTick() // a backward goto makes a loop
+		// A backward goto makes a loop, unless the compiler made it: the
+		// gotos that compile a switch (labels starting with ".") never
+		// loop, and they differ with optimization, which turns a string
+		// switch's switch on lengths into a jump table.
+		if lab.defined && !strings.HasPrefix(sym.Name, ".") && s.detCounts(n.Pos()) {
+			s.detTick()
 		}
 
 		b := s.endBlock()

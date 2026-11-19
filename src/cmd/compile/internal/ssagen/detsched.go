@@ -44,7 +44,7 @@ func (s *state) detInlCounts(i int64) bool {
 //
 // It is emitted at the entry of a function that counts and is not a leaf
 // (ir.DetLeaf), at the start of each inlined body of one, at the end of each iteration of a for loop in
-// code that counts, and before each backward goto there.
+// code that counts, and before each backward goto in its source.
 func (s *state) detTick() {
 	s.detCheck(ir.Syms.DetTicks, ir.Syms.DetPreempt)
 }

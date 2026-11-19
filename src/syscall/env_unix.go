@@ -146,6 +146,9 @@ func Environ() []string {
 	copyenv()
 	envLock.RLock()
 	defer envLock.RUnlock()
+	if goexperiment.DetSched {
+		return detEnviron()
+	}
 	a := make([]string, 0, len(envs))
 	for _, env := range envs {
 		if env != "" {
@@ -153,4 +156,46 @@ func Environ() []string {
 		}
 	}
 	return a
+}
+
+// detEnviron is Environ in det mode. It leaves out the variables that a
+// search's runs, their replay lines, and a debugger's runs set
+// differently: those that control det mode, named GODET*, and GODEBUG
+// when all its settings are the runtime's det ones (see
+// runtime.detGodebugEnv), and those a shell sets for each command, _ and
+// OLDPWD, which a replay line's cd changes. So a program that ranges over
+// its environment does the same work in each, and runs the same
+// schedule. Getenv still finds them. The result has the capacity of envs,
+// which the runtime fixes (see detEnvsCopy), so that its size does not
+// depend on them either.
+func detEnviron() []string {
+	a := make([]string, 0, cap(envs))
+	for _, env := range envs {
+		if env != "" && !detHidden(env) {
+			a = append(a, env)
+		}
+	}
+	return a
+}
+
+// detHidden reports whether detEnviron leaves out env, a "key=value".
+func detHidden(env string) bool {
+	if len(env) >= 5 && env[:5] == "GODET" || len(env) >= 2 && env[:2] == "_=" || len(env) >= 7 && env[:7] == "OLDPWD=" {
+		return true
+	}
+	if len(env) < 8 || env[:8] != "GODEBUG=" {
+		return false
+	}
+	// Each setting, between commas, must start with "det" or be empty.
+	for s := env[8:]; s != ""; {
+		i := 0
+		for i < len(s) && s[i] != ',' {
+			i++
+		}
+		if f := s[:i]; f != "" && (len(f) < 3 || f[:3] != "det") {
+			return false
+		}
+		s = s[min(i+1, len(s)):]
+	}
+	return true
 }

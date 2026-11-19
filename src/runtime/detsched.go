@@ -134,6 +134,11 @@ type detPState struct {
 
 	// fault is the random state behind simulated faults; see detsim.go.
 	fault chacha8rand.State
+
+	// last is the goroutine that ran before the current one, and
+	// lastGoid its goid, for dettrace=2's switch lines.
+	last     guintptr
+	lastGoid uint64
 }
 
 // detGState is the det-mode state of a goroutine, used by PCT. g.det has
@@ -337,11 +342,52 @@ func detTraceSwitch(pp *p, gp *g) {
 		detGC.ran = true // see detGCIdleEpoch
 	}
 	if debug.dettrace >= 2 {
-		print("detsched: switch ", detP(pp).switches, " to goroutine ", gp.goid, " at ")
-		if name, file, line := detSitePos(gp.sched.pc); name != "" {
-			print(name, " ", file, ":", line, "\n")
+		print("detsched: switch ", detP(pp).switches, " k", detTickNow(), " to goroutine ", gp.goid, " at ")
+		name, file, line := detSitePos(gp.sched.pc)
+		if name != "" {
+			print(name, " ", file, ":", line)
 		} else {
-			print(hex(gp.sched.pc), "\n")
+			print(hex(gp.sched.pc))
+		}
+		if stringslite.HasPrefix(name, "runtime.") {
+			detTraceFrame(" in ", gp)
+		}
+		// Where the goroutine before stopped: for one preempted, where
+		// it counted the tick that used up its budget.
+		if last := detP(pp).last.ptr(); last != nil {
+			print(", after goroutine ", detP(pp).lastGoid)
+			how := " stopped in "
+			if f := findfunc(last.sched.pc); f.valid() && funcname(f) == "runtime.detPreempt" {
+				how = " was preempted in "
+			}
+			if last.goid != detP(pp).lastGoid || readgstatus(last)&^_Gscan == _Gdead {
+				print(" exited")
+			} else {
+				detTraceFrame(how, last)
+			}
+		}
+		print("\n")
+		detP(pp).last.set(gp)
+		detP(pp).lastGoid = gp.goid
+	}
+}
+
+// detTraceFrame prints prefix and the innermost function outside the
+// runtime that gp is in, inlined or not, with the file and line of its
+// call or tick, if gp is stopped and has one. A goroutine that execute
+// is about to run is stopped too.
+func detTraceFrame(prefix string, gp *g) {
+	if s := readgstatus(gp) &^ _Gscan; s != _Grunnable && s != _Gwaiting && s != _Grunning || gp == getg() {
+		return
+	}
+	var u unwinder
+	for u.init(gp, unwindSilentErrors); u.valid(); u.next() {
+		for iu, uf := newInlineUnwinder(u.frame.fn, u.symPC()); uf.valid(); uf = iu.next(uf) {
+			if name := iu.srcFunc(uf).name(); !stringslite.HasPrefix(name, "runtime.") {
+				file, line := iu.fileLine(uf)
+				print(prefix, name, " ", file, ":", line)
+				return
+			}
 		}
 	}
 }
@@ -925,6 +971,15 @@ func detTraceReport() {
 	}
 	if detSetup != 0 {
 		print("detsched: setup complete at switch ", detSetup, "\n")
+		if detSetupOthers[0] != "" {
+			print("detsched: setup completed again in tests after ", detSetupTest, ":")
+			for _, t := range detSetupOthers {
+				if t != "" {
+					print(" ", t)
+				}
+			}
+			print("\n")
+		}
 	}
 	if detPerturb.pct {
 		print("detsched: perturb pct depth=", detPCT.depth, " steps=", detPCT.steps, "\n")
@@ -1092,7 +1147,7 @@ func syscall_detStartProcess(argv0 string) {
 //
 //go:linkname os_runtime_detFileOpen os.runtime_detFileOpen
 func os_runtime_detFileOpen(fd int) bool {
-	if detsimFD(uintptr(fd)) {
+	if detsimFD(uintptr(fd)) || detFork.own {
 		return false
 	}
 	atomic.Xaddint32(&detFork.files, 1)
@@ -1121,10 +1176,22 @@ func os_runtime_detOSRand() uint64 {
 //
 //go:linkname os_runtime_detWroteFS os.runtime_detWroteFS
 func os_runtime_detWroteFS(fd int) {
-	if fd >= 0 && detsimFD(uintptr(fd)) || fd < 0 && detsimNodeOf() != 0 {
+	if fd >= 0 && detsimFD(uintptr(fd)) || fd < 0 && detsimNodeOf() != 0 || detFork.own {
 		return
 	}
 	atomic.Storeint32(&detFork.wroteFS, 1)
+}
+
+// testing_detOwnFiles marks the files package testing opens, until it
+// calls it again with false, as files that do not keep the process from
+// forking: those its flags name, such as -test.testlogfile, which go test
+// passes, so that a test run with go test can fork. A forked child
+// shares them with its parent: branches that write the test log too can
+// leave it unparsable, which only keeps go test from caching the result.
+//
+//go:linkname testing_detOwnFiles testing.detOwnFiles
+func testing_detOwnFiles(on bool) {
+	detFork.own = on
 }
 
 // os_runtime_detFileClose uncounts a file os_runtime_detFileOpen counted.
@@ -2027,12 +2094,35 @@ func detSDKBranches() int {
 	return detBranches
 }
 
+// detTest is the top-level test running, and detSetupTest the one that
+// completed setup. detSetupOthers lists the other tests that called
+// SetupComplete in the same process, up to 8, whose setups every branch
+// runs again: only the first call is a fork point.
+var (
+	detTest, detSetupTest string
+	detSetupOthers        [8]string
+)
+
+//go:linkname testing_detTestStart testing.detTestStart
+func testing_detTestStart(name string) { detTest = name }
+
 //go:linkname detSDKSetupComplete github.com/ryanworl/go-detsched/misc/detsched/sdk/lifecycle.runtime_setupComplete
 func detSDKSetupComplete() {
 	if detSetup != 0 {
+		if detTest != detSetupTest {
+			for i, t := range detSetupOthers {
+				if t == detTest {
+					break
+				}
+				if t == "" {
+					detSetupOthers[i] = detTest
+					break
+				}
+			}
+		}
 		return
 	}
-	detSetup = detP(getg().m.p.ptr()).switches
+	detSetup, detSetupTest = detP(getg().m.p.ptr()).switches, detTest
 	mcall(gosched_m)
 }
 
@@ -2065,6 +2155,7 @@ var detFork struct {
 	files    int32 // regular files package os has open (see os_runtime_detFileOpen)
 	wroteFS  int32 // package os wrote to the real file system (see os_runtime_detWroteFS)
 	security bool  // Security.framework was called (darwin); see detfork_darwin.go
+	own      bool  // package testing is opening its own files (see testing_detOwnFiles)
 }
 
 // detBranchChild reports whether this process is a branch that ends the

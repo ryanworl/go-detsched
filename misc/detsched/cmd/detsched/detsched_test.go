@@ -657,6 +657,60 @@ func TestAssertAll(t *testing.T) {
 	}
 }
 
+// TestTestLogFork checks that a test that go test -v runs, which passes
+// -test.testlogfile, a real file the testing package opens, still forks
+// its composer branches. Before, every branch printed that it did not run
+// because the process uses the real file system.
+func TestTestLogFork(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/simcompose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	cmd := exec.Command(bin, "-test.v", "-test.testlogfile="+filepath.Join(t.TempDir(), "testlog"))
+	cmd.Env = append(os.Environ(), "GODETSEED=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil || bytes.Contains(out, []byte("cannot fork now")) {
+		t.Errorf("%v\n%s", err, out)
+	}
+}
+
+// TestForkTicks checks that a composer branch run in place
+// (GODETBRANCH) reaches its first failed assertion at the tick its forked
+// child did, so that GODETSTOP=kN on the replay line stops there. Before,
+// the simulation's work in each forked child counted a tick.
+func TestForkTicks(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/simcompose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	first := regexp.MustCompile(`first assertion failed at (\S+ s\d+ k\d+)`)
+	branch := regexp.MustCompile(`detsched: branch (\d+) \(GODETBRANCH=`)
+	for seed := 1; seed <= 40; seed++ {
+		forked, _, err := runBin(bin, "SIMCOMPOSE_BUG=1", fmt.Sprintf("GODETSEED=%d", seed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := branch.FindStringSubmatch(forked.stderr)
+		if m == nil {
+			continue
+		}
+		inPlace, _, err := runBin(bin, "SIMCOMPOSE_BUG=1", fmt.Sprintf("GODETSEED=%d", seed), "GODETBRANCH="+m[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The forked branch's output comes right after its line.
+		_, after, _ := strings.Cut(forked.stderr, m[0])
+		f, p := first.FindStringSubmatch(after), first.FindStringSubmatch(inPlace.stderr)
+		if f == nil || p == nil || f[1] != p[1] {
+			t.Errorf("seed %d, branch %s: forked %q, in place %q", seed, m[1], f, p)
+		}
+		return
+	}
+	t.Fatal("no seed failed in a branch")
+}
+
 // TestSimPrograms runs simulation programs that check themselves, with
 // each seed, and checks that every run of a seed ends the same way, with
 // the exit status and the messages, each printed once, that the case
@@ -767,6 +821,26 @@ func TestSimKill(t *testing.T) {
 		if len(x.failures) > 0 {
 			t.Errorf("%s %s: got %s, want no failures", tc.pkg, strings.Join(tc.env, " "), x.report())
 		}
+	}
+}
+
+// TestPowerFailReports checks that a power failure reports torn writes
+// as injected only on a node with unsynced writes
+// (testdata/simkill's TestPowerFailReports).
+func TestPowerFailReports(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/simkill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	cmd := command(bin, "GODETSEED=1", "GODETSEARCH=feedback=1")
+	cmd.Args = append(cmd.Args, "-test.run=^TestPowerFailReports$")
+	o, _, err := run(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := regexp.MustCompile(`(?m)^detsched: assert reachable true=(\d+) false=\d+ fault: sim.disk.torn$`).FindStringSubmatch(o.stderr); o.exitCode != 0 || m == nil || m[1] != "1" {
+		t.Errorf("exit status %d, torn writes reported %v times, want 1:\n%s", o.exitCode, m, o.stderr)
 	}
 }
 
@@ -1176,9 +1250,12 @@ func TestDetGodebug(t *testing.T) {
 // them up in a sync.Map, whose work depends on their addresses; both
 // differ between the builds (testdata/typemap); and in one that ranges
 // over maps keyed by pointers, whose addresses differ between the builds
-// (testdata/ptrmap).
+// (testdata/ptrmap); and in compute-bound goroutines that preempt each
+// other all over constructs the builds compile differently, such as a
+// switch on strings of eight lengths, which only the optimized build
+// compiles to a jump table (testdata/constructs).
 func TestDebugBuild(t *testing.T) {
-	for _, prog := range []string{"buildinfo", "typemap", "ptrmap"} {
+	for _, prog := range []string{"buildinfo", "typemap", "ptrmap", "constructs"} {
 		var outs []outcome
 		for _, flags := range [][]string{nil, {"-gcflags=all=-N -l"}} {
 			_, bin, err := buildPackage("../../testdata/"+prog, t.TempDir(), flags...)

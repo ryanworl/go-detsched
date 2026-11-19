@@ -108,6 +108,21 @@ whether it is a generic fix for upstream Delve or specific to detsched:
   `detsched.start` which start of it; generic: a channel prints in one
   line (`chan int 3/100 (closed) at ADDR`) and `*ch` is its `hchan`, and
   `on NAME print EXPR` is labelled `EXPR`.
+- `0011`: detsched: `restart NOTE` runs to the checkpoint with that note
+  and other arguments are refused, and `rewind` also stops at a
+  `restart` to a point; `--json` prints no prompt, also at the end of an
+  `--init` file without `exit`; generic: a breakpoint names each
+  function it has addresses in with its type arguments and marks a
+  generic method's wrapper (`funcs` in the API and JSON); `checkpoint`
+  and `checkpoints` print typed JSON records with each checkpoint's
+  `id`, `note` and `pos`.
+- `0012`: generic: the program dlv starts has exactly dlv's environment:
+  `CGO_CFLAGS=-O0 -g` goes only to the builds of `dlv debug` and `dlv
+  test`, os/exec adds no `PWD` on Linux, and on macOS debugserver
+  launches the program at the protocol's `A` packet with the environment
+  in `-e` options, rather than from its command line, where it adds its
+  own environment (`__CF_USER_TEXT_ENCODING`); detsched: on macOS a
+  detsched program's `GODEBUG` gets no `asyncpreemptoff=1`.
 
 To build dlv for this tree, `delve.bash bin/dlv`. To change the patches,
 copy Delve's module (`go mod download -json

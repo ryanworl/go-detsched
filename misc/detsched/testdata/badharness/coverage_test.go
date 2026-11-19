@@ -58,10 +58,11 @@ func TestCoverage(t *testing.T) {
 		done := make(chan int)
 		b.Go(func() {
 			// Nothing listens on port 8, so the first dial fails and the
-			// retry path runs in every run.
+			// retry path runs in every run. The client gives up after 100
+			// tries, as a run that is one storm can keep a down for good.
 			got, addr := 0, "10.0.0.1:8"
 			var c net.Conn
-			for got < 3 {
+			for try := 0; got < 3 && try < 100; try++ {
 				var err error
 				if c == nil {
 					c, err = net.Dial("tcp", addr)

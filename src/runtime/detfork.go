@@ -319,9 +319,16 @@ func detForkProcess() (pid int64, child bool) {
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 	unlock(&detFork.lock)
 	if f := detsim.forked; f != nil {
+		// The ticks f counts do not move the tick clock: a branch run
+		// in place (GODETBRANCH) does not run f, and GODETSTOP=kN on
+		// its replay line must stop where the forked child was at
+		// tick N.
+		now := detTickNow()
 		ticks, q, last := detsimEnter()
 		systemstack(func() { f() })
 		detsimExit(ticks, q, last)
+		detTickEnd -= detTickNow() - now
+		detPutTicks(detTicksReal())
 	}
 	return 0, true
 }

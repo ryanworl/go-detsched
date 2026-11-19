@@ -75,10 +75,16 @@ jq -c 'select(.event != "output" and .event != "ok")' dlv.out
   switches=... syncs=..."}` (in text, `Process N has exited with status 1
   (detsched: trace=...)`). It must equal the log's. `exit -k` kills the
   program instead. A program that does not end within 5 minutes is
-  killed, with a message that it printed no trace line.
+  killed, with a message that it printed no trace line. With `--json`
+  every line is a record, with or without `exit`: Delve prints no
+  `(dlv)` prompt.
 
 Nothing you do in Delve changes the run: its stops run no program code,
 and time spent stopped does not exist for the program's virtual clock.
+`dlv exec` starts the program with exactly the environment it was given,
+in its order, as the shell would: a program that reads its environment,
+as the runtime does at its first `os.Getenv`, does other work with other
+variables and runs another schedule.
 Delve's `call` would run code; it is refused on optimized functions, and
 must not be used in the build below.
 
@@ -133,7 +139,9 @@ goroutines -t 30
 - `testing.(*common).Fail` stops at `t.Error` and `t.Fatal`.
 - Panics and fatal errors stop by themselves (`unrecovered-panic`,
   `runtime-fatal-throw`); a panic on a sim node with `OnPanic` set does
-  not, so break on `sim.onPanic` for it.
+  not, so break on `sim.onPanic` for it. There the panicking function is
+  `frame 4`, under `runtime.gopanic`, or the frame under
+  `runtime.sigpanic` for a fault such as a nil dereference.
 - A run that hangs: [attach to it](#attach-to-a-spinning-or-hung-run).
 
 ## Where the run is
@@ -247,13 +255,15 @@ as it did:
   and the breakpoints' hit counts); `checkpoints` lists them, and
   `clear-checkpoint cN` deletes one.
 - `restart c1` runs to checkpoint c1 and stops at the same instruction of
-  the same goroutine, with the same hit counts.
-- `rewind` (`rw`) goes back to the previous breakpoint stop of the
-  session (tracepoint hits don't count), or to the start; each `rewind`
-  one further.
+  the same goroutine, with the same hit counts; after `checkpoint hit15`,
+  `restart hit15` does the same.
+- `rewind` (`rw`) goes back to the previous stop of the session at a
+  breakpoint (tracepoint hits don't count) or of a `restart` to a point,
+  or to the start; each `rewind` one further.
 - `restart t9.4`, `restart s12345`, `restart k812345678` run to a point,
   as above. `restart` alone runs from the start with the breakpoints, as
-  in stock Delve.
+  in stock Delve. Any other argument is refused: in stock Delve it would
+  be the program's new arguments, a run other than the replay.
 
 At a point that is the last tick of its goroutine's quantum, the
 goroutine yields, and its code goes on only at a later switch. There
@@ -309,6 +319,12 @@ Each costs a replay up to the point: under a second for
   compiler's wrappers. Hits then name both functions:
   `> goroutine(1): [a] main.(*base).Record(...) (inlined in main.(*list).Record)`
   (in JSON, `func` and `inlined_in`) is a hit of `(*base).Record`.
+- A method of a generic type has a wrapper for each type argument,
+  `(*T[string]).M`, which calls its body for the argument's shape,
+  `(*T[go.shape.string]).M`, at the same line. `break b pkg.(*T).M` stops
+  in both, and the line says which address is which:
+  `0x4a1c0a for pkg.(*T[go.shape.string]).M(), 0x4a1caa for pkg.(*T[string]).M() (wrapper) ./t.go:22`
+  (`funcs`, one per address, in the JSON `breakpoints` record).
 - An address stops for one breakpoint. A function inlined into another at
   its first statement shares its address, so after
   `trace a pkg.(*T).Free`, `trace b pkg.(*T).release` says
@@ -419,12 +435,22 @@ starts with `cd`, so a variable written in front reaches only `cd`.
 cmp a.trace b.trace; diff a.trace b.trace | head
 ```
 
-The first differing `detsched: switch N to goroutine G at FUNC FILE:LINE`
-line is where they part: FUNC is the innermost function, inlined or not,
-and the line the call returns to, so an optimized build and one without
-optimizations compare. When a `bubble ... time` line differs first, the
-runs computed different amounts before it, which moved a node's clock.
-To look there, `restart sN` in Delve, then `stack 20`.
+The first line that differs up to its `at` is where they part:
+
+```
+detsched: switch N kK to goroutine G at FUNC FILE:LINE in USERFUNC FILE:LINE, after goroutine P was preempted in USERFUNC FILE:LINE
+```
+
+FUNC is the innermost function, inlined or not, and the line the call
+returns to, so an optimized build and one without optimizations compare;
+`in` names the first function outside the runtime when FUNC is in it,
+such as `runtime.detPreempt`. `after` says where the goroutine that ran
+before stopped: for one preempted, the tick that used up its budget.
+When only K, the ticks so far, differs, compare the two `after` parts:
+that goroutine ran another amount of code since its switch. When a
+`bubble ... time` line differs first, the runs computed different
+amounts before it, which moved a node's clock. To look there, `restart
+sN` in Delve, then `stack 20`, or run both with `GODETSTOP=sN:dump`.
 
 ## Attach to a spinning or hung run
 
@@ -461,7 +487,9 @@ it is:
 | `args`, `locals` | `args`, `locals` | `vars`: `name`, `type`, `value` |
 | `stack` | `stack` | `frames`: `n`, `func`, `file`, `line`, `pc` |
 | `goroutines` | `goroutines` | `goroutines`: `id`, locations, `node`, `node_state`, `wait`, `thread`, `labels`, and `frames` with `-t N` |
-| `breakpoints` | `breakpoints` | `breakpoints`: `id`, `name`, `kind`, `state`, `func`, `file`, `line`, `addrs`, `hits`, `cond`, `hitcond`, `counted_by` and `not_runtime_counted`, `actions` |
+| `breakpoints` | `breakpoints` | `breakpoints`: `id`, `name`, `kind`, `state`, `func`, `file`, `line`, `addrs`, `funcs` (each address's function, with type arguments), `hits`, `cond`, `hitcond`, `counted_by` and `not_runtime_counted`, `actions` |
+| `checkpoint` | `checkpoint [note]` | `id` (`"c1"`, as `restart` takes it), `note`, `when`, `pos`, `goroutine` |
+| `checkpoints` | `checkpoints` | `checkpoints`: the fields of `checkpoint` for each |
 | `exit` | the program's exit | `pid`, `status`, `trace` |
 | `error` | a command that failed | `error` |
 | `output` | other text | `text` |
@@ -485,6 +513,11 @@ additions. Instead of each:
   `GODETSTOP` stops;
 - the trace line: end the script with one more `continue`, since a stock
   `exit` kills the program first;
+- the environment: stock Delve adds `CGO_CFLAGS=-O0 -g` to the program's
+  environment, and on macOS debugserver adds `__CF_USER_TEXT_ENCODING`
+  (and with `GODEBUG` set, Delve appends `asyncpreemptoff=1` to it), so
+  a program that reads its environment at init, as most do, runs another
+  schedule; `dlv attach` to the plain replay keeps it;
 - locations: a file matches only by a suffix of its path on disk, and a
   closure only as `F.func1`, without its package; hits of an inlined
   function name only the function it was inlined into; strings are cut

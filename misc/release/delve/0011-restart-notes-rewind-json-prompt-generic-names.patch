@@ -1,0 +1,505 @@
+pkg/terminal, service: restart by checkpoint note, rewind to restart stops, JSON prompt and checkpoints, generic names
+
+restart NOTE, for a checkpoint made with checkpoint NOTE, fell through
+to stock restart, which took NOTE as the program's new arguments: it
+ran another program than the replay, from its start, with its output
+no longer going to the -r files, and with no trace line at exit. In a
+detsched program restart now runs to the checkpoint with that note, as
+restart cN does, and refuses any argument that is not a checkpoint's
+note or a position; restart alone still runs the program again from its
+start with the same arguments and redirects.
+
+rewind went back through the breakpoint stops only, so after restart
+tD, a breakpoint stop, checkpoint and restart c1, it went to the
+program's start rather than to the restart's stop. The stop of a
+restart to a point, tD, sN or kN, is now a stop of the history rewind
+goes back through, and rewind runs to the point again to reach it.
+
+In the JSON mode the "(dlv) " prompt was printed before the next
+record whenever the commands came from a file or a pipe, as at the end
+of an --init file without exit, so that line was not JSON. The JSON
+mode prints no prompt.
+
+A breakpoint on a method of a generic type has addresses in its wrapper
+for each type argument, (*T[string]).M, and in its body for the
+argument's shape, (*T[go.shape.string]).M, both at the method's line,
+and its confirmation named them alike, (*T).M(). It now names the
+function of each address with its type arguments, and marks the
+wrapper:
+
+	Breakpoint 1 set at 0x49a1ca for main.(*T[go.shape.string]).M(), 0x49a26a for main.(*T[string]).M() (wrapper) ./main.go:13
+
+The API breakpoint has the function of each address in Funcs, which the
+JSON breakpoints record has as "funcs", and the error for a breakpoint
+at an address another has names the address's function.
+
+In the JSON mode checkpoint and checkpoints printed text, as output
+records, which the filter the docs suggest drops. checkpoint prints a
+checkpoint record, with the checkpoint's id, cN, note, when, and, in a
+detsched program, its position and goroutine, and checkpoints a
+checkpoints record with a list of them; the API checkpoint has the
+position in Pos.
+
+The restart and rewind changes and the checkpoints' positions are
+detsched's (0003), the prompt and checkpoint records are the JSON
+mode's (0003); the names of a generic function's
+instantiations are a generic fix for upstream Delve.
+
+diff --git a/pkg/proc/breakpoints.go b/pkg/proc/breakpoints.go
+index f02a344..36573d8 100644
+--- a/pkg/proc/breakpoints.go
++++ b/pkg/proc/breakpoints.go
+@@ -266,13 +266,18 @@ type BreakpointExistsError struct {
+ 	Line  int
+ 	Addr  uint64
+ 	Owner string // the breakpoint that has the address, if known
++	Func  string // the function of the address, with its type arguments
+ }
+ 
+ func (bpe BreakpointExistsError) Error() string {
+ 	if bpe.Owner != "" {
+ 		// Two functions share the address when one is inlined into the
+ 		// other at its first statement.
+-		return fmt.Sprintf("Breakpoint exists at %s:%d at %x: %s has it, and an address stops for one breakpoint; the stack at its stops shows every call inlined there", bpe.File, bpe.Line, bpe.Addr, bpe.Owner)
++		in := ""
++		if bpe.Func != "" {
++			in = " in " + bpe.Func
++		}
++		return fmt.Sprintf("Breakpoint exists at %s:%d at %x%s: %s has it, and an address stops for one breakpoint; the stack at its stops shows every call inlined there", bpe.File, bpe.Line, bpe.Addr, in, bpe.Owner)
+ 	}
+ 	return fmt.Sprintf("Breakpoint exists at %s:%d at %x", bpe.File, bpe.Line, bpe.Addr)
+ }
+@@ -892,7 +897,7 @@ func (t *Target) setBreakpointInternal(logicalID int, addr uint64, kind Breakpoi
+ 
+ 	if bp, ok := bpmap.M[addr]; ok {
+ 		if !bp.canOverlap(kind) {
+-			return bp, BreakpointExistsError{File: bp.File, Line: bp.Line, Addr: bp.Addr, Owner: bp.Logical.describe()}
++			return bp, BreakpointExistsError{File: bp.File, Line: bp.Line, Addr: bp.Addr, Owner: bp.Logical.describe(), Func: bp.FunctionName}
+ 		}
+ 		bp.Breaklets = append(bp.Breaklets, newBreaklet)
+ 		setLogicalBreakpoint(bp)
+diff --git a/pkg/proc/interface.go b/pkg/proc/interface.go
+index 4b17cd6..ddb332b 100644
+--- a/pkg/proc/interface.go
++++ b/pkg/proc/interface.go
+@@ -117,6 +117,7 @@ type Checkpoint struct {
+ 	ID    int
+ 	When  string
+ 	Where string
++	Pos   *DetPos // the position of a checkpoint of a detsched program
+ }
+ 
+ // ContinueOnceContext is an object passed to ContinueOnce that the backend
+diff --git a/pkg/terminal/command.go b/pkg/terminal/command.go
+index 9636328..59fc90e 100644
+--- a/pkg/terminal/command.go
++++ b/pkg/terminal/command.go
+@@ -191,11 +191,12 @@ For live targets the command takes the following forms:
+ For a program built with GOEXPERIMENT=detsched, whose run is the same every time, it also runs the program again to a position, with the breakpoints disabled on the way:
+ 
+ 	restart cN	to checkpoint N (see "help checkpoint")
++	restart NOTE	to the checkpoint made with "checkpoint NOTE"
+ 	restart tD	to D seconds of virtual time, as GODETSTOP and the fault timeline write it
+ 	restart sN	to goroutine switch N
+ 	restart kN	to tick N
+ 
+-At a position it stops in the code of the goroutine that runs there.
++At a position it stops in the code of the goroutine that runs there. Other arguments are refused, since new arguments would run another program than the replay; "restart" alone runs it again from its start with the same arguments and redirects.
+ 
+ If newargv is omitted the process is restarted (or re-recorded) with the same argument vector.
+ If -noargs is specified instead, the argument vector is cleared.
+@@ -684,7 +685,9 @@ Switches to the specified process.`},
+ 				aliases: []string{"rewind", "rw"},
+ 				group:   runCmds,
+ 				cmdFn:   c.rewind,
+-				helpMsg: "Run backwards until breakpoint or start of recorded history.",
++				helpMsg: `Run backwards until breakpoint or start of recorded history.
++
++In a GOEXPERIMENT=detsched program it runs the program again to the last stop before the current one at a breakpoint or of a restart to a position (tD, sN or kN), or to its start.`,
+ 			},
+ 			command{
+ 				aliases: []string{"check", "checkpoint"},
+@@ -693,7 +696,7 @@ Switches to the specified process.`},
+ 
+ 	checkpoint [note]
+ 
+-The "note" is arbitrary text that can be used to identify the checkpoint, if it is not specified it defaults to the current filename:line position.`,
++The "note" is arbitrary text that can be used to identify the checkpoint, if it is not specified it defaults to the current filename:line position. In a GOEXPERIMENT=detsched program "restart note" goes back to the checkpoint, as "restart cN" does.`,
+ 			},
+ 			command{
+ 				aliases: []string{"checkpoints"},
+@@ -1351,8 +1354,12 @@ func parseOptionalCount(arg string) (int64, error) {
+ }
+ 
+ func restartLive(t *Term, ctx callContext, args string) error {
+-	if detPositionRegexp.MatchString(args) && t.isDetsched() {
+-		return restartDetsched(t, args)
++	if args != "" && t.isDetsched() {
++		pos, err := t.detRestartTarget(args)
++		if err != nil {
++			return err
++		}
++		return restartDetsched(t, pos)
+ 	}
+ 	t.oldPid = 0
+ 	resetArgs, newArgv, newRedirects, err := parseNewArgv(args)
+@@ -3644,6 +3651,20 @@ func checkpoint(t *Term, ctx callContext, args string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if t.jsonOn() {
++		cps, err := t.client.ListCheckpoints()
++		if err != nil {
++			return err
++		}
++		for _, cp := range cps {
++			if cp.ID == cpid {
++				rec := jsonCheckpoint(cp)
++				rec["event"] = "checkpoint"
++				t.jsonEmit(rec)
++			}
++		}
++		return nil
++	}
+ 
+ 	fmt.Fprintf(t.stdout, "Checkpoint c%d created.\n", cpid)
+ 	return nil
+@@ -3654,6 +3675,14 @@ func checkpoints(t *Term, ctx callContext, args string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if t.jsonOn() {
++		list := []map[string]any{}
++		for _, cp := range cps {
++			list = append(list, jsonCheckpoint(cp))
++		}
++		t.jsonEmit(map[string]any{"event": "checkpoints", "checkpoints": list})
++		return nil
++	}
+ 	w := new(tabwriter.Writer)
+ 	w.Init(t.stdout, 4, 4, 2, ' ', 0)
+ 	fmt.Fprintln(w, "ID\tWhen\tNote")
+@@ -3886,6 +3915,26 @@ func formatBreakpointName(bp *api.Breakpoint, upcase bool) string {
+ 
+ func (t *Term) formatBreakpointLocation(bp *api.Breakpoint) string {
+ 	var out bytes.Buffer
++	fns := breakpointInstantiations(bp)
++	if len(fns) > 1 && bp.WatchExpr == "" {
++		for i, fn := range fns {
++			if i > 0 {
++				out.WriteString(", ")
++			}
++			for j, addr := range fn.addrs {
++				if j > 0 {
++					out.WriteString(",")
++				}
++				fmt.Fprintf(&out, "%#x", addr)
++			}
++			fmt.Fprintf(&out, " for %s()", fn.name)
++			if fn.wrapper {
++				out.WriteString(" (wrapper)")
++			}
++		}
++		fmt.Fprintf(&out, " %s:%d", t.formatPath(bp.File), bp.Line)
++		return out.String()
++	}
+ 	if len(bp.Addrs) > 0 {
+ 		for i, addr := range bp.Addrs {
+ 			if i == 0 {
+@@ -3901,7 +3950,9 @@ func (t *Term) formatBreakpointLocation(bp *api.Breakpoint) string {
+ 	if bp.WatchExpr == "" {
+ 		fmt.Fprintf(&out, " for ")
+ 		p := t.formatPath(bp.File)
+-		if bp.FunctionName != "" {
++		if len(fns) == 1 {
++			fmt.Fprintf(&out, "%s() ", fns[0].name)
++		} else if bp.FunctionName != "" {
+ 			fmt.Fprintf(&out, "%s() ", bp.FunctionName)
+ 		}
+ 		fmt.Fprintf(&out, "%s:%d", p, bp.Line)
+diff --git a/pkg/terminal/detsched.go b/pkg/terminal/detsched.go
+index 4bb47f8..081d64d 100644
+--- a/pkg/terminal/detsched.go
++++ b/pkg/terminal/detsched.go
+@@ -8,6 +8,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"regexp"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/go-delve/delve/service/api"
+@@ -26,6 +27,34 @@ func posSuffix(th *api.Thread) string {
+ // program: a checkpoint, or a point as of GODETSTOP.
+ var detPositionRegexp = regexp.MustCompile(`^(c[0-9]+|t[0-9]*\.?[0-9]+|[sk][0-9]+)$`)
+ 
++// detRestartTarget returns the position restart args runs a detsched
++// program again to: args itself if it is a position, or the checkpoint
++// whose note args is. Other arguments are refused rather than taken as the
++// program's new arguments, which would run another program than the
++// replay, without its redirects.
++func (t *Term) detRestartTarget(args string) (string, error) {
++	if detPositionRegexp.MatchString(args) {
++		return args, nil
++	}
++	cps, err := t.client.ListCheckpoints()
++	if err != nil {
++		return "", err
++	}
++	var ids []string
++	for _, cp := range cps {
++		if cp.Where == args {
++			ids = append(ids, fmt.Sprintf("c%d", cp.ID))
++		}
++	}
++	switch len(ids) {
++	case 1:
++		return ids[0], nil
++	case 0:
++		return "", fmt.Errorf("restart %s: not a checkpoint's note or a position; restart takes cN, a checkpoint's note (see checkpoints), tD, sN or kN, or nothing to run the program again from its start (to run it with other arguments, start dlv again)", args)
++	}
++	return "", fmt.Errorf("restart %s: the checkpoints %s have this note; restart one by its ID", args, strings.Join(ids, ", "))
++}
++
+ // isDetsched reports whether the target is a detsched program, whose
+ // stops have a position, also once it exited.
+ func (t *Term) isDetsched() bool {
+@@ -204,3 +233,38 @@ func (t *Term) jsonFilteredVariables(kind string, vars []api.Variable, filter st
+ 	t.jsonEmit(map[string]any{"event": kind, "vars": t.jsonVars(match, 0)})
+ 	return nil
+ }
++
++// instantiation is a function a breakpoint has addresses in.
++type instantiation struct {
++	name    string // with its type arguments
++	addrs   []uint64
++	wrapper bool // calls the go.shape body of another
++}
++
++// breakpointInstantiations returns the functions bp's addresses are in,
++// with their type arguments, when they are one function or the
++// instantiations of one generic function, such as a method's wrapper,
++// (*T[string]).M, and its body, (*T[go.shape.string]).M, which
++// bp.FunctionName names alike without them; nil otherwise.
++func breakpointInstantiations(bp *api.Breakpoint) []instantiation {
++	if bp.FunctionName == "" || bp.FunctionName == "(multiple functions)" || len(bp.Funcs) != len(bp.Addrs) {
++		return nil
++	}
++	var fns []instantiation
++	shape := false
++outer:
++	for i, name := range bp.Funcs {
++		shape = shape || strings.Contains(name, "go.shape.")
++		for j := range fns {
++			if fns[j].name == name {
++				fns[j].addrs = append(fns[j].addrs, bp.Addrs[i])
++				continue outer
++			}
++		}
++		fns = append(fns, instantiation{name: name, addrs: []uint64{bp.Addrs[i]}})
++	}
++	for i := range fns {
++		fns[i].wrapper = len(fns) > 1 && shape && strings.Contains(fns[i].name, "[") && !strings.Contains(fns[i].name, "go.shape.")
++	}
++	return fns
++}
+diff --git a/pkg/terminal/json.go b/pkg/terminal/json.go
+index 183aae6..99a1505 100644
+--- a/pkg/terminal/json.go
++++ b/pkg/terminal/json.go
+@@ -107,6 +107,17 @@ func (t *Term) jsonCall(cmdstr, src string, call func() error) error {
+ 	return nil
+ }
+ 
++// jsonCheckpoint returns the fields of a checkpoint's record: its id,
++// cN, its note, when, and, in a detsched program, its position and
++// goroutine.
++func jsonCheckpoint(cp api.Checkpoint) map[string]any {
++	r := map[string]any{"id": fmt.Sprintf("c%d", cp.ID), "note": cp.Where, "when": cp.When}
++	if cp.Pos != nil {
++		r["pos"], r["goroutine"] = jsonPos(cp.Pos), cp.Pos.Goroutine
++	}
++	return r
++}
++
+ func jsonPos(p *api.Position) map[string]any {
+ 	if p == nil {
+ 		return nil
+@@ -297,6 +308,12 @@ func (t *Term) jsonBreakpoints(bps []*api.Breakpoint) {
+ 				addrs = append(addrs, fmt.Sprintf("%#x", a))
+ 			}
+ 			r["addrs"], r["func"], r["file"], r["line"] = addrs, bp.FunctionName, t.formatPath(bp.File), bp.Line
++			if fns := breakpointInstantiations(bp); len(fns) == 1 {
++				r["func"] = fns[0].name
++			}
++			if len(bp.Funcs) > 0 {
++				r["funcs"] = bp.Funcs // the function of each address, with its type arguments
++			}
+ 		}
+ 		if bp.Cond != "" {
+ 			r["cond"] = bp.Cond
+diff --git a/pkg/terminal/terminal.go b/pkg/terminal/terminal.go
+index 90d7dc7..4fd5db9 100644
+--- a/pkg/terminal/terminal.go
++++ b/pkg/terminal/terminal.go
+@@ -458,6 +458,10 @@ func (t *Term) Run() (int, error) {
+ 		if t.conf != nil && t.conf.Prompt != "" {
+ 			prompt = t.expandPrompt(t.conf.Prompt)
+ 		}
++		if t.jsonOn() {
++			// Every line of the JSON mode is a record.
++			prompt = ""
++		}
+ 
+ 		cmdstr, err := t.promptForInput(prompt)
+ 		if err != nil {
+diff --git a/service/api/conversions.go b/service/api/conversions.go
+index 82be88b..9dc107e 100644
+--- a/service/api/conversions.go
++++ b/service/api/conversions.go
+@@ -66,6 +66,7 @@ func ConvertPhysicalBreakpoints(b *Breakpoint, lbp *proc.LogicalBreakpoint, pids
+ 	for i, bp := range bps {
+ 		b.Addrs = append(b.Addrs, bp.Addr)
+ 		b.AddrPid = append(b.AddrPid, pids[i])
++		b.Funcs = append(b.Funcs, bp.FunctionName)
+ 		if b.FunctionName != bp.FunctionName && b.FunctionName != "" {
+ 			if !lg {
+ 				b.FunctionName = removeTypeParams(b.FunctionName)
+diff --git a/service/api/types.go b/service/api/types.go
+index 6761e37..c5e691d 100644
+--- a/service/api/types.go
++++ b/service/api/types.go
+@@ -100,6 +100,10 @@ type Breakpoint struct {
+ 	// FunctionName is the name of the function at the current breakpoint, and
+ 	// may not always be available.
+ 	FunctionName string `json:"functionName,omitempty"`
++	// Funcs[i] is the function of Addrs[i], with its type arguments: the
++	// instantiations of a generic function that FunctionName names
++	// without them, such as a method's wrapper and its go.shape body.
++	Funcs []string `json:"funcs,omitempty"`
+ 	// ExprString is the string that will be used to set a suspended breakpoint.
+ 	ExprString string
+ 
+@@ -683,6 +687,8 @@ type Checkpoint struct {
+ 	ID    int
+ 	When  string
+ 	Where string
++	// Pos is the position of a checkpoint of a detsched program.
++	Pos *Position `json:"pos,omitempty"`
+ }
+ 
+ // Image represents a loaded shared object (go plugin or shared library)
+diff --git a/service/debugger/detsched.go b/service/debugger/detsched.go
+index 4932187..0acad77 100644
+--- a/service/debugger/detsched.go
++++ b/service/debugger/detsched.go
+@@ -27,6 +27,10 @@ type detMark struct {
+ 	pos  proc.DetPos
+ 	pc   uint64
+ 	hits map[int]detHits // the user breakpoints' hit counts, by ID
++
++	// point is, for the stop of a restart to a point, the point, tD, sN
++	// or kN: rewind runs the program to it again as restart did.
++	point string
+ }
+ 
+ type detHits struct {
+@@ -37,7 +41,7 @@ type detHits struct {
+ type detState struct {
+ 	marks   []*detMark
+ 	nextID  int
+-	history []*detMark // the breakpoint stops of the run, for rewind
++	history []*detMark // the breakpoint and restart stops of the run, for rewind
+ }
+ 
+ // detsched reports whether the target is a live detsched program, which
+@@ -95,7 +99,8 @@ func (d *Debugger) detCheckpoint(note string) (int, error) {
+ func (d *Debugger) detCheckpoints() []proc.Checkpoint {
+ 	r := make([]proc.Checkpoint, 0, len(d.det.marks))
+ 	for _, m := range d.det.marks {
+-		r = append(r, proc.Checkpoint{ID: m.id, When: m.when(), Where: m.note})
++		pos := m.pos
++		r = append(r, proc.Checkpoint{ID: m.id, When: m.when(), Where: m.note, Pos: &pos})
+ 	}
+ 	return r
+ }
+@@ -164,7 +169,22 @@ func (d *Debugger) detRestart(pos string) error {
+ 	if mark != nil {
+ 		return d.detRunToMark(mark)
+ 	}
+-	return d.detRunToPoint(kind, n, pos)
++	if err := d.detRunToPoint(kind, n, pos, nil); err != nil {
++		return err
++	}
++	// Rewind goes back to the stop restart went to, and before it to the
++	// stops of the history before it.
++	m, err := d.detMarkHere(pos)
++	if err != nil {
++		return err
++	}
++	m.point = pos
++	h := d.det.history
++	for len(h) > 0 && h[len(h)-1].pos.Tick >= m.pos.Tick {
++		h = h[:len(h)-1]
++	}
++	d.det.history = append(h, m)
++	return nil
+ }
+ 
+ // detRelaunch kills the program and starts it again, stopped before its
+@@ -260,9 +280,10 @@ func (d *Debugger) detContinueTo(addr uint64, cb func(proc.Thread, *proc.Target)
+ // that runs there, unless the goroutine yields at the point: then its
+ // code goes on only at a later switch, and the program stays in the
+ // runtime, at the point, where the frame below runtime.detPreempt is the
+-// goroutine's code.
+-func (d *Debugger) detRunToPoint(kind byte, n uint64, what string) error {
+-	return d.detWithoutBreakpoints(nil, func() error {
++// goroutine's code. The breakpoints then have the hit counts in hits, if
++// not nil.
++func (d *Debugger) detRunToPoint(kind byte, n uint64, what string, hits map[int]detHits) error {
++	return d.detWithoutBreakpoints(hits, func() error {
+ 		tgt := d.target.Selected
+ 		if err := tgt.DetSetStop(kind, n); err != nil {
+ 			return err
+@@ -380,8 +401,9 @@ func (d *Debugger) detAt(m *detMark) bool {
+ 	return err == nil && h.pc == m.pc && h.pos.Tick == m.pos.Tick && h.pos.Goroutine == m.pos.Goroutine
+ }
+ 
+-// detRewind runs the program again to the last breakpoint stop before
+-// the current one, or to its start if there is none.
++// detRewind runs the program again to the last breakpoint stop or
++// restart to a point before the current stop, or to its start if there
++// is none.
+ func (d *Debugger) detRewind() error {
+ 	// After the program exited, every stop is before the current
+ 	// position.
+@@ -407,6 +429,13 @@ func (d *Debugger) detRewind() error {
+ 	if err := d.detRelaunch(); err != nil {
+ 		return err
+ 	}
++	if m.point != "" {
++		kind, n, err := proc.ParseDetPoint(m.point)
++		if err != nil {
++			return err
++		}
++		return d.detRunToPoint(kind, n, m.point, m.hits)
++	}
+ 	return d.detRunToMark(m)
+ }
+ 
+diff --git a/service/rpc2/server.go b/service/rpc2/server.go
+index bbfb9c1..fb79e14 100644
+--- a/service/rpc2/server.go
++++ b/service/rpc2/server.go
+@@ -881,7 +881,10 @@ func (s *RPCServer) ListCheckpoints(arg ListCheckpointsIn, out *ListCheckpointsO
+ 	}
+ 	out.Checkpoints = make([]api.Checkpoint, len(cps))
+ 	for i := range cps {
+-		out.Checkpoints[i] = api.Checkpoint(cps[i])
++		out.Checkpoints[i] = api.Checkpoint{ID: cps[i].ID, When: cps[i].When, Where: cps[i].Where}
++		if cps[i].Pos != nil {
++			out.Checkpoints[i].Pos = api.ConvertPosition(cps[i].Pos)
++		}
+ 	}
+ 	return nil
+ }

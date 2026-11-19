@@ -11,12 +11,15 @@ package runaway
 
 import (
 	"os"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/sim"
 )
@@ -81,6 +84,62 @@ func TestPoll(t *testing.T) {
 			}
 		}()
 		for !done.Load() {
+			time.Sleep(time.Millisecond)
+		}
+	})
+}
+
+// spin counts runes, so that most of the ticks a goroutine counts in it
+// are in package unicode/utf8.
+func spin() int {
+	sum := 0
+	for range 30 {
+		sum += utf8.RuneCountInString(text)
+	}
+	return sum
+}
+
+var text = strings.Repeat("détsched ", 20)
+
+// TestDepSpin waits for a flag in a loop that never blocks, so virtual
+// time, which would set it, never moves, and checks with spin, so that
+// its switches land in a dependency: the search must name spin, the
+// innermost function of the code under test, not utf8's.
+func TestDepSpin(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var done atomic.Bool
+		time.AfterFunc(time.Millisecond, func() { done.Store(true) })
+		if !bad() {
+			time.Sleep(2 * time.Millisecond)
+		}
+		for !done.Load() {
+			spin()
+		}
+	})
+}
+
+// TestChurn polls like TestPoll, starting goroutines that exit at each
+// poll, so that most switches go to goroutines that have exited: the
+// search must name where they started, not each of them.
+func TestChurn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var done atomic.Bool
+		go func() {
+			time.Sleep(time.Second)
+			if !bad() {
+				done.Store(true)
+			}
+		}()
+		for !done.Load() {
+			var wg sync.WaitGroup
+			for range 8 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					runtime.Gosched()
+				}()
+			}
+			wg.Wait()
 			time.Sleep(time.Millisecond)
 		}
 	})

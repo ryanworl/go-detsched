@@ -4,7 +4,8 @@
 
 // Package simkill kills a throttled node while its goroutine reads a file
 // it mapped. A killed node's goroutines must never run once its memory is
-// unmapped, under any schedule: TestSimKill explores schedules.
+// unmapped, under any schedule: TestSimKill explores schedules. It also
+// kills nodes from their own goroutines.
 package simkill
 
 import (
@@ -17,6 +18,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/ryanworl/go-detsched/misc/detsched/sdk/buggify"
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/sim"
 )
 
@@ -181,5 +183,77 @@ func TestSetIP(t *testing.T) {
 		if got, err := dial("10.0.0.1:7000"); err == nil {
 			t.Errorf("dial to the old address reached %q", got)
 		}
+	})
+}
+
+// TestSelfKill kills a node from one of its own goroutines, with Kill
+// and with KillProcess, while another of its goroutines waits: the
+// caller must stop there, the node must go down and start again, and the
+// test must go on. Before, the caller left the bubble with its node and
+// then closed the node's channels, which panicked ("close of synctest
+// channel from outside bubble"), or the bubble deadlocked.
+func TestSelfKill(t *testing.T) {
+	if !sim.Supported() {
+		t.Skip("needs GOEXPERIMENT=detsched")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		w := sim.NewWorld(sim.Config{})
+		defer w.Close()
+		a := w.AddNode("a", "10.0.0.1")
+		for i := range 4 {
+			a.Start(func() {})
+			a.Go(func() { select {} })
+			after := false
+			a.Go(func() {
+				time.Sleep(time.Millisecond)
+				if i%2 == 0 {
+					a.Kill()
+				} else {
+					a.KillProcess()
+				}
+				after = true
+			})
+			<-a.Down()
+			time.Sleep(time.Millisecond)
+			if after || a.Up() {
+				t.Fatalf("incarnation %d: the caller ran on after killing its node (%v), or the node is up (%v)", i, after, a.Up())
+			}
+		}
+		a.Start(func() {})
+		ran := make(chan bool)
+		a.Go(func() { ran <- true })
+		<-ran
+	})
+}
+
+// TestPowerFailReports cuts the power of node a, which has no files, and
+// of node b, which has an unsynced write, with torn writes forced on.
+// Only b's may report sim.disk.torn as injected (TestPowerFailReports in
+// cmd/detsched counts the reports): before, every power failure did,
+// which told the search that a harness without disk use was tested with
+// torn writes.
+func TestPowerFailReports(t *testing.T) {
+	if !sim.Supported() {
+		t.Skip("needs GOEXPERIMENT=detsched")
+	}
+	buggify.Force("sim.disk.torn", true)
+	defer buggify.Force("sim.disk.torn", false)
+	synctest.Test(t, func(t *testing.T) {
+		w := sim.NewWorld(sim.Config{})
+		defer w.Close()
+		a, b := w.AddNode("a", "10.0.0.1"), w.AddNode("b", "10.0.0.2")
+		a.Start(func() {})
+		b.Start(func() {})
+		a.Kill()
+		wrote := make(chan bool)
+		b.Go(func() {
+			f, _ := os.Create("/f")
+			f.Write([]byte("synced"))
+			f.Sync()
+			f.Write([]byte(", unsynced"))
+			close(wrote)
+		})
+		<-wrote
+		b.Kill()
 	})
 }

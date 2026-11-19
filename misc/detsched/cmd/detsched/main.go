@@ -190,6 +190,8 @@ type search struct {
 	timeout    time.Duration
 	workers    int
 	seedBase   uint64 // added to every seed after seed 1
+	modsOnce   sync.Once
+	mods       []string // the modules of the code under test (see codeModules)
 
 	progress io.Writer       // where to report progress, or nil
 	signals  context.Context // done at SIGINT or SIGTERM, or nil
@@ -454,6 +456,7 @@ var (
 	syncsField    = regexp.MustCompile(` syncs=(\d+)$`)
 	extentLine    = regexp.MustCompile(`(?m)^detsched: extent time=(\d+) stuck=(\d+) heap=(\d+)$`)
 	stopLine      = regexp.MustCompile(`(?m)^detsched: did not finish: (\w+): (\d+) .*\) at switch (\d+), virtual time (\S+)s$`)
+	setupAgain    = regexp.MustCompile(`(?m)^detsched: setup completed again in tests after (\S+): (.+)$`)
 	lastSwitches  = regexp.MustCompile(`(?m)^detsched: the last (\d+) switches went to:\n((?:detsched: \t.*\n)+)`)
 	setupLine     = regexp.MustCompile(`(?m)^detsched: setup complete at switch (\d+)$`)
 	deadlockLine  = regexp.MustCompile(`(?m)^detsched: potential deadlock: (.*)$`)
@@ -659,7 +662,17 @@ func (s *search) replayLine(r *result, debug bool) string {
 	if m := traceHash.FindStringSubmatch(trace); m != nil && !r.timedOut && !r.outOfMem {
 		env = addSearch(env, "trace="+m[1])
 	}
-	env = slices.Concat(env, r.env, s.vars)
+	for _, e := range slices.Concat(r.env, s.vars) {
+		v, ok := strings.CutPrefix(e, "GODETSEARCH=")
+		i := slices.IndexFunc(env, func(e string) bool { return strings.HasPrefix(e, "GODETSEARCH=") })
+		if !ok || i < 0 {
+			env = append(env, e)
+			continue
+		}
+		// One GODETSEARCH, as the run had it: the search's fields
+		// after those of the environment (see plain).
+		env[i] = "GODETSEARCH=" + v + " " + strings.TrimPrefix(env[i], "GODETSEARCH=")
+	}
 	// Set the variables the program read as the run had them, and unset
 	// those it did not have, since the shell the line runs in may have
 	// others, such as NO_COLOR, which can change the schedule.
@@ -741,6 +754,10 @@ func (s *search) buildDebug(ctx context.Context) {
 		cmd.Path, cmd.Args[0] = bin, bin
 		r, err = s.exec(context.WithoutCancel(ctx), cmd)
 	}
+	var where string
+	if err == nil && r.trace() != s.baseTrace {
+		where = s.debugDivergence(context.WithoutCancel(ctx), bin)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
@@ -749,7 +766,7 @@ func (s *search) buildDebug(ctx context.Context) {
 		s.debugNote = fmt.Sprintf("building or running it without optimizations failed: %v", truncate(err.Error(), 500))
 		s.notice("debug lines run the optimized binary: building or running it without optimizations failed")
 	case r.trace() != s.baseTrace:
-		s.debugNote = fmt.Sprintf("its build without optimizations (-gcflags=all=-N -l) ran seed 1 on another schedule three times (%s, not %s), as a program that reads its own stacks or whose work depends on heap addresses does", strings.TrimPrefix(r.trace(), "detsched: "), strings.TrimPrefix(s.baseTrace, "detsched: "))
+		s.debugNote = fmt.Sprintf("its build without optimizations (-gcflags=all=-N -l) ran seed 1 on another schedule three times (%s, not %s)%s", strings.TrimPrefix(r.trace(), "detsched: "), strings.TrimPrefix(s.baseTrace, "detsched: "), where)
 		s.notice("debug lines run the optimized binary: its build without optimizations runs another schedule")
 	default:
 		s.debugBin = bin
@@ -758,6 +775,77 @@ func (s *search) buildDebug(ctx context.Context) {
 			s.printf("\tgroup %d (%s): %s\n", g.index, g.msg(), s.debugLine(g))
 		}
 	}
+}
+
+// codeMods returns the modules of the code under test in the binary.
+func (s *search) codeMods() []string {
+	s.modsOnce.Do(func() { s.mods = codeModules(s.bin) })
+	return s.mods
+}
+
+// debugDivergence runs seed 1 with GODEBUG=dettrace=2 in the optimized
+// build and in bin, the build without optimizations, and returns where
+// their switches first differ, for the note that debug lines keep the
+// optimized binary: the switch, and the tick and the position each build
+// stopped the goroutine that ran before it, which its switch line names.
+// It returns "" if it finds no difference.
+func (s *search) debugDivergence(ctx context.Context, bin string) string {
+	// switches returns the run's switch lines, each cut in two: up to
+	// its site, "detsched: switch N kK to goroutine G", and what follows
+	// ", after ".
+	type line struct{ head, after string }
+	switches := func(path string) []line {
+		cmd := s.plain(1, "GODETSEARCH=feedback=1")
+		cmd.Path, cmd.Args[0] = path, path
+		godebug := "dettrace=2"
+		if v, ok := lookupEnv(cmd.Env, "GODEBUG"); ok && v != "" {
+			godebug = v + ",dettrace=2"
+		}
+		cmd.Env = append(cmd.Env, "GODEBUG="+godebug)
+		r, err := s.exec(ctx, cmd)
+		if err != nil {
+			return nil
+		}
+		var lines []line
+		for _, l := range strings.Split(string(r.output), "\n") {
+			if strings.HasPrefix(l, "[detsched: ") {
+				break // the output was cut here
+			}
+			if strings.HasPrefix(l, "detsched: switch ") {
+				head, rest, _ := strings.Cut(l, " at ")
+				_, after, _ := strings.Cut(rest, ", after ")
+				lines = append(lines, line{head, after})
+			}
+		}
+		return lines
+	}
+	opt, dbg := switches(s.bin), switches(bin)
+	i := 0
+	for i < len(opt) && i < len(dbg) && opt[i].head == dbg[i].head {
+		i++
+	}
+	if i == len(opt) || i == len(dbg) {
+		return ""
+	}
+	n, k := switchFields(opt[i].head)
+	_, kd := switchFields(dbg[i].head)
+	where := fmt.Sprintf(": the builds first differ at switch %s (k%s optimized, k%s without optimizations)", n, k, kd)
+	if opt[i].after == "" {
+		return where
+	}
+	// The goroutine that ran up to switch n ran another amount of code
+	// in the two builds, or reached another operation: where each build
+	// stopped it says what it was running.
+	return fmt.Sprintf("%s, after %s optimized and %s without optimizations", where, opt[i].after, dbg[i].after)
+}
+
+// switchFields returns N and K of a "detsched: switch N kK ..." line.
+func switchFields(l string) (n, k string) {
+	f := strings.Fields(l)
+	if len(f) < 4 {
+		return "?", "?"
+	}
+	return f[2], strings.TrimPrefix(f[3], "k")
 }
 
 // envRead returns the names of the variables the program read, in the
@@ -1164,7 +1252,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 			g.left = leftGoroutines(r.output)
 		}
 		if r.runaway() {
-			g.where = whereOf(r.output)
+			g.where = whereOf(r.output, s.codeMods())
 		}
 		s.byKey[g.key] = g
 		s.groups = append(s.groups, g)
@@ -1497,6 +1585,12 @@ func (s *search) fallbacks() []fallback {
 		add("new-shell", "seed 1 runs another schedule in a new shell, and detsched could not find which of its variables cause it",
 			"replay lines may not reproduce failures in another shell",
 			"run replay lines from the shell that ran detsched")
+	}
+	if m := setupAgain.FindSubmatch(s.baseOutput); m != nil {
+		others := strings.Fields(string(m[2]))
+		add("tests-share-a-fork-point", fmt.Sprintf("tests after %s complete setup in the same process (%s), but only the first setup of a process is a fork point", m[1], strings.Join(others, ", ")),
+			"every run pays the later tests' setup again, with faults on from the first setup's end",
+			fmt.Sprintf("search one test at a time: detsched -run '^%s$', then -run '^%s$', and so on", m[1], others[0]))
 	}
 	if r, ok := forkReasons[s.refusal]; ok {
 		add("fork-refused", "the program refused to fork: "+r.why,

@@ -2196,6 +2196,9 @@ func tRunner(t *T, fn func(t *T)) {
 	asserts := 0
 	if goexperiment.DetSched {
 		asserts = detAssertFailures()
+		if t.parent != nil && t.parent.parent == nil {
+			detTestStart(t.name)
+		}
 	}
 	fn(t)
 	if goexperiment.DetSched && detAssertFailures() > asserts && !t.Failed() {
@@ -2216,6 +2219,12 @@ func tRunner(t *T, fn func(t *T)) {
 //
 //go:linkname detAssertFailures
 func detAssertFailures() int
+
+// detTestStart tells the runtime that top-level test name starts, under
+// GOEXPERIMENT=detsched. It is provided by the runtime.
+//
+//go:linkname detTestStart
+func detTestStart(name string)
 
 // Run runs f as a subtest of t called name. It runs f in a separate goroutine
 // and blocks until f returns or calls t.Parallel to become a parallel test.
@@ -2776,8 +2785,19 @@ func runTests(modulePath, importPath string, matchString func(pat, str string) (
 	return ran, ok
 }
 
+// detOwnFiles marks the files testing opens until it is called with false
+// as testing's own, which under GOEXPERIMENT=detsched do not keep the
+// process from forking. It is provided by the runtime.
+//
+//go:linkname detOwnFiles
+func detOwnFiles(on bool)
+
 // before runs before all testing.
 func (m *M) before() {
+	if goexperiment.DetSched {
+		detOwnFiles(true)
+		defer detOwnFiles(false)
+	}
 	if *memProfileRate > 0 {
 		runtime.MemProfileRate = *memProfileRate
 	}

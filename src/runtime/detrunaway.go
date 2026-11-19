@@ -37,8 +37,9 @@ var detRunaway struct {
 	heap                           uint64 // the most bytes a GC found live
 	overHeap                       uint64 // what a GC found live over maxHeap, or 0
 	stopped                        bool
-	next                           guintptr     // the goroutine about to run at the last switch
-	ring                           [1024]uint64 // the goroutines of the last switches
+	next                           guintptr      // the goroutine about to run at the last switch
+	ring                           [1024]uint64  // the goroutines of the last switches
+	starts                         [1024]uintptr // the functions they started in
 }
 
 // detRunawayStuck returns the switches but preemptions since a bubble's
@@ -56,6 +57,7 @@ func detRunawayExecute(pp *p, gp *g) {
 	r := &detRunaway
 	n := detP(pp).switches
 	r.ring[n%uint64(len(r.ring))] = gp.goid
+	r.starts[n%uint64(len(r.ring))] = gp.startpc
 	r.next.set(gp)
 	if r.preempted {
 		r.preempted = false
@@ -129,9 +131,10 @@ func detRunawayExtent() {
 }
 
 // detRunawayReport prints the goroutines the last switches went to, most
-// first, each with the first function outside the runtime and the
-// standard library's synchronization that it is in now, when the run
-// stopped at a limit or a signal.
+// first, each with the functions outside the runtime and the standard
+// library's synchronization that it is in now, innermost first, when the
+// run stopped at a limit or a signal. Switches to goroutines that have
+// exited since count on one line, with the functions they started in.
 func detRunawayReport() {
 	r := &detRunaway
 	if !r.on || !r.stopped && getg().m.caughtsig.ptr() == nil {
@@ -144,9 +147,26 @@ func detRunawayReport() {
 	k := min(n, uint64(len(r.ring)))
 	var goids [16]uint64
 	var counts [16]uint64
-	var other uint64
+	var other, exited uint64
+	var exitedStarts [2]uintptr
+	var lastID uint64
+	lastLive := false
 	for i := uint64(0); i < k; i++ {
 		id := r.ring[(n-i)%uint64(len(r.ring))]
+		if id != lastID {
+			lastID, lastLive = id, detRunawayG(id) != nil
+		}
+		if !lastLive {
+			exited++
+			pc := r.starts[(n-i)%uint64(len(r.ring))]
+			for j := range exitedStarts {
+				if exitedStarts[j] == pc || exitedStarts[j] == 0 {
+					exitedStarts[j] = pc
+					break
+				}
+			}
+			continue
+		}
 		j := 0
 		for j < len(goids) && goids[j] != id && counts[j] != 0 {
 			j++
@@ -175,21 +195,40 @@ func detRunawayReport() {
 		detRunawayWhere(goids[i])
 		print("\n")
 	}
+	if exited > 0 {
+		print("detsched: \t", exited, " exited goroutines, started in")
+		for j, pc := range exitedStarts {
+			if f := findfunc(pc); pc != 0 && f.valid() {
+				if j > 0 {
+					print(",")
+				}
+				print(" ", funcname(f))
+			}
+		}
+		print("\n")
+	}
 	if other > 0 {
 		print("detsched: \t", other, " other goroutines\n")
 	}
 }
 
-// detRunawayWhere prints where goroutine goid is: the first function
-// outside the runtime and package sync it is in, with its file and line,
-// or the function it started in.
-func detRunawayWhere(goid uint64) {
+// detRunawayG returns the goroutine with ID goid, or nil if it exited.
+func detRunawayG(goid uint64) *g {
 	var gp *g
 	forEachGRace(func(g1 *g) {
 		if g1.goid == goid && readgstatus(g1)&^_Gscan != _Gdead {
 			gp = g1
 		}
 	})
+	return gp
+}
+
+// detRunawayWhere prints where goroutine goid is: the functions outside
+// the runtime and the standard library's synchronization it is in, with
+// their files and lines, innermost first and separated by " < ", or the
+// function it started in.
+func detRunawayWhere(goid uint64) {
+	gp := detRunawayG(goid)
 	if gp == nil {
 		print("(exited)")
 		return
@@ -197,16 +236,23 @@ func detRunawayWhere(goid uint64) {
 	// The goroutine a limit stopped the run before is running, but has
 	// not run yet.
 	if s := readgstatus(gp) &^ _Gscan; s == _Grunnable || s == _Gwaiting || s == _Gsyscall || detRunaway.stopped && gp == detRunaway.next.ptr() {
+		frames := 0
 		var u unwinder
-		for u.init(gp, unwindSilentErrors); u.valid(); u.next() {
-			for iu, uf := newInlineUnwinder(u.frame.fn, u.symPC()); uf.valid(); uf = iu.next(uf) {
+		for u.init(gp, unwindSilentErrors); u.valid() && frames < 32; u.next() {
+			for iu, uf := newInlineUnwinder(u.frame.fn, u.symPC()); uf.valid() && frames < 32; uf = iu.next(uf) {
 				sf := iu.srcFunc(uf)
 				if name := sf.name(); !detRunawayInternal(name) {
+					if frames > 0 {
+						print(" < ")
+					}
 					file, line := iu.fileLine(uf)
 					print(name, " ", file, ":", line)
-					return
+					frames++
 				}
 			}
+		}
+		if frames > 0 {
+			return
 		}
 	}
 	if f := findfunc(gp.startpc); f.valid() {

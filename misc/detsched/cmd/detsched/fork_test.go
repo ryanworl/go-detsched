@@ -421,11 +421,12 @@ func TestSearchHung(t *testing.T) {
 // TestSearchRunaway runs harnesses whose runs do not finish on every
 // fourth seed: a livelock, where virtual time stays put; a poll that
 // goes on forever as virtual time moves, in the timeline or in a branch
-// of it; and a history that grows without bound. Before, each such run went on until -timeout or the search's
+// of it, in a dependency's code, or in goroutines that exit; and a
+// history that grows without bound. Before, each such run went on until -timeout or the search's
 // end, and was reported as a group and again as a fallback. Each must
 // now stop at a limit set from the passing runs, as one group that names
-// the limit and where its switches went, with a replay line that stops at
-// the same switch. A computation that takes 10 times longer on those
+// the limit and where its switches went, in the code under test, with a
+// replay line that stops at the same switch. A computation that takes 10 times longer on those
 // seeds is none of these, and passes, as does one that takes 27 times
 // longer than the first runs to pass, whose limits were set from them.
 func TestSearchRunaway(t *testing.T) {
@@ -433,6 +434,8 @@ func TestSearchRunaway(t *testing.T) {
 		{"TestLivelock", "did not finish: livelock at t=0.000s: virtual time stayed put for ", "maxstuck=", "runaway.TestLivelock.func1.2 (runaway_test.go:", ""},
 		{"TestPoll", "did not finish: ran ", "maxswitches=", "runaway.TestPoll.func1 (runaway_test.go:", ""},
 		{"TestBranchPoll", "did not finish: ran ", "maxswitches=", "runaway.TestBranchPoll.func1 (runaway_test.go:", ""},
+		{"TestDepSpin", "did not finish: ran ", "maxswitches=", "runaway.spin (runaway_test.go:", "perturb=off quantum=100"},
+		{"TestChurn", "did not finish: ran ", "maxswitches=", "exited goroutines, started in runaway.TestChurn.func1.2", ""},
 		{"TestHistory", "did not finish: memory: ", "maxheap=", "runaway.TestHistory.func1 (runaway_test.go:", ""},
 		{"TestCompute", "", "", "", "perturb=off quantum=100"},
 		{"TestLong", "", "", "", "perturb=off quantum=10"},
@@ -476,14 +479,16 @@ func TestSearchRunaway(t *testing.T) {
 
 // TestSearchBadHarness runs harnesses with mistakes that a search without
 // failures used to hide, and checks that the summary names each:
-// assertions no run reached, a Sometimes that never held, runs that end
+// assertions no run reached, with assert.Unreachable for one whose
+// condition is false, a Sometimes that never held, runs that end
 // before any fault, and faults the harness cannot get; and that t.Fatal on
 // a simulated node's goroutine fails the run there, naming the call,
 // where before the test waited for good and the run ended as a deadlock;
 // and that of the faults that come with a failure, the summary names the
 // one it needs, where before it named those that fired more often in
 // failing runs than in passing ones, such as clock skips that come in the
-// same storms.
+// same storms, also for a failure noticed long after its cause, which
+// variants reseeded close to the failure all show, with or without it.
 func TestSearchBadHarness(t *testing.T) {
 	search := func(t *testing.T, test string, n uint64) *search {
 		t.Setenv("TMPDIR", t.TempDir())
@@ -520,6 +525,13 @@ func TestSearchBadHarness(t *testing.T) {
 			t.Errorf("no failures and these warnings missing, %v:\n%s", want, r)
 		}
 	})
+	t.Run("TestErrorBranch", func(t *testing.T) {
+		s := search(t, "TestErrorBranch", 20)
+		r := searchReport(s)
+		if !strings.Contains(r, `no run reached 1 of the program's 2 assertions: always "the number parses" (unreachable_test.go:22; for a branch no run should reach, use assert.Unreachable)`) {
+			t.Errorf("want the warning to suggest assert.Unreachable:\n%s", r)
+		}
+	})
 	t.Run("TestFatalOnNode", func(t *testing.T) {
 		s := search(t, "TestFatalOnNode", 8)
 		r := searchReport(s)
@@ -533,6 +545,16 @@ func TestSearchBadHarness(t *testing.T) {
 		}
 		if !regexp.MustCompile(`detsched: \S*badharness\.TestFatalOnNode\.func1\.3 at \S*/fatal_test\.go:\d+ called t\.FailNow`).Match(log) {
 			t.Errorf("log does not name the call:\n%s", log)
+		}
+	})
+	t.Run("TestLostUpdate", func(t *testing.T) {
+		s := search(t, "TestLostUpdate", 60)
+		r := searchReport(s)
+		if len(s.groups) != 1 || s.groups[0].status != "reproduced" {
+			t.Fatalf("want one group, reproduced:\n%s", r)
+		}
+		if !regexp.MustCompile(`^needs: sim\.net\.loss \(0 of \d+ fail without it\); \d+ of \d+ fail with every fault, in variants of its first run reseeded at its start$`).MatchString(s.groups[0].attrib) {
+			t.Errorf("want the group to need loss:\n%s", r)
 		}
 	})
 	t.Run("TestSlowServer", func(t *testing.T) {
@@ -617,10 +639,45 @@ func TestSearchCompose(t *testing.T) {
 	}
 }
 
+// TestSearchTwoTests checks that a search of a package whose tests each
+// complete setup, of which only the first is a fork point, says to search
+// each test on its own.
+func TestSearchTwoTests(t *testing.T) {
+	s := newTestSearch(t, "../../testdata/twotests")
+	if err := s.run(context.Background(), 4); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(s.fallbacks(), func(f fallback) bool {
+		return f.anchor == "tests-share-a-fork-point" && strings.Contains(f.what, "tests after TestFirst complete setup in the same process (TestSecond)") && strings.Contains(f.fix, "-run '^TestFirst$'")
+	}) {
+		t.Errorf("summary does not say to search each test on its own:\n%s", searchReport(s))
+	}
+}
+
+// TestEnvScan checks that a program that ranges over its environment
+// replays its failures through their replay lines, run from the shell
+// that ran the search: the lines set GODETBRANCH and another GODETSEARCH
+// than the search's runs had, and the program must not see the variables
+// that control det mode (testdata/envscan). A new shell, with other
+// variables, runs another schedule, which the search reports.
+func TestEnvScan(t *testing.T) {
+	s := runSearch(t, "../../testdata/envscan", 20)
+	if len(s.groups) == 0 {
+		t.Fatalf("want failures:\n%s", searchReport(s))
+	}
+	for _, g := range s.groups {
+		out, _ := exec.Command("sh", "-c", g.replay).CombinedOutput()
+		trace := regexp.MustCompile(`trace=(0x[0-9a-f]+)`).FindStringSubmatch(g.replay)
+		if trace == nil || !bytes.Contains(out, []byte("detsched: trace="+trace[1]+" ")) {
+			t.Errorf("group %d's replay line ran another schedule than the run's (%v):\n%s\n%s", g.index, trace, g.replay, out)
+		}
+	}
+}
+
 // TestSearchDebugFallback checks that debug lines keep the optimized
-// binary, and the summary says why, when the build without optimizations
-// runs another schedule: testdata/stackread's schedule depends on its own
-// stacks.
+// binary, and the summary says where the builds part, when the build
+// without optimizations runs another schedule: testdata/stackread's
+// schedule depends on its own stacks.
 func TestSearchDebugFallback(t *testing.T) {
 	s := newTestSearch(t, "../../testdata/stackread")
 	if err := s.run(context.Background(), 1); err != nil {
@@ -633,8 +690,9 @@ func TestSearchDebugFallback(t *testing.T) {
 	if debug := s.debugLine(s.groups[0]); s.debugBin != "" || !strings.Contains(debug, "dlv exec --disable-aslr "+quote(s.bin)) {
 		t.Errorf("debug line %s, want the optimized binary %s", debug, s.bin)
 	}
-	if r := searchReport(s); !strings.Contains(r, "debug lines run the optimized binary") || !strings.Contains(r, "ran seed 1 on another schedule") {
-		t.Errorf("summary does not say why debug lines run the optimized binary:\n%s", r)
+	if r := searchReport(s); !strings.Contains(r, "debug lines run the optimized binary") || !strings.Contains(r, "ran seed 1 on another schedule") ||
+		!regexp.MustCompile(`the builds first differ at switch \d+ \(k\d+ optimized, k\d+ without optimizations\), after goroutine \d+ (was preempted|stopped) in \S+ \S+:\d+ optimized and goroutine \d+ (was preempted|stopped) in \S+ \S+:\d+ without`).MatchString(r) {
+		t.Errorf("summary does not say why debug lines run the optimized binary, and where the builds part:\n%s", r)
 	}
 }
 
@@ -729,9 +787,11 @@ func (s *forkServer) branchOutcome(seed, steps uint64) (outcome, error) {
 
 // TestMutationCheck runs -check on harnesses of one package: a strong one
 // that tests the code concurrently and with failing syncs, which must
-// catch a dropped lock and an ignored error, and a weak one that calls it
-// from one goroutine, whose clean searches prove nothing, which must
-// let them survive. A mutant that does not compile is skipped, and a
+// catch a dropped lock, every lock of a mutex locked and unlocked in
+// different methods dropped, and an ignored error, and a weak one that
+// calls it from one goroutine, whose clean searches prove nothing, which
+// must let the lock survive and get no mutant on an error path it never
+// takes. A mutant that does not compile is skipped, and a
 // harness that fails without mutations must be fixed first.
 func TestMutationCheck(t *testing.T) {
 	check := func(t *testing.T, pkg, test string) (int, string) {
@@ -750,6 +810,8 @@ func TestMutationCheck(t *testing.T) {
 			"drop the Lock and Unlock of c.mu: detsched: assertion failed: the count is the sum of the adds",
 			"ignore the error in err != nil: detsched: assertion failed: the log counts the syncs that succeeded",
 			"drop w.Sync(), as if it succeeded: detsched: assertion failed: the log counts the syncs that succeeded",
+			// Locked in Begin and unlocked in Commit.
+			"drop every Lock and Unlock of writer, 4 calls: detsched: assertion failed: the store's value is the sum of the commits",
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("exit status %d, want %q in:\n%s", code, want, out)
@@ -761,11 +823,30 @@ func TestMutationCheck(t *testing.T) {
 		for _, want := range []string{
 			"caught 2 of 10 mistakes",
 			"survived: store.go:36 drop the Lock and Unlock of c.mu",
-			"survived: store.go:65 ignore the error in err != nil",
 		} {
 			if code != 1 || !strings.Contains(out, want) {
 				t.Errorf("exit status %d, want 1 and %q in:\n%s", code, want, out)
 			}
+		}
+		// Its syncs never fail, so ignoring their errors changes nothing.
+		if strings.Contains(out, "ignore the error") {
+			t.Errorf("planted a mutant on an error path no run took:\n%s", out)
+		}
+	})
+	// A harness module that tests a local copy of the code through
+	// go.mod's replace, as harness.md recommends, which -check used to
+	// report as a package without tests.
+	t.Run("Replace", func(t *testing.T) {
+		t.Chdir("../../testdata/checkreplace/harness")
+		code, out := check(t, ".", "TestCounter")
+		if want := "counter.go:26 drop the Lock and Unlock of c.mu: detsched: assertion failed: the count is the sum of the adds"; !strings.Contains(out, "caught:   "+want) {
+			t.Errorf("exit status %d, want %q in:\n%s", code, want, out)
+		}
+	})
+	t.Run("NothingToMutate", func(t *testing.T) {
+		code, out := check(t, "../../testdata/badharness", "TestCoverage")
+		if want := "no code to mutate: the test binary links no non-test Go files of github.com/ryanworl/go-detsched/misc/detsched (the tests' module)"; code != 2 || !strings.Contains(out, want) {
+			t.Errorf("exit status %d, want 2 and %q in:\n%s", code, want, out)
 		}
 	})
 	t.Run("TestFatalOnNode", func(t *testing.T) {

@@ -118,3 +118,35 @@ func (q *Queue) Close() {
 	close(q.jobs)
 	<-q.done
 }
+
+// A Store holds a value that transactions update one at a time: Begin
+// takes the writer lock, which the transaction's Commit releases.
+type Store struct {
+	writer sync.Mutex
+	v      int
+}
+
+// A Txn updates a Store's value.
+type Txn struct {
+	s *Store
+	v int
+}
+
+// Begin starts a transaction, which reads the value.
+func (s *Store) Begin() *Txn {
+	s.writer.Lock()
+	return &Txn{s: s, v: s.v}
+}
+
+// Commit adds d to the value the transaction read.
+func (t *Txn) Commit(d int) {
+	t.s.v = t.v + d
+	t.s.writer.Unlock()
+}
+
+// Value returns the value.
+func (s *Store) Value() int {
+	s.writer.Lock()
+	defer s.writer.Unlock()
+	return s.v
+}

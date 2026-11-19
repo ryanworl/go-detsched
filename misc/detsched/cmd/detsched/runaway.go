@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"debug/buildinfo"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -178,36 +179,105 @@ func (l limits) explain(kind string, v uint64, at, t string) string {
 }
 
 // lastSwitchLine matches a line of the runtime's report of the goroutines
-// a run's last switches went to.
-var lastSwitchLine = regexp.MustCompile(`^detsched: \t(\d+) (goroutine \d+|other goroutines)(?: (\S+)(?: (\S+:\d+))?)?`)
+// a run's last switches went to: the switches, the goroutines, and where
+// they are, innermost first, separated by " < ".
+var lastSwitchLine = regexp.MustCompile(`^detsched: \t(\d+) (goroutine \d+|exited goroutines|other goroutines),?(?: (.*))?$`)
 
 // whereOf returns the goroutines the last switches of a run that did not
-// finish went to, the 3 with the most, with where each is, or "".
-func whereOf(out []byte) string {
+// finish went to, the 3 with the most, with where each is, or "": the
+// innermost function of a package in mods, the code under test, or else
+// the innermost function. Goroutines that have exited are named by the
+// functions they started in.
+func whereOf(out []byte, mods []string) string {
 	m := lastSwitches.FindSubmatch(out)
 	if m == nil {
 		return ""
 	}
-	var parts []string
-	for i, line := range strings.Split(strings.TrimSuffix(string(m[2]), "\n"), "\n") {
-		if i == 3 {
-			break
-		}
+	type part struct {
+		n int
+		p string
+	}
+	var parts []part
+	for _, line := range strings.Split(strings.TrimSuffix(string(m[2]), "\n"), "\n") {
 		l := lastSwitchLine.FindStringSubmatch(line)
 		if l == nil {
 			continue
 		}
 		p := l[1] + " to " + l[2]
 		switch {
+		case l[2] == "exited goroutines":
+			var fns []string
+			for _, fn := range strings.Split(strings.TrimPrefix(l[3], "started in "), ", ") {
+				fns = append(fns, fn[strings.LastIndex(fn, "/")+1:])
+			}
+			p += ", started in " + strings.Join(fns, ", ")
 		case strings.HasPrefix(l[3], "("):
 			p += " " + l[3] // (exited)
-		case l[3] != "":
+		case strings.HasSuffix(l[3], " (where it started)"):
 			p += " in " + l[3][strings.LastIndex(l[3], "/")+1:]
+		case l[3] != "":
+			frames := strings.Split(l[3], " < ")
+			f := frames[0]
+			for _, fr := range frames {
+				if inModules(fr, mods) {
+					f = fr
+					break
+				}
+			}
+			fn, pos, _ := strings.Cut(f, " ")
+			p += " in " + fn[strings.LastIndex(fn, "/")+1:]
+			if pos != "" {
+				p += " (" + filepath.Base(pos) + ")"
+			}
 		}
-		if l[4] != "" {
-			p += " (" + filepath.Base(l[4]) + ")"
-		}
-		parts = append(parts, p)
+		n, _ := strconv.Atoi(l[1])
+		parts = append(parts, part{n, p})
 	}
-	return fmt.Sprintf("of its last %s switches, %s", m[1], strings.Join(parts, ", "))
+	slices.SortStableFunc(parts, func(a, b part) int { return b.n - a.n })
+	var top []string
+	for i, p := range parts {
+		if i < 3 {
+			top = append(top, p.p)
+		}
+	}
+	return fmt.Sprintf("of its last %s switches, %s", m[1], strings.Join(top, ", "))
+}
+
+// inModules reports whether frame, "FUNC FILE:LINE", is in a package of
+// one of mods, but the SDK.
+func inModules(frame string, mods []string) bool {
+	fn, _, _ := strings.Cut(frame, " ")
+	pkg := fn
+	if i := strings.LastIndexByte(pkg, '/'); i >= 0 {
+		if j := strings.IndexByte(pkg[i:], '.'); j >= 0 {
+			pkg = pkg[:i+j]
+		}
+	} else if j := strings.IndexByte(pkg, '.'); j >= 0 {
+		pkg = pkg[:j]
+	}
+	if strings.HasPrefix(pkg+"/", sdkPrefix) {
+		return false
+	}
+	for _, m := range mods {
+		if pkg == m || strings.HasPrefix(pkg, m+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// codeModules returns the modules of the code under test in bin: its main
+// module and those it replaces with a local directory.
+func codeModules(bin string) []string {
+	bi, err := buildinfo.ReadFile(bin)
+	if err != nil {
+		return nil
+	}
+	mods := []string{bi.Main.Path}
+	for _, d := range bi.Deps {
+		if d.Replace != nil && d.Replace.Version == "" {
+			mods = append(mods, d.Path)
+		}
+	}
+	return mods
 }

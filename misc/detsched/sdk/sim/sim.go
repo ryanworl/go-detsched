@@ -80,6 +80,7 @@ package sim
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -228,10 +229,11 @@ func Supported() bool { return supported }
 
 // NewWorld creates a world with no nodes and routes system calls of its
 // nodes to it. Only one world exists at a time. Call it inside a synctest
-// bubble, and call Close before the bubble ends.
+// bubble, and call Close before the bubble ends. Without the experiment
+// it panics: a test that uses it skips first when Supported is false.
 func NewWorld(cfg Config) *World {
 	if !supported {
-		panic("sim: requires GOEXPERIMENT=detsched")
+		panic(`sim: requires GOEXPERIMENT=detsched; skip the test without it: if !sim.Supported() { t.Skip("requires GOEXPERIMENT=detsched") }`)
 	}
 	if world != nil {
 		panic("sim: a World already exists")
@@ -651,7 +653,8 @@ func goAs(inc *incarnation, f func()) {
 // peers notice only through timeouts, or through resets once the node is up
 // again. On a node whose process is down but whose kernel still runs, as
 // after KillProcess or a panic, it cuts the power: the disk loses what it
-// had not synced.
+// had not synced. A goroutine of the node may kill its own node: it
+// freezes with the others, and Kill does not return.
 func (n *Node) Kill() {
 	if n.inc == nil {
 		runtime_call(func() {
@@ -866,6 +869,22 @@ func (n *Node) crashAs(process bool, ev string) {
 	self := runtime_node() == inc.handle
 	n.w.logEvent(n.name, ev)
 	crashed := false
+	if self {
+		// The caller leaves the bubble with its node, so it can no
+		// longer close the bubble's channels: a goroutine of no node
+		// closes them once the node has crashed.
+		old := runtime_setNode(0)
+		go func() {
+			for n.inc == inc {
+				runtime.Gosched()
+			}
+			if crashed {
+				close(inc.down)
+				inc.end()
+			}
+		}()
+		runtime_setNode(old)
+	}
 	runtime_call(func() {
 		// Another goroutine may have crashed it meanwhile, such as a
 		// second Stop, while this one yielded.
@@ -880,14 +899,17 @@ func (n *Node) crashAs(process bool, ev string) {
 		n.throttlePaused = false
 		runtime_crash(inc.handle)
 	})
+	if self {
+		if crashed {
+			runtime_halt()
+		}
+		return
+	}
 	if !crashed {
 		return
 	}
 	close(inc.down)
 	inc.end()
-	if self {
-		runtime_halt()
-	}
 }
 
 // Rand returns a number from the fault stream, for test code that injects
