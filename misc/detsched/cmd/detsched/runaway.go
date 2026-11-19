@@ -5,9 +5,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -76,6 +79,54 @@ func (s *search) limits() limits {
 		fmt.Sprintf("maxtime=%d", runMultiple*max(l.time, timeFloor)),
 		fmt.Sprintf("maxheap=%d", runMultiple*max(l.heap, heapFloor)),
 	}}
+}
+
+// value returns the limit on what a run that stopped for kind, as the
+// runtime names it, measured, or 0 if it ran without one.
+func (l limits) value(kind string) uint64 {
+	name := map[string]string{"switches": "maxswitches=", "livelock": "maxstuck=", "time": "maxtime=", "memory": "maxheap="}[kind]
+	for _, f := range l.fields {
+		if v, ok := strings.CutPrefix(f, name); ok && name != "" {
+			return atou(v)
+		}
+	}
+	return 0
+}
+
+// rerunRaised runs r again, from its start, when it stopped at a limit
+// that the runs that passed since it started have raised, and returns
+// the run to record. The first runs to pass are the short ones, so a run
+// that started then has limits that a run of the program's usual length
+// can pass.
+func (s *search) rerunRaised(ctx context.Context, r *result) (*result, error) {
+	for !r.timedOut && !r.outOfMem {
+		m := stopLine.FindSubmatch(r.output)
+		if m == nil {
+			break
+		}
+		s.mu.Lock()
+		lim := s.limits()
+		s.mu.Unlock()
+		if old := r.limits.value(string(m[1])); old == 0 || lim.value(string(m[1])) <= old {
+			break
+		}
+		var fields []string
+		if r.tape != "" {
+			fields = append(fields, "tape="+r.tape)
+		}
+		cmd := s.plain(r.seed)
+		cmd.Env = addSearch(cmd.Env, slices.Concat(fields, yieldField(r.yield), lim.fields)...)
+		again, err := s.exec(ctx, cmd)
+		if errors.Is(err, errCanceled) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		again.seed, again.tape, again.yield, again.limits = r.seed, r.tape, r.yield, lim
+		r = again
+	}
+	return r, nil
 }
 
 // field returns the field of the limit the run with output out stopped

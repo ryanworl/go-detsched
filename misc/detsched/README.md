@@ -338,8 +338,11 @@ assertion failed (`assert.Failures() > 0`), not on every failure.
 
 Every run after the first that passed runs with limits set from the
 most any passing run went, and a run that passes one fails as one that
-did not finish, at a switch that its replay line stops at too. Each way a
-run does not finish is a group:
+did not finish, at a switch that its replay line stops at too. A run
+stopped at a limit that the runs that passed since it started have
+raised runs again from its start with the raised limits, since the first
+runs to pass are the short ones. Each way a run does not finish is a
+group:
 
 - `did not finish: livelock at t=...`: while virtual time stayed put, the
   run's goroutines blocked and woke each other (switches other than

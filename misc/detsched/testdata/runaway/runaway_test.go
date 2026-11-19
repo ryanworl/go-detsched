@@ -17,6 +17,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/ryanworl/go-detsched/misc/detsched/sdk/sim"
 )
 
 // bad reports whether this seed's run does not finish.
@@ -48,6 +50,22 @@ func TestLivelock(t *testing.T) {
 			}
 		}
 		close(req)
+	})
+}
+
+// TestBranchPoll polls forever in a branch of the timeline, which a
+// composer forks to check recovery, while the timeline passes. The run's
+// failure is the branch's, so its replay must run the branch in place.
+func TestBranchPoll(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		time.Sleep(time.Millisecond)
+		if sim.Branch("the branch finishes") {
+			for stuck := bad(); stuck; {
+				time.Sleep(time.Millisecond)
+			}
+			os.Exit(0)
+		}
+		time.Sleep(time.Millisecond)
 	})
 }
 
@@ -96,6 +114,34 @@ func TestCompute(t *testing.T) {
 		if bad() {
 			n *= 15
 		}
+		var wg sync.WaitGroup
+		sums := make([]uint64, 2)
+		for i := range sums {
+			wg.Go(func() {
+				for j := range n {
+					sums[i] = sums[i]*31 + uint64(j)
+				}
+			})
+		}
+		wg.Wait()
+	})
+}
+
+// TestLong always finishes, in 9 times as many switches on seeds 3 to 5
+// as on seed 2, and 27 times on later seeds. With 4 runs at a time, seed
+// 6 starts once seed 2 has passed, with limits set from it, which seed 6
+// passes; once seeds 3 to 5 have passed too, it must finish, and not be
+// reported as a runaway.
+func TestLong(t *testing.T) {
+	seed, _ := strconv.Atoi(os.Getenv("GODETSEED"))
+	n := 1 << 18
+	switch {
+	case seed >= 6:
+		n *= 27
+	case seed >= 3:
+		n *= 9
+	}
+	synctest.Test(t, func(t *testing.T) {
 		var wg sync.WaitGroup
 		sums := make([]uint64, 2)
 		for i := range sums {

@@ -467,8 +467,14 @@ func (r *result) stopped() (int, string) {
 		return 0, ""
 	}
 	trace := string(rest[loc[0]:loc[1]])
-	if m := branchLine.FindSubmatchIndex(rest[loc[1]:]); m != nil && m[0] == 1 {
-		n, _ := strconv.Atoi(string(rest[loc[1]+m[2] : loc[1]+m[3]]))
+	// A branch's report ends with its number, after its trace line and
+	// lines such as its extent, before the timeline's trace line.
+	tail := rest[loc[1]:]
+	if next := traceLine.FindIndex(tail); next != nil {
+		tail = tail[:next[0]]
+	}
+	if m := branchLine.FindSubmatch(tail); m != nil {
+		n, _ := strconv.Atoi(string(m[1]))
 		return n, trace
 	}
 	return 0, trace
@@ -1067,6 +1073,10 @@ func (s *search) recheck() {
 
 // record records a run, and when it is the first of its group, replays it.
 func (s *search) record(ctx context.Context, r *result, a int) error {
+	r, err := s.rerunRaised(ctx, r)
+	if err != nil {
+		return err
+	}
 	r.arm = a
 	if r.env == nil {
 		r.env = s.env

@@ -1020,6 +1020,14 @@ func (s *search) plain(seed uint64, env ...string) *exec.Cmd {
 	cmd := exec.Command(s.bin, s.args...)
 	cmd.Dir = s.dir
 	cmd.Env = append(append(os.Environ(), s.env...), "PWD="+s.dir, fmt.Sprintf("GODETSEED=%d", seed))
-	cmd.Env = addSearch(append(cmd.Env, env...), "envread", "extent")
+	// GODETSEARCH's fields add to those of the environment, which the
+	// last GODETSEARCH would replace.
+	for _, e := range append(env, "GODETSEARCH=envread extent") {
+		if v, ok := strings.CutPrefix(e, "GODETSEARCH="); ok {
+			cmd.Env = addSearch(cmd.Env, strings.Fields(v)...)
+		} else {
+			cmd.Env = append(cmd.Env, e)
+		}
+	}
 	return cmd
 }

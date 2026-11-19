@@ -420,19 +420,22 @@ func TestSearchHung(t *testing.T) {
 
 // TestSearchRunaway runs harnesses whose runs do not finish on every
 // fourth seed: a livelock, where virtual time stays put; a poll that
-// goes on forever as virtual time moves; and a history that grows without
-// bound. Before, each such run went on until -timeout or the search's
+// goes on forever as virtual time moves, in the timeline or in a branch
+// of it; and a history that grows without bound. Before, each such run went on until -timeout or the search's
 // end, and was reported as a group and again as a fallback. Each must
 // now stop at a limit set from the passing runs, as one group that names
 // the limit and where its switches went, with a replay line that stops at
 // the same switch. A computation that takes 10 times longer on those
-// seeds is none of these, and passes.
+// seeds is none of these, and passes, as does one that takes 27 times
+// longer than the first runs to pass, whose limits were set from them.
 func TestSearchRunaway(t *testing.T) {
 	for _, tc := range []struct{ test, sig, field, where, search string }{
 		{"TestLivelock", "did not finish: livelock at t=0.000s: virtual time stayed put for ", "maxstuck=", "runaway.TestLivelock.func1.2 (runaway_test.go:", ""},
 		{"TestPoll", "did not finish: ran ", "maxswitches=", "runaway.TestPoll.func1 (runaway_test.go:", ""},
+		{"TestBranchPoll", "did not finish: ran ", "maxswitches=", "runaway.TestBranchPoll.func1 (runaway_test.go:", ""},
 		{"TestHistory", "did not finish: memory: ", "maxheap=", "runaway.TestHistory.func1 (runaway_test.go:", ""},
 		{"TestCompute", "", "", "", "perturb=off quantum=100"},
+		{"TestLong", "", "", "", "perturb=off quantum=10"},
 	} {
 		t.Run(tc.test, func(t *testing.T) {
 			s := newTestSearch(t, "../../testdata/runaway")

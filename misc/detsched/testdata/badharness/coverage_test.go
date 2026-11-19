@@ -21,8 +21,7 @@ import (
 // TestCoverage passes on every seed, and checks little: its workload ends
 // a few milliseconds after the nemesis starts, so that most runs end
 // before any fault; the nemesis can fault only one node and restart none;
-// a retry path and its check are never reached; and a state it means to
-// reach never comes.
+// a check is never reached; and a state it means to reach never comes.
 func TestCoverage(t *testing.T) {
 	if !sim.Supported() {
 		t.Skip("needs GOEXPERIMENT=detsched")
@@ -58,16 +57,31 @@ func TestCoverage(t *testing.T) {
 		nm.Start()
 		done := make(chan int)
 		b.Go(func() {
-			got := 0
-			c, err := net.Dial("tcp", "10.0.0.1:7")
-			for err == nil && got < 3 {
-				c.SetDeadline(time.Now().Add(time.Second))
-				if _, err = c.Write([]byte("x\n")); err == nil {
-					_, err = bufio.NewReader(c).ReadString('\n')
+			// Nothing listens on port 8, so the first dial fails and the
+			// retry path runs in every run.
+			got, addr := 0, "10.0.0.1:8"
+			var c net.Conn
+			for got < 3 {
+				var err error
+				if c == nil {
+					c, err = net.Dial("tcp", addr)
+					addr = "10.0.0.1:7"
+				}
+				if err == nil {
+					c.SetDeadline(time.Now().Add(time.Second))
+					if _, err = c.Write([]byte("x\n")); err == nil {
+						_, err = bufio.NewReader(c).ReadString('\n')
+					}
 				}
 				if err != nil {
 					assert.Reachable("a request was retried", nil)
 					assert.Always(got < 3, "a retry comes before the last response", nil)
+					if c != nil {
+						c.Close()
+						c = nil
+					}
+					time.Sleep(10 * time.Millisecond)
+					continue
 				}
 				got++
 			}
