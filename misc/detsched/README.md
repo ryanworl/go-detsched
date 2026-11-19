@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched24
+v=go1.27.4-detsched25
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -263,12 +263,15 @@ and for `reflect.ArrayOf`, `SliceOf`, `PointerTo` and the like: the
 hash tries behind `sync.Map` and `unique`, and reflect's search of the
 binary's types, count no ticks, because how much work they do depends on
 addresses and on what types the binary holds, which differ between the
-builds. `detsched` makes this build in `<outdir>/debug/` while it searches, runs
+builds. And it holds for maps keyed by pointers or channels, or by
+structs, arrays or interfaces that hold them, including `sync.Map` and
+`unique`: such a key hashes by its pointer's identity, not its address
+(see [How the runtime makes runs deterministic](#how-the-runtime-makes-runs-deterministic)),
+so `range` visits it in the same order in both builds. `detsched` makes this build in `<outdir>/debug/` while it searches, runs
 seed 1 in it, and from then on prints `debug:` lines that run it. They run the optimized binary instead
 when the build was not ready when the search ended, with `-exec`, or when
 seed 1 ran another schedule in it three times, because the program depends on heap
-addresses (iterating a map or `sync.Map` keyed by pointers, types or channels when the order
-changes the work, printing or hashing pointers), its own stack
+addresses (printing pointers, hashing or sorting them as numbers), its own stack
 (`runtime.Stack`, `runtime.Callers`, a node's `Stacks`), or memory
 statistics (`runtime.ReadMemStats`, GC counts). In the last case debug the
 optimized binary; otherwise build one yourself
@@ -439,10 +442,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched24:
+and release N's version is v0.N.0, so with go1.27.4-detsched25:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.24.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.25.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
@@ -686,7 +689,18 @@ cycle and `testdata/simfaults` each fault.
 
 All randomness (map seeds and order, `select` order, hash keys, the heap
 base address, the `math/rand` globals, `-test.shuffle=on`, and all
-cryptographic randomness) comes from `GODETSEED`, a decimal uint64. With
+cryptographic randomness) comes from `GODETSEED`, a decimal uint64.
+A map key that holds a pointer (a pointer, channel or `unsafe.Pointer`,
+alone or in a struct, array or interface, in a map, a `sync.Map`,
+`unique.Make` or `maphash.Comparable`) hashes by the pointer's
+identity: a number given out in the order in which the program first
+stores each pointer in a map, which the pointer keeps until its object is
+freed. So map order does not depend on where objects are in memory,
+which differs between an optimized build and one without optimizations,
+and with anything that moves an allocation. A lookup of a pointer that
+no map holds gives it no identity. A map operation on such a key costs
+about 10ns more, and storing a pointer for the first time 100 to 200ns
+more. With
 it set, the runtime also perturbs the schedule, prints the trace line at
 exit, and reports where the program leaves the deterministic subset.
 Without it, a program built with the experiment runs one unperturbed
@@ -744,7 +758,7 @@ On macOS on arm64 the experiment works as on Linux, with these
 differences.
 
 - **ASLR.** macOS loads every program at a random address, which would
-  change map order and so the schedule. A program built with the
+  change the addresses the program sees and so the schedule. A program built with the
   experiment that finds itself moved runs itself again in its place with
   ASLR off (`posix_spawn` with `_POSIX_SPAWN_DISABLE_ASLR`) before it does
   anything else, keeping its process ID. Under a debugger, start it

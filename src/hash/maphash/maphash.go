@@ -19,6 +19,7 @@ package maphash
 import (
 	"hash"
 	"internal/abi"
+	"internal/goexperiment"
 	"internal/runtime/maps"
 	"unsafe"
 )
@@ -352,11 +353,24 @@ func comparableHash[T comparable](v T, seed Seed) uint64 {
 	var m map[T]struct{}
 	mTyp := abi.TypeOf(m)
 	hasher := (*abi.MapType)(unsafe.Pointer(mTyp)).Hasher
+	if goexperiment.DetSched {
+		// A pointer in v hashes by its identity, which it gets here
+		// as if a map stored it (see runtime/detptrid.go), since the
+		// caller may store v.
+		maps.DetAssign = true
+	}
 	if maps.Use64BitHash {
-		return uint64(hasher(abi.NoEscape(unsafe.Pointer(&v)), uintptr(s)))
+		h := uint64(hasher(abi.NoEscape(unsafe.Pointer(&v)), uintptr(s)))
+		if goexperiment.DetSched {
+			maps.DetAssign = false
+		}
+		return h
 	}
 	lo := hasher(abi.NoEscape(unsafe.Pointer(&v)), uintptr(uint32(s)))
 	hi := hasher(abi.NoEscape(unsafe.Pointer(&v)), uintptr(s>>32))
+	if goexperiment.DetSched {
+		maps.DetAssign = false
+	}
 	return uint64(hi)<<32 | uint64(lo)
 }
 

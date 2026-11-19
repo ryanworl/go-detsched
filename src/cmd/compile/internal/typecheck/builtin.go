@@ -198,6 +198,7 @@ var runtimeDecls = [...]struct {
 	{"memhash32", funcTag, 140},
 	{"memhash64", funcTag, 140},
 	{"memhash128", funcTag, 140},
+	{"detptrhash", funcTag, 140},
 	{"f32hash", funcTag, 140},
 	{"f64hash", funcTag, 140},
 	{"c64hash", funcTag, 140},

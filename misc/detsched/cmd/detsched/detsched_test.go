@@ -1170,9 +1170,11 @@ func TestDetGodebug(t *testing.T) {
 // build without optimizations (testdata/buildinfo), and in one that makes
 // types with reflect.ArrayOf, which searches the binary's types, and looks
 // them up in a sync.Map, whose work depends on their addresses; both
-// differ between the builds (testdata/typemap).
+// differ between the builds (testdata/typemap); and in one that ranges
+// over maps keyed by pointers, whose addresses differ between the builds
+// (testdata/ptrmap).
 func TestDebugBuild(t *testing.T) {
-	for _, prog := range []string{"buildinfo", "typemap"} {
+	for _, prog := range []string{"buildinfo", "typemap", "ptrmap"} {
 		var outs []outcome
 		for _, flags := range [][]string{nil, {"-gcflags=all=-N -l"}} {
 			_, bin, err := buildPackage("../../testdata/"+prog, t.TempDir(), flags...)

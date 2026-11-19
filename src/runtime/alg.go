@@ -8,6 +8,7 @@ import (
 	"internal/abi"
 	"internal/byteorder"
 	"internal/goarch"
+	"internal/goexperiment"
 	"internal/runtime/maps"
 	"internal/runtime/sys"
 	"unsafe"
@@ -217,6 +218,9 @@ func nilinterhash(p unsafe.Pointer, h uintptr) uintptr {
 //
 //go:linkname typehash
 func typehash(t *_type, p unsafe.Pointer, h uintptr) uintptr {
+	if goexperiment.DetSched && t.TFlag&abi.TFlagRegularMemory != 0 && t.Pointers() {
+		return detTypeHash(t, p, h)
+	}
 	if t.TFlag&abi.TFlagRegularMemory != 0 {
 		// Handle ptr sizes specially, see issue 37086.
 		switch t.Size_ {

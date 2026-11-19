@@ -160,7 +160,12 @@ func runtime_mapassign(typ *abi.MapType, m *Map, key unsafe.Pointer) unsafe.Poin
 		fatal("concurrent map writes")
 	}
 
-	hash := typ.Hasher(key, m.seed)
+	var hash uintptr
+	if goexperiment.DetSched {
+		hash = detAssignHash(typ, key, m.seed)
+	} else {
+		hash = typ.Hasher(key, m.seed)
+	}
 
 	// Set writing after calling Hasher, since Hasher may panic, in which
 	// case we have not actually done a write.

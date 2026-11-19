@@ -7,6 +7,7 @@ package reflectdata
 import (
 	"fmt"
 	"go/constant"
+	"internal/buildcfg"
 	"strconv"
 	"strings"
 
@@ -21,7 +22,7 @@ import (
 // genhash returns a symbol which is the closure used to compute
 // the hash of a value of type t.
 func genhash(t *types.Type) *obj.LSym {
-	return genhashSig(eqSignature(t))
+	return genhashSig(hashSignature(t))
 }
 
 func genhashSig(sig string) *obj.LSym {
@@ -41,6 +42,8 @@ func genhashSig(sig string) *obj.LSym {
 		return sysClosure("memhash64")
 	case string(sigMemory) + "16":
 		return sysClosure("memhash128")
+	case string(sigPtr):
+		return sysClosure("detptrhash")
 	case string(sigString):
 		return sysClosure("strhash")
 	case string(sigIface):
@@ -169,6 +172,8 @@ func hashFunc(sig string) *ir.Func {
 			hash("f32hash", 4)
 		case sigFloat64:
 			hash("f64hash", 8)
+		case sigPtr:
+			hash("detptrhash", int64(types.PtrSize))
 		case sigString:
 			hash("strhash", 2*int64(types.PtrSize))
 		case sigEface:
@@ -637,7 +642,19 @@ func EqFor(t *types.Type) (ir.Node, bool) {
 // If an alignment directive is present, it must be first.
 // Signatures can end early; a K%d is not required at the end.
 func eqSignature(t *types.Type) string {
-	var e eqSigBuilder
+	return signature(t, false)
+}
+
+// hashSignature returns the signature of t's hash function, which is
+// t's signature for equality, except that with GOEXPERIMENT=detsched a
+// pointer, channel or unsafe.Pointer is sigPtr: it hashes by the
+// pointer's identity, not its address (see runtime/detptrid.go).
+func hashSignature(t *types.Type) string {
+	return signature(t, buildcfg.Experiment.DetSched)
+}
+
+func signature(t *types.Type, ptrs bool) string {
+	e := eqSigBuilder{ptrs: ptrs}
 	if !base.Ctxt.Arch.CanMergeLoads { // alignment only matters if we can't use unaligned loads
 		if a := t.Alignment(); a != int64(types.PtrSize) {
 			e.r.WriteString(fmt.Sprintf("%c%d", sigAlign, a))
@@ -659,12 +676,14 @@ const (
 	sigArrayStart = '[' // followed by an iteration count, element signature, and sigArrayEnd
 	sigArrayEnd   = ']'
 	sigAlign      = 'A' // followed by an integer byte alignment
+	sigPtr        = 'P' // a pointer hashed by its identity; only in hash signatures
 )
 
 type eqSigBuilder struct {
 	r       strings.Builder
 	regMem  int64 // queued up region of regular memory
 	skipMem int64 // queued up region of memory to skip
+	ptrs    bool  // pointers are sigPtr, not memory
 }
 
 func (e *eqSigBuilder) flush(atEnd bool) {
@@ -722,7 +741,14 @@ func (e *eqSigBuilder) build(t *types.Type) {
 		e.regular(4)
 	case types.TINT64, types.TUINT64:
 		e.regular(8)
-	case types.TINT, types.TUINT, types.TUINTPTR, types.TPTR, types.TUNSAFEPTR, types.TCHAN:
+	case types.TPTR, types.TUNSAFEPTR, types.TCHAN:
+		if e.ptrs {
+			e.flush(false)
+			e.r.WriteByte(sigPtr)
+			break
+		}
+		e.regular(int64(types.PtrSize))
+	case types.TINT, types.TUINT, types.TUINTPTR:
 		e.regular(int64(types.PtrSize))
 	case types.TFLOAT32:
 		e.float32()
@@ -758,7 +784,7 @@ func (e *eqSigBuilder) build(t *types.Type) {
 			e.skip(t.Size() - off)
 		}
 	case types.TARRAY:
-		if types.AlgType(t) == types.AMEM {
+		if types.AlgType(t) == types.AMEM && !(e.ptrs && t.HasPointers()) {
 			// TODO: some "regular equality" types don't hit here,
 			// like [8]sync/atomic.Pointer. Figure out how to
 			// handle the subtle difference between "AMEM" and
@@ -873,6 +899,8 @@ func sigSize(sig string) int64 {
 			size += 8
 		case sigString, sigIface, sigEface:
 			size += 2 * int64(types.PtrSize)
+		case sigPtr:
+			size += int64(types.PtrSize)
 		case sigArrayStart:
 			var n int64
 			var elemSig string

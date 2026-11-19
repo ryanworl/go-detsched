@@ -25,6 +25,7 @@
 package runtime
 
 import (
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"unsafe"
 )
@@ -613,6 +614,9 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	}
 	if hadSpecials && s.specials == nil {
 		spanHasNoSpecials(s)
+	}
+	if goexperiment.DetSched {
+		detPtrIDSweep(s)
 	}
 
 	if traceAllocFreeEnabled() || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled {

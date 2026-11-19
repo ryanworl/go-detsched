@@ -237,6 +237,7 @@ func memhash16(p unsafe.Pointer, h uintptr) uintptr
 func memhash32(p unsafe.Pointer, h uintptr) uintptr
 func memhash64(p unsafe.Pointer, h uintptr) uintptr
 func memhash128(p unsafe.Pointer, h uintptr) uintptr
+func detptrhash(p unsafe.Pointer, h uintptr) uintptr
 func f32hash(p unsafe.Pointer, h uintptr) uintptr
 func f64hash(p unsafe.Pointer, h uintptr) uintptr
 func c64hash(p unsafe.Pointer, h uintptr) uintptr

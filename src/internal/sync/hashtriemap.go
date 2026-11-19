@@ -7,6 +7,7 @@ package sync
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"sync/atomic"
 	"unsafe"
 )
@@ -87,7 +88,12 @@ func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
 // The loaded result is true if the value was loaded, false if stored.
 func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool) {
 	ht.init()
-	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	var hash uintptr
+	if goexperiment.DetSched {
+		hash = runtime_detHashAssign(ht.keyHash, abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	} else {
+		hash = ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	}
 	var i *indirect[K, V]
 	var hashShift uint
 	var slot *atomicPointer[node[K, V]]
@@ -204,7 +210,12 @@ func (ht *HashTrieMap[K, V]) Store(key K, new V) {
 // The loaded result reports whether the key was present.
 func (ht *HashTrieMap[K, V]) Swap(key K, new V) (previous V, loaded bool) {
 	ht.init()
-	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	var hash uintptr
+	if goexperiment.DetSched {
+		hash = runtime_detHashAssign(ht.keyHash, abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	} else {
+		hash = ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	}
 	var i *indirect[K, V]
 	var hashShift uint
 	var slot *atomicPointer[node[K, V]]

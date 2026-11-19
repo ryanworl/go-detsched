@@ -8,6 +8,7 @@ package maps
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"internal/runtime/math"
 	"internal/runtime/sys"
 	"unsafe"
@@ -507,7 +508,12 @@ func (m *Map) PutSlot(typ *abi.MapType, key unsafe.Pointer) unsafe.Pointer {
 		fatal("concurrent map writes")
 	}
 
-	hash := typ.Hasher(key, m.seed)
+	var hash uintptr
+	if goexperiment.DetSched {
+		hash = detAssignHash(typ, key, m.seed)
+	} else {
+		hash = typ.Hasher(key, m.seed)
+	}
 
 	// Set writing after calling Hasher, since Hasher may panic, in which
 	// case we have not actually done a write.

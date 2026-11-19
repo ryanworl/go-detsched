@@ -7,6 +7,7 @@ package unique
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -56,7 +57,12 @@ func (m *canonMap[T]) Load(key T) *T {
 }
 
 func (m *canonMap[T]) LoadOrStore(key T) *T {
-	hash := m.hash(abi.NoEscape(unsafe.Pointer(&key)), m.seed)
+	var hash uintptr
+	if goexperiment.DetSched {
+		hash = runtime_detHashAssign(m.hash, abi.NoEscape(unsafe.Pointer(&key)), m.seed)
+	} else {
+		hash = m.hash(abi.NoEscape(unsafe.Pointer(&key)), m.seed)
+	}
 
 	var i *indirect[T]
 	var hashShift uint
@@ -403,3 +409,11 @@ func (x *atomicPointer[T]) Store(val *T) { atomic.StorePointer(&x.v, unsafe.Poin
 func (x *atomicPointer[T]) CompareAndSwap(old, new *T) (swapped bool) {
 	return atomic.CompareAndSwapPointer(&x.v, unsafe.Pointer(old), unsafe.Pointer(new))
 }
+
+// runtime_detHashAssign is hash(key, seed) for a key the caller stores,
+// with GOEXPERIMENT=detsched, where only such a key gives the pointers in
+// it identities to hash by (see runtime/detptrid.go).
+//
+//go:linkname runtime_detHashAssign
+//go:noescape
+func runtime_detHashAssign(hash func(unsafe.Pointer, uintptr) uintptr, key unsafe.Pointer, seed uintptr) uintptr

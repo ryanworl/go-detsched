@@ -9,6 +9,7 @@ import (
 	"internal/goarch"
 	"internal/goexperiment"
 	"internal/runtime/atomic"
+	"internal/runtime/maps"
 	"internal/runtime/sys"
 	"internal/stringslite"
 	"unsafe"
@@ -808,6 +809,9 @@ var panicnil = &godebugInc{name: "panicnil"}
 //
 //go:linkname gopanic
 func gopanic(e any) {
+	if goexperiment.DetSched {
+		maps.DetAssign = false // a key that cannot be hashed panics
+	}
 	if e == nil {
 		if debug.panicnil.Load() != 1 {
 			e = new(PanicNilError)
