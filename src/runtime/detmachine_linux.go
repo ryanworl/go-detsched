@@ -4,12 +4,6 @@
 
 package runtime
 
-import (
-	"internal/goarch"
-	"internal/runtime/syscall/linux"
-	"unsafe"
-)
-
 // detAuxv returns the value of auxiliary vector entry tag that det mode
 // gives the process instead of val: the HWCAP words with only the bits of
 // detHWCapKeep, so that code that chooses by them, in the standard
@@ -86,38 +80,4 @@ func detAuxvCanon(kv []uintptr) []uintptr {
 		}
 	}
 	return detAuxvBuf[: 2*len(detAuxvTags) : 2*len(detAuxvTags)]
-}
-
-// memfd_create and pwrite64, for syscall_detAuxvFile; 0 on other
-// architectures.
-const (
-	detSysMemfdCreate = 319*goarch.IsAmd64 + 279*goarch.IsArm64
-	detSysPwrite      = 18*goarch.IsAmd64 + 68*goarch.IsArm64
-)
-
-// syscall_detAuxvFile opens /proc/self/auxv for package syscall's Open
-// and Openat outside every simulated node: the kernel's file holds the
-// vector as the kernel gave it, as long as the kernel's and unmasked,
-// which github.com/klauspost/cpuid, for one, reads in its init. It
-// returns a file that holds the vector getAuxv returns instead, or
-// ok false to open path as usual.
-//
-//go:linkname syscall_detAuxvFile syscall.detAuxvFile
-func syscall_detAuxvFile(path string, flags int) (fd int, ok bool) {
-	if path != "/proc/self/auxv" && path != "/proc/thread-self/auxv" || flags&3 != 0 || detSysMemfdCreate == 0 || detsimNodeOf() != 0 {
-		return 0, false
-	}
-	name := [...]byte{'a', 'u', 'x', 'v', 0}
-	const mfdCloexec = 1
-	r, _, errno := linux.Syscall6(detSysMemfdCreate, uintptr(unsafe.Pointer(&name[0])), mfdCloexec, 0, 0, 0, 0)
-	if errno != 0 {
-		return 0, false
-	}
-	// At offset 0, which leaves the file's offset at its start.
-	n := unsafe.Sizeof(detAuxvBuf)
-	if w, _, errno := linux.Syscall6(detSysPwrite, r, uintptr(unsafe.Pointer(&detAuxvBuf[0])), n, 0, 0, 0); errno != 0 || w != n {
-		closefd(int32(r))
-		return 0, false
-	}
-	return int(r), true
 }

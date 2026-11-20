@@ -55,12 +55,23 @@ func runtime_exitsyscall()
 // RawSyscall, which also runs in the child of vfork.
 func detsimSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr, raw bool) (r1, r2, errno uintptr, ok bool)
 
+// detMachineSyscall answers, under GOEXPERIMENT=detsched, the system calls
+// that describe the machine, outside every simulated node, as the same
+// machine on every machine: openat of /proc/cpuinfo, /proc/meminfo, the
+// cgroup's files and others, sysinfo, and sched_getaffinity. It reports
+// whether it answered the call. It is provided by the runtime
+// (runtime/detmachinefiles_linux.go).
+func detMachineSyscall(trap, a1, a2, a3 uintptr) (r1, errno uintptr, ok bool)
+
 //go:uintptrkeepalive
 //go:nosplit
 //go:norace
 //go:linkname RawSyscall
 func RawSyscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 	if goexperiment.DetSched {
+		if r1, e, ok := detMachineSyscall(trap, a1, a2, a3); ok {
+			return r1, 0, Errno(e)
+		}
 		if r1, r2, e, ok := detsimSyscall(trap, a1, a2, a3, 0, 0, 0, true); ok {
 			return r1, r2, Errno(e)
 		}
@@ -84,6 +95,9 @@ func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errn
 //go:linkname Syscall
 func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 	if goexperiment.DetSched {
+		if r1, e, ok := detMachineSyscall(trap, a1, a2, a3); ok {
+			return r1, 0, Errno(e)
+		}
 		if r1, r2, e, ok := detsimSyscall(trap, a1, a2, a3, 0, 0, 0, false); ok {
 			return r1, r2, Errno(e)
 		}
@@ -111,6 +125,9 @@ func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
 //go:linkname Syscall6
 func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
 	if goexperiment.DetSched {
+		if r1, e, ok := detMachineSyscall(trap, a1, a2, a3); ok {
+			return r1, 0, Errno(e)
+		}
 		if r1, r2, e, ok := detsimSyscall(trap, a1, a2, a3, a4, a5, a6, false); ok {
 			return r1, r2, Errno(e)
 		}
@@ -299,29 +316,12 @@ func Mknod(path string, mode uint32, dev int) (err error) {
 }
 
 func Open(path string, mode int, perm uint32) (fd int, err error) {
-	if goexperiment.DetSched {
-		if fd, ok := detAuxvFile(path, mode); ok {
-			return fd, nil
-		}
-	}
 	return openat(_AT_FDCWD, path, mode|O_LARGEFILE, perm)
 }
-
-// detAuxvFile opens a file that holds the auxiliary vector the runtime
-// shows the program, if path is /proc/self/auxv and the caller is on no
-// simulated node, so that code that reads that file sees the vector
-// getAuxv returns: the same on every machine (see runtime.detAuxvCanon).
-// Provided by the runtime.
-func detAuxvFile(path string, flags int) (fd int, ok bool)
 
 //sys	openat(dirfd int, path string, flags int, mode uint32) (fd int, err error)
 
 func Openat(dirfd int, path string, flags int, mode uint32) (fd int, err error) {
-	if goexperiment.DetSched {
-		if fd, ok := detAuxvFile(path, flags); ok {
-			return fd, nil
-		}
-	}
 	return openat(dirfd, path, flags|O_LARGEFILE, mode)
 }
 

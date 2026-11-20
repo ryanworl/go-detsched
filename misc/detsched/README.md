@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched35
+v=go1.27.4-detsched36
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -239,20 +239,42 @@ auxiliary vector is the same on every machine and kernel, in
 that keep only what the standard library chooses code by (on arm64 FP,
 ASIMD, AES, PMULL, SHA1, SHA2, CRC32 and atomics, so not `HWCAP_CPUID`,
 with which libraries would read the ID registers). `runtime.NumCPU()`
-returns 4 on every machine, and `GOMAXPROCS` is 1. The memory size is not
-read, and the kernel version only by work outside the deterministic
-subset, such as copying real files.
+returns 4 on every machine, and `GOMAXPROCS` is 1. The runtime does not
+read the memory size, and reads the kernel version only for work outside
+the deterministic subset, such as copying real files.
+
+Packages also read the machine in their `init`: `go.uber.org/automaxprocs`
+reads the cgroup's CPU quota, memory-limit packages read `memory.max`,
+`/proc/meminfo` or `sysinfo`, and others count the processors in
+`/proc/cpuinfo`. On Linux, outside simulated nodes, det mode gives these
+the same machine everywhere: four CPUs with the features it keeps, 16 GiB
+of memory, and a container at the root of a cgroup v2 hierarchy with no
+CPU or memory limit. Opening `/proc/cpuinfo`, `/proc/meminfo`,
+`/proc/stat`, `/proc/loadavg`, `/proc/mounts`, `/proc/self/mountinfo`,
+`/proc/self/mounts`, `/proc/self/cgroup`, `/proc/self/auxv`,
+`/sys/devices/system/cpu/{online,possible,present}`, or the cgroup v2
+files `cgroup.controllers`, `cpu.max`, `cpu.weight`,
+`cpuset.cpus.effective`, `cpuset.mems.effective`, `memory.max`,
+`memory.high`, `memory.low`, `memory.min`, `memory.swap.max` and
+`pids.max` in `/sys/fs/cgroup` for reading gives a file with det mode's
+contents, also through `/proc/thread-self` and `/proc/PID`. cgroup v1
+files, such as `/sys/fs/cgroup/memory/memory.limit_in_bytes`, do not
+exist, and `sysinfo` and `sched_getaffinity` report the same machine. So
+automaxprocs leaves `GOMAXPROCS` as it is, and a memory-limit package
+that falls back to the machine's memory sets its limit from 16 GiB. The
+process's real limits are unchanged, so a program is not told about a
+smaller real memory limit, and files these directories hold that are not
+listed, such as `memory.current` or `/sys/devices/system/cpu/cpu0/`, are
+the machine's own.
 
 This entry means the machine lacks one of the features kept, so the
 standard library runs other code here: search and replay on machines
 that have them. What det mode cannot hide is what code reads itself: the
 `CPUID` instruction on x86 (as `golang.org/x/sys/cpu` and
 `github.com/klauspost/cpuid` do), the ID registers on arm64 by code that
-does not check `HWCAP_CPUID`, sysctl on macOS, files that describe the
-machine (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/self/mountinfo`, and the
-cgroup's, which `go.uber.org/automaxprocs` and memory-limit packages read
-in their `init`), the page size (`os.Getpagesize`), the host name and the
-process ID. So replay lines carry the machine's ID (`machine=p4096.f...`:
+does not check `HWCAP_CPUID`, sysctl on macOS, files about the machine
+other than those above, the page size (`os.Getpagesize`), the host name
+and the process ID. So replay lines carry the machine's ID (`machine=p4096.f...`:
 page size, CPU features, the kernel's HWCAP words, and the CPU's ID
 registers or signature), and a replay that runs another schedule on
 another machine says what differs, such as `CPU features only there:
@@ -641,10 +663,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched35:
+and release N's version is v0.N.0, so with go1.27.4-detsched36:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.35.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.36.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass

@@ -499,9 +499,11 @@ func TestStops(t *testing.T) {
 // about the machine leaves testdata/machine's schedule as it is, so that a
 // binary replays a seed on every machine of its GOOS and GOARCH: the CPU
 // features det mode hides, here turned off or on with GODEBUG's cpu
-// settings; the number of CPUs the process may run on;
-// and dettrace, whose settings code that reads $GODEBUG itself, as the
-// program does, must not see. Each run is compared with one without
+// settings; the number of CPUs the process may run on; the mounts, and
+// QEMU's CPU and kernel interface, which the files and system calls that
+// describe the machine and the auxiliary vector report; and dettrace,
+// whose settings code that reads $GODEBUG itself, as the program does,
+// must not see. Each run is compared with one without
 // GODEBUG at all, by its trace line and by stop lines every 5000 ticks,
 // which also catch a shift of a few ticks that leaves the trace line as
 // it is.
@@ -572,6 +574,12 @@ func TestMachine(t *testing.T) {
 				t.Errorf("GODETSEED=%s on one CPU: %s on all", seed, differ(o, base))
 			}
 		}
+		// Another set of mounts, which /proc/self/mountinfo lists.
+		if unshare, err := exec.LookPath("unshare"); err == nil && exec.Command(unshare, "-rm", "true").Run() == nil {
+			if o := runEnv([]string{seedEnv}, unshare, "-rm", "sh", "-c", `mount -t tmpfs none /mnt && exec "$0"`); o != base {
+				t.Errorf("GODETSEED=%s with another mount: %s without", seed, differ(o, base))
+			}
+		}
 		// Another x86 machine: QEMU's, whose CPU and auxiliary vector,
 		// shorter than the kernel's, differ from this machine's.
 		if qemu := lookQEMU("x86_64"); qemu != "" && runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
@@ -589,6 +597,19 @@ func TestMachine(t *testing.T) {
 		}
 		if want := "auxv tags: [33 51 16 6 17 3 4 5 7 8 9 11 12 13 14 23 25 26 27 28 29 30 31 15]\nauxv file same: true\n"; !strings.HasPrefix(o.stdout, want) {
 			t.Errorf("the program saw another auxiliary vector than det mode's:\n%s\nwant:\n%s", o.stdout, want)
+		}
+		// And the same files and system calls that describe the
+		// machine: four CPUs, 16 GiB, and a cgroup v2 root without
+		// limits.
+		o, _, err = runBin(bin, "GODETSEED=1", "MACHINE_FILES=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `files: cgroup / mount /sys/fs/cgroup cpu.max "max 100000" memory.max "max" v1 "error: open /sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us: no such file or directory" "error: open /sys/fs/cgroup/memory/memory.limit_in_bytes: no such file or directory"
+files: processors 4 stat 4 online 0-3 affinity 4 memtotal 16777216 sysinfo 17179869184
+`
+		if !strings.HasPrefix(o.stdout, want) {
+			t.Errorf("the program saw another machine than det mode's:\n%s\nwant:\n%s", o.stdout, want)
 		}
 	}
 	// A replay that runs another schedule than its line's, on a machine

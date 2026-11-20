@@ -25,6 +25,9 @@ import (
 //     others that read them with getAuxv or from /proc/self/auxv.
 //   - The auxiliary vector's length. The program sees the same entries in
 //     the same order on every kernel (see detAuxvTags).
+//   - Files and system calls that describe the machine: /proc/cpuinfo,
+//     /proc/meminfo, the cgroup's limits, sysinfo, and others give the
+//     same machine everywhere (see detmachinefiles_linux.go).
 //   - The number of CPUs. GOMAXPROCS is 1 (see procresize), and NumCPU
 //     returns detNumCPU, so that code sized by it, such as a pool of
 //     workers, does the same work on every machine.
@@ -33,10 +36,10 @@ import (
 //     files or starting a process.
 //
 // What remains is what code reads itself: the CPUID instruction on x86,
-// the ID registers on arm64, sysctl on darwin, files such as
-// /proc/cpuinfo, /proc/self/mountinfo, and the cgroup's, and the page
-// size (os.Getpagesize). The runtime describes the CPU and the page size
-// in a machine ID (see detMachineID), which
+// the ID registers on arm64, sysctl on darwin, other files, such as the
+// per-CPU directories in /sys, and the page size (os.Getpagesize). The
+// runtime describes the CPU and the page size in a machine ID (see
+// detMachineID), which
 // a search's runs print and its replay lines carry, so that a replay
 // that runs another schedule on another machine says how the machines
 // differ.
@@ -301,7 +304,7 @@ func detMachineDiffer() {
 			print(" here;")
 		}
 	}
-	print(" det mode hides these from the standard library, but code that reads the CPU or the page size itself, such as golang.org/x/sys/cpu on x86 and darwin or github.com/klauspost/cpuid on x86, can choose other code by them, and so count other ticks, as can code that reads files that describe the machine, such as /proc/cpuinfo or the cgroup's\n")
+	print(" det mode hides these from the standard library, but code that reads the CPU or the page size itself, such as golang.org/x/sys/cpu on x86 and darwin or github.com/klauspost/cpuid on x86, can choose other code by them, and so count other ticks, as can code that reads files about the machine that det mode does not replace\n")
 }
 
 // detBisectHint tells the user of a replay that ran another schedule than
