@@ -184,6 +184,50 @@ var RISCV64 struct {
 //go:linkname S390X
 //go:linkname RISCV64
 
+// DetPin is set by the runtime under GOEXPERIMENT=detsched, before
+// Initialize, so that the program sees only the features that det mode
+// assumes every machine of its GOARCH has (detFeatures' kept ones): it
+// takes the same code paths, assembly or Go, on all of them, and so
+// counts the same ticks and runs the same schedule. Initialize then sets
+// DetRaw to the features detected, bit i for detFeatures[i], and
+// DetMissing to the kept features this machine lacks, for the runtime to
+// report: code that reads the CPU itself can still see what DetPin
+// hides, and a machine without a kept feature runs other code.
+var (
+	DetPin     bool
+	DetRaw     uint64
+	DetMissing uint64
+)
+
+// A detFeature is a feature that DetPin keeps or hides.
+type detFeature struct {
+	name string
+	f    *bool
+	keep bool
+}
+
+func detPin() {
+	for i, d := range detFeatures {
+		if *d.f {
+			DetRaw |= 1 << i
+		} else if d.keep {
+			DetMissing |= 1 << i
+		}
+		if !d.keep {
+			*d.f = false
+		}
+	}
+}
+
+// DetFeatureName returns the name of bit i of DetRaw and DetMissing, or
+// "" past the last.
+func DetFeatureName(i int) string {
+	if i < len(detFeatures) {
+		return detFeatures[i].name
+	}
+	return ""
+}
+
 // doDerived, if non-nil, is called after processing GODEBUG to set "derived"
 // feature flags.
 var doDerived func()
@@ -194,6 +238,9 @@ var doDerived func()
 // cpu feature options in GODEBUG.
 func Initialize(env string) {
 	doinit()
+	if DetPin {
+		detPin()
+	}
 	processOptions(env)
 	if doDerived != nil {
 		doDerived()

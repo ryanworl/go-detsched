@@ -20,7 +20,7 @@ The reference is `$(go env GOROOT)/misc/detsched/README.md`, and debugging is `$
 
 ## Rules
 
-- Replay with the printed line exactly: its `cd`, every variable, the kept binary, its arguments. It works in a new shell, and `detsched` has checked that it reproduces. A replay reproduces when its `detsched: trace=` line equals the log's first one.
+- Replay with the printed line exactly: its `cd`, every variable, the kept binary, its arguments. It works in a new shell and on another machine of the same OS and architecture, and `detsched` has checked that it reproduces; a replay that runs another schedule prints a warning that says what differs, such as a variable or the machine's CPU features. A replay reproduces when its `detsched: trace=` line equals the log's first one.
 - Never add prints, `-test.v` or `-test.run` to a replay: any change to the binary, its arguments, or a variable it reads gives another run. Use dlv; diagnostics a harness prints must run only after an assertion failed (`assert.Failures() > 0`).
 - Under dlv, keep `GODETBRANCH` from the line: dlv does not follow forks.
 - Keep assertion messages constant, with values in the details: the message is the group.

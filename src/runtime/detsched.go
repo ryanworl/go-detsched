@@ -96,9 +96,14 @@
 // that writes to a pipe the program reads, or a blocking read from a
 // terminal another goroutine writes to. The detWatchdog thread does only
 // that part of sysmon's job: once a goroutine has been in the same system
-// call for at least detSyscallRetakeNS, it hands off the P so other
-// goroutines can run. Short system calls keep the P, so they leave the
-// schedule deterministic; a hand-off does not, and is reported.
+// call for at least detSyscallRetakeNS, and its thread sleeps in the
+// kernel waiting for an event (see detThreadSleeping), it hands off the P
+// so other goroutines can run. Short system calls keep the P, so they
+// leave the schedule deterministic; a hand-off does not, and is reported.
+// A call whose thread runs, waits for a CPU, or waits for a disk keeps
+// the P however long it takes, so that a loaded machine, which can leave
+// any thread without a CPU for longer than detSyscallRetakeNS, does not
+// change the schedule.
 
 package runtime
 
@@ -694,6 +699,7 @@ func detRandInit(pp *p) {
 //	cover=1|counts        record coverage features (see detFeedCoverInit)
 //	yield=0xA,...         hold locks acquired at these sites (see detFeedYieldInit)
 //	extent                report how far the run went (see detrunaway.go)
+//	envread               report the variables read (see detEnvRead) and the machine ID
 //	maxswitches=N         stop after N switches since the last branch
 //	maxstuck=N            stop after N switches while virtual time stays put
 //	maxtime=NS            stop when virtual time passes NS
@@ -703,10 +709,11 @@ func detRandInit(pp *p) {
 //	perturb=off|walk|pct  use one strategy instead of drawing one per run
 //	quantum=N             ticks per quantum without perturbation (see detQuantum)
 //	trace=0xH             the schedule hash the run should have (see detExpectTrace)
+//	machine=ID            the machine that run ran on (see detMachineID)
 //
 // Replaying a run needs the fields that change what it does: all but
-// fork, feedback, cover, and extent, and trace, which a replay line adds
-// to check the replay.
+// fork, feedback, cover, and extent, and trace and machine, which a
+// replay line adds to check the replay.
 func detSearchInit() {
 	s := gogetenv("GODETSEARCH")
 	for s != "" {
@@ -751,6 +758,8 @@ func detSearchInit() {
 			detFaultsOff = v
 		case "trace":
 			detExpectTrace, ok = detParseHex(v)
+		case "machine":
+			detExpectMachine = v
 		case "envread":
 			detEnvRead.report = true
 		case "quantum":
@@ -950,7 +959,9 @@ func detTraceReport() {
 	detRunawayExtent()
 	if detExpectTrace != 0 && h != detExpectTrace {
 		print("detsched: warning: this run's schedule is not the one its replay line was printed for (trace=", hex(detExpectTrace), "), so it may not do what that run did. Its environment, the files it reads, or the binary differ from the search's: a variable set here that the search's environment did not have, such as NO_COLOR, can change the schedule; unset it with env -u NAME\n")
+		detMachineDiffer()
 	}
+	detMachineReport()
 	if detBranchChild {
 		print("detsched: branch ", detBranchN, " (GODETBRANCH=", detBranchN, " runs it in place)\n")
 	}
@@ -1527,11 +1538,17 @@ func detRetakeSyscall(now int64) {
 			thread.resume()
 		} else if d := now - pd.syscallwhen; d < detSyscallRetakeNS || d < detInitSyscallRetakeNS && !mainInitDone.Load() {
 			thread.resume()
+		} else if !detThreadSleeping(thread.mp) {
+			// It runs, or waits for a CPU or a disk: it waits for
+			// nothing another goroutine does, however long a loaded
+			// machine takes, so a hand-off would change the schedule
+			// for nothing. Look again at the next check.
+			thread.resume()
 		} else {
 			// The goroutine is held in _Gsyscall and the P is ours, so
 			// no Go code runs while we report.
 			thread.takeP()
-			detStrictOS("has been in a system call for at least 10ms of real time, so other goroutines run meanwhile", thread.gp)
+			detStrictOS("has been waiting in a system call for at least 10ms of real time, so other goroutines run meanwhile", thread.gp)
 			thread.resume()
 			handoffp(pp)
 		}

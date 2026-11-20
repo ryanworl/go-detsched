@@ -27,6 +27,20 @@ func doinit() {
 	osInit()
 }
 
+// detFeatures keeps the features of servers since Neoverse N1 and of
+// Apple silicon since M1. It hides SHA512 and SHA3, which Neoverse N1
+// lacks. LSE atomics, CPUID, DIT, SB, and the CPU part change no code
+// path that counts ticks, so they stay as detected.
+var detFeatures = []detFeature{
+	{"aes", &ARM64.HasAES, true},
+	{"pmull", &ARM64.HasPMULL, true},
+	{"sha1", &ARM64.HasSHA1, true},
+	{"sha2", &ARM64.HasSHA2, true},
+	{"crc32", &ARM64.HasCRC32, true},
+	{"sha512", &ARM64.HasSHA512, false},
+	{"sha3", &ARM64.HasSHA3, false},
+}
+
 func getisar0() uint64
 
 func getisar1() uint64

@@ -422,7 +422,7 @@ func TestStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	stop := regexp.MustCompile(`(?m)^detsched: stop (\d) at t(-|\d+)(?:\.\d{9})? s(\d+) k(\d+) goroutine \d+$`)
+	stop := regexp.MustCompile(`(?m)^detsched: stop (\d) at t(-|\d+)(?:\.\d{9})? s(\d+) k(\d+) goroutine \d+ trace=0x[0-9a-f]+$`)
 	for _, seed := range []string{"1", "2", "3"} {
 		env := []string{"GODETSEED=" + seed, "GODETBRANCH=0", "SIMCOMPOSE_BUG=1"}
 		base, _, err := runBin(bin, env...)
@@ -471,6 +471,131 @@ func TestStops(t *testing.T) {
 		if n := strings.Count(o.stderr, "\ngoroutine "); n < 5 {
 			t.Errorf("GODETSEED=%s: s500:dump printed %d goroutines:\n%s", seed, n, o.stderr)
 		}
+		// A periodic point stops at every multiple of its period, with
+		// the schedule's hash so far, whatever other stops the run has:
+		// the lines that two runs print compare them.
+		var periodic [2][]string
+		for i, points := range []string{"s*1000", "s*1000,t5,k1"} {
+			p, _, err := runBin(bin, append(env, "GODETSTOP="+points)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.trace != base.trace {
+				t.Errorf("GODETSEED=%s GODETSTOP=%s: trace %q, want %q", seed, points, p.trace, base.trace)
+			}
+			for _, m := range stop.FindAllStringSubmatch(p.stderr, -1) {
+				if m[1] == "1" {
+					periodic[i] = append(periodic[i], strings.TrimPrefix(m[0], "detsched: stop 1 "))
+				}
+			}
+		}
+		if n, _ := strconv.Atoi(regexp.MustCompile(`switches=(\d+)`).FindStringSubmatch(base.trace)[1]); len(periodic[0]) < n/1000-1 || len(periodic[0]) > n/1000 || !slices.Equal(periodic[0], periodic[1]) {
+			t.Errorf("GODETSEED=%s: GODETSTOP=s*1000 stopped %d times in %d switches, and differently beside other stops:\n%s\n%s", seed, len(periodic[0]), n, strings.Join(periodic[0], "\n"), strings.Join(periodic[1], "\n"))
+		}
+	}
+}
+
+// TestMachine checks that what the runtime and the standard library read
+// about the machine leaves testdata/machine's schedule as it is, so that a
+// binary replays a seed on every machine of its GOOS and GOARCH: the CPU
+// features det mode hides, here turned off or on with GODEBUG's cpu
+// settings; the number of CPUs the process may run on;
+// and dettrace, whose settings code that reads $GODEBUG itself, as the
+// program does, must not see. Each run is compared with one without
+// GODEBUG at all, by its trace line and by stop lines every 5000 ticks,
+// which also catch a shift of a few ticks that leaves the trace line as
+// it is.
+func TestMachine(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/machine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	stopLines := regexp.MustCompile(`(?m)^detsched: stop .*$`)
+	runEnv := func(env []string, prefix ...string) string {
+		t.Helper()
+		cmd := exec.Command(bin)
+		if len(prefix) > 0 {
+			cmd = exec.Command(prefix[0], append(prefix[1:], bin)...)
+		}
+		cmd.Env = slices.DeleteFunc(os.Environ(), func(e string) bool { return strings.HasPrefix(e, "GODEBUG=") || strings.HasPrefix(e, "GODET") })
+		cmd.Env = append(cmd.Env, append(env, "GODETSTOP=k*5000")...)
+		o, _, err := run(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stops := stopLines.FindAllString(o.stderr, -1)
+		if o.exitCode != 0 || len(stops) < 10 {
+			t.Fatalf("%v %v: exit status %d, %d stops:\n%s%s", prefix, env, o.exitCode, len(stops), o.stdout, o.stderr)
+		}
+		return o.trace + "\n" + strings.Join(stops, "\n")
+	}
+	var hidden []string
+	switch runtime.GOARCH {
+	case "amd64":
+		hidden = []string{"avx512f", "sha", "vpclmulqdq", "adx"}
+	case "arm64":
+		hidden = []string{"sha512", "sha3"}
+	}
+	differ := func(a, b string) string {
+		al, bl := strings.Split(a, "\n"), strings.Split(b, "\n")
+		for i := range min(len(al), len(bl)) {
+			if al[i] != bl[i] {
+				return fmt.Sprintf("%q, not %q", al[i], bl[i])
+			}
+		}
+		return fmt.Sprintf("%d lines, not %d", len(al), len(bl))
+	}
+	for _, seed := range []string{"1", "2"} {
+		seedEnv := "GODETSEED=" + seed
+		base := runEnv([]string{seedEnv})
+		for _, v := range []string{"dettrace=1", "dettrace=2", "dettrace=0,dettrace=1,dettrace=2"} {
+			if o := runEnv([]string{seedEnv, "GODEBUG=" + v}); o != base {
+				t.Errorf("GODETSEED=%s GODEBUG=%s: %s without GODEBUG", seed, v, differ(o, base))
+			}
+		}
+		for _, f := range hidden {
+			// As long, with as many settings, so that what parses
+			// $GODEBUG counts the same ticks.
+			off := runEnv([]string{seedEnv, "GODEBUG=a=00,cpu." + f + "=off"})
+			on := runEnv([]string{seedEnv, "GODEBUG=a=000,cpu." + f + "=on"})
+			if off != on {
+				t.Errorf("GODETSEED=%s: with GODEBUG=cpu.%s=off %s with it on", seed, f, differ(off, on))
+			}
+		}
+		if taskset, err := exec.LookPath("taskset"); err == nil {
+			if o := runEnv([]string{seedEnv}, taskset, "-c", "0"); o != base {
+				t.Errorf("GODETSEED=%s on one CPU: %s on all", seed, differ(o, base))
+			}
+		}
+	}
+	// A replay that runs another schedule than its line's, on a machine
+	// with another ID than the line's, says how the machines differ.
+	o, _, err := runBin(bin, "GODETSEED=1", "GODETSEARCH=envread trace=0x1 machine=p65536.f0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := regexp.MustCompile(`(?m)^detsched: machine=(p\d+\.f[0-9a-f]+\S*)$`).FindStringSubmatch(o.stderr)
+	if id == nil || !strings.Contains(o.stderr, "detsched: it ran on another machine than the search's run (machine=p65536.f0, here "+id[1]+"):") || !strings.Contains(o.stderr, "page size 65536 there") {
+		t.Errorf("a replay with another machine's ID did not say how the machines differ:\n%s", o.stderr)
+	}
+}
+
+// TestLongSyscall checks that system calls that take far longer than the
+// watchdog's 10ms, but in which the thread runs rather than waits, keep
+// the P (testdata/longsyscall): a hand-off would make the schedule depend
+// on how long they took, as a loaded machine's threads wait for a CPU
+// that long.
+func TestLongSyscall(t *testing.T) {
+	r, err := check(config{runs: 3, parallel: 1}, "../../testdata/longsyscall")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.deterministic() {
+		t.Fatalf("longsyscall is not deterministic:\n%s", r.details())
+	}
+	if o := r.outcomes[0]; o.exitCode != 0 || strings.Contains(o.stderr, "system call") {
+		t.Errorf("exit status %d, want 0 and no hand-off:\n%s", o.exitCode, o.stderr)
 	}
 }
 

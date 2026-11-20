@@ -7,6 +7,7 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/syscall/linux"
 	"internal/strconv"
@@ -301,6 +302,13 @@ func sysauxv(auxv []uintptr) (pairs int) {
 	var i int
 	for ; auxv[i] != _AT_NULL; i += 2 {
 		tag, val := auxv[i], auxv[i+1]
+		if goexperiment.DetSched {
+			// The masked value is what every reader of the auxiliary
+			// vector in the process sees: internal/cpu, and
+			// golang.org/x/sys/cpu through getAuxv.
+			val = detAuxv(tag, val)
+			auxv[i+1] = val
+		}
 		switch tag {
 		case _AT_RANDOM:
 			// The kernel provides a pointer to 16 bytes of cryptographically

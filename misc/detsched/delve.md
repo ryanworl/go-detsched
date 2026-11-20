@@ -217,7 +217,7 @@ goroutine running there. It works after the program exited too.
 To end a window too, put `GODETSTOP` among the replay line's variables,
 after its `cd`. It lists points, separated by commas; at the first tick
 of a goroutine's own code at or after each, the program prints
-`detsched: stop 1 at t10.025092087 s1822 k90267 goroutine 10`, calls
+`detsched: stop 1 at t10.025092087 s1822 k90267 goroutine 10 trace=0x...`, calls
 `runtime.detStop`, where Delve can break, and runs on unchanged:
 
 ```
@@ -451,6 +451,21 @@ that goroutine ran another amount of code since its switch. When a
 `bubble ... time` line differs first, the runs computed different
 amounts before it, which moved a node's clock. To look there, `restart
 sN` in Delve, then `stack 20`, or run both with `GODETSTOP=sN:dump`.
+
+A trace of a long run is gigabytes. To compare two runs cheaply, such as
+one replay line on two machines, print a stop line every so often
+instead: each ends with the hash of the schedule so far, and stops change
+nothing in the run.
+
+```
+(export GODETSTOP='s*100000'; <replay line>) 2>&1 >/dev/null | grep -a '^detsched: stop' > a.stops
+```
+
+The first line that differs between the two machines' files brackets the
+switch where they part. Run both again from the last line that agrees
+with a finer period, such as `GODETSTOP='s1200000*1000'`, then `s*1` over
+that range or `kN*M` for the tick, and take the `dettrace=2` trace only
+around it.
 
 ## Attach to a spinning or hung run
 

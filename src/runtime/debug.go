@@ -156,6 +156,9 @@ func SetDefaultGOMAXPROCS() {
 // at process startup. Changes to operating system CPU allocation after
 // process startup are not reflected.
 func NumCPU() int {
+	if goexperiment.DetSched {
+		return detNumCPU
+	}
 	return int(numCPUStartup)
 }
 

@@ -231,6 +231,45 @@ func doinit() {
 	osInit()
 }
 
+// detFeatures keeps the features of x86-64-v3 (Haswell and later, and
+// every AMD Zen) that the standard library chooses code by, and hides
+// AVX-512, AVX-VNNI, SHA, VAES, VPCLMULQDQ, GFNI, and ADX, which many
+// machines lack. ERMS, FSRM, and RDTSCP change only the runtime's own
+// code, which counts no ticks, so they stay as detected.
+var detFeatures = []detFeature{
+	{"sse3", &X86.HasSSE3, true},
+	{"ssse3", &X86.HasSSSE3, true},
+	{"sse41", &X86.HasSSE41, true},
+	{"sse42", &X86.HasSSE42, true},
+	{"popcnt", &X86.HasPOPCNT, true},
+	{"avx", &X86.HasAVX, true},
+	{"avx2", &X86.HasAVX2, true},
+	{"bmi1", &X86.HasBMI1, true},
+	{"bmi2", &X86.HasBMI2, true},
+	{"fma", &X86.HasFMA, true},
+	{"aes", &X86.HasAES, true},
+	{"pclmulqdq", &X86.HasPCLMULQDQ, true},
+	{"adx", &X86.HasADX, false},
+	{"sha", &X86.HasSHA, false},
+	{"vaes", &X86.HasVAES, false},
+	{"vpclmulqdq", &X86.HasVPCLMULQDQ, false},
+	{"gfni", &X86.HasGFNI, false},
+	{"avxvnni", &X86.HasAVXVNNI, false},
+	{"avx512f", &X86.HasAVX512F, false},
+	{"avx512cd", &X86.HasAVX512CD, false},
+	{"avx512bw", &X86.HasAVX512BW, false},
+	{"avx512dq", &X86.HasAVX512DQ, false},
+	{"avx512vl", &X86.HasAVX512VL, false},
+	{"avx512gfni", &X86.HasAVX512GFNI, false},
+	{"avx512vaes", &X86.HasAVX512VAES, false},
+	{"avx512vnni", &X86.HasAVX512VNNI, false},
+	{"avx512vbmi", &X86.HasAVX512VBMI, false},
+	{"avx512vbmi2", &X86.HasAVX512VBMI2, false},
+	{"avx512bitalg", &X86.HasAVX512BITALG, false},
+	{"avx512vpopcntdq", &X86.HasAVX512VPOPCNTDQ, false},
+	{"avx512vpclmulqdq", &X86.HasAVX512VPCLMULQDQ, false},
+}
+
 func isSet(hwc uint32, value uint32) bool {
 	return hwc&value != 0
 }

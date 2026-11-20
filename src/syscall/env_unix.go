@@ -54,7 +54,62 @@ var copyenv = sync.OnceFunc(func() {
 			}
 		}
 	}
+	if goexperiment.DetSched {
+		detGodebug()
+	}
 })
+
+// detGodebug rewrites $GODEBUG in envs without the settings whose names
+// start with "det", which only the runtime reads (as
+// runtime.detGodebugEnv does for internal/godebug), and removes it when
+// none other is left. Code that parses $GODEBUG itself, such as
+// golang.org/x/sys/cpu and net/http's HTTP/2, counts ticks for each
+// setting, so a diagnostic setting such as dettrace=2 would otherwise
+// change the schedule it is meant to show; and Environ and Getenv agree.
+// The value is always a new allocation of what remains, so that the heap
+// does not depend on whether there were det settings either.
+func detGodebug() {
+	i, ok := env["GODEBUG"]
+	if !ok {
+		return
+	}
+	v := envs[i][len("GODEBUG="):]
+	n := 0
+	for f := range detFields(v) {
+		n += len(f) + 1
+	}
+	if n == 0 {
+		envs[i] = ""
+		delete(env, "GODEBUG")
+		return
+	}
+	b := make([]byte, 0, len("GODEBUG=")+n-1)
+	b = append(b, "GODEBUG="...)
+	for f := range detFields(v) {
+		if len(b) > len("GODEBUG=") {
+			b = append(b, ',')
+		}
+		b = append(b, f...)
+	}
+	envs[i] = string(b)
+}
+
+// detFields yields the settings of a $GODEBUG value but the det ones.
+func detFields(v string) func(func(string) bool) {
+	return func(yield func(string) bool) {
+		for v != "" {
+			i := 0
+			for i < len(v) && v[i] != ',' {
+				i++
+			}
+			f := v[:i]
+			v = v[min(i+1, len(v)):]
+			if f != "" && (len(f) < 3 || f[:3] != "det") && !yield(f) {
+				return
+			}
+		}
+	}
+}
 
 func Unsetenv(key string) error {
 	copyenv()
@@ -160,12 +215,12 @@ func Environ() []string {
 
 // detEnviron is Environ in det mode. It leaves out the variables that a
 // search's runs, their replay lines, and a debugger's runs set
-// differently: those that control det mode, named GODET*, and GODEBUG
-// when all its settings are the runtime's det ones (see
-// runtime.detGodebugEnv), and those a shell sets for each command, _ and
-// OLDPWD, which a replay line's cd changes. So a program that ranges over
-// its environment does the same work in each, and runs the same
-// schedule. Getenv still finds them. The result has the capacity of envs,
+// differently: those that control det mode, named GODET*, and those a
+// shell sets for each command, _ and OLDPWD, which a replay line's cd
+// changes; $GODEBUG has lost its det settings already (see detGodebug).
+// So a program that ranges over its environment does the same work in
+// each, and runs the same schedule. Getenv still finds the GODET*
+// variables, _, and OLDPWD. The result has the capacity of envs,
 // which the runtime fixes (see detEnvsCopy), so that its size does not
 // depend on them either.
 func detEnviron() []string {
@@ -180,22 +235,5 @@ func detEnviron() []string {
 
 // detHidden reports whether detEnviron leaves out env, a "key=value".
 func detHidden(env string) bool {
-	if len(env) >= 5 && env[:5] == "GODET" || len(env) >= 2 && env[:2] == "_=" || len(env) >= 7 && env[:7] == "OLDPWD=" {
-		return true
-	}
-	if len(env) < 8 || env[:8] != "GODEBUG=" {
-		return false
-	}
-	// Each setting, between commas, must start with "det" or be empty.
-	for s := env[8:]; s != ""; {
-		i := 0
-		for i < len(s) && s[i] != ',' {
-			i++
-		}
-		if f := s[:i]; f != "" && (len(f) < 3 || f[:3] != "det") {
-			return false
-		}
-		s = s[min(i+1, len(s)):]
-	}
-	return true
+	return len(env) >= 5 && env[:5] == "GODET" || len(env) >= 2 && env[:2] == "_=" || len(env) >= 7 && env[:7] == "OLDPWD="
 }

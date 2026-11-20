@@ -25,13 +25,15 @@ import (
 //	sN    switch N, as GODEBUG=dettrace=2 numbers them
 //	kN    tick N: after N ticks, counted from the start of the program
 //
-// each optionally followed by ":dump". The run stops at the first tick at
-// or after each point: the runtime prints
+// each optionally followed by "*M", to stop again every M seconds,
+// switches, or ticks after it ("s*M" is "sM*M"), and by ":dump". The run
+// stops at the first tick at or after each point: the runtime prints
 //
-//	detsched: stop I at tD sN kN goroutine G
+//	detsched: stop I at tD sN kN goroutine G trace=0xH
 //
-// to standard error, with the current position (t- outside a bubble),
-// prints the stack of every goroutine for ":dump", and calls detStop(I),
+// to standard error, with the current position (t- outside a bubble) and
+// the hash of the schedule so far, which the trace line at exit ends
+// with, prints the stack of every goroutine for ":dump", and calls detStop(I),
 // on which a debugger breaks: in a debugger, the frame below detPreempt
 // is where goroutine G is. When the stop is at the last tick of G's
 // quantum, detPreempt yields after it, as it would have without the
@@ -39,6 +41,13 @@ import (
 // so. Then the run goes on, as if it had not
 // stopped: the stops draw no randomness, run no code that counts ticks,
 // and leave every goroutine's budget of ticks as it was.
+//
+// So without a debugger, stops cost little and change nothing, and their
+// lines locate where two runs that should be the same part: run a seed
+// on two machines, or two builds, with GODETSTOP=s*100000, and the first
+// stop line that differs brackets the switch where they do; then narrow
+// it with a finer period from the last line that agrees, such as
+// GODETSTOP=s1200000*1000, down to the switch, and to the tick with kN*M.
 //
 // Ticks are the run's finest clock: the compiler counts one at every
 // function entry and loop back edge in user code (see detsched.go), so no
@@ -62,6 +71,7 @@ const detBubbleStart = 946684800000000000
 type detStopPoint struct {
 	kind  byte   // 't', 's', or 'k'
 	n     uint64 // nanoseconds, switch, or tick
+	every uint64 // stop again this many nanoseconds, switches, or ticks later; 0 is never
 	dump  bool   // print every goroutine's stack
 	armed bool   // reached: it stops at the next tick
 	fired bool
@@ -218,25 +228,37 @@ func detStopInit() {
 		ok := len(item) > 1
 		if ok {
 			p.kind = item[0]
-			switch p.kind {
-			case 't':
-				p.n, ok = detParseSeconds(item[1:])
-			case 's', 'k':
-				p.n, ok = atoi64u(item[1:])
-				ok = ok && p.n < detStopNone
-			default:
-				ok = false
+			at, every, periodic := stringslite.Cut(item[1:], "*")
+			if periodic {
+				p.every, ok = detParseStop(p.kind, every)
+				ok = ok && p.every > 0
+				p.n = p.every
+			}
+			if ok && (at != "" || !periodic) {
+				p.n, ok = detParseStop(p.kind, at)
 			}
 		}
 		if !ok {
 			print("detsched: GODETSTOP point ", item, "\n")
-			fatal("GODETSTOP must be a list of points tD, sN, or kN, each optionally followed by :dump")
+			fatal("GODETSTOP must be a list of points tD, sN, or kN, each optionally followed by *M and by :dump")
 		}
 		points = append(points, p)
 	}
 	detStops.points = points
 	detStops.on = true
 	detStopsNext()
+}
+
+// detParseStop parses the number of a GODETSTOP point of kind kind.
+func detParseStop(kind byte, v string) (uint64, bool) {
+	switch kind {
+	case 't':
+		return detParseSeconds(v)
+	case 's', 'k':
+		n, ok := atoi64u(v)
+		return n, ok && n < detStopNone
+	}
+	return 0, false
 }
 
 // detParseSeconds parses decimal seconds, with up to 9 digits after the
@@ -339,7 +361,8 @@ func detStopFire(gp *g, pc, sp uintptr) {
 			} else {
 				print("-")
 			}
-			print(" s", detP(gp.m.p.ptr()).switches, " k", now, " goroutine ", gp.goid, "\n")
+			pp := gp.m.p.ptr()
+			print(" s", detP(pp).switches, " k", now, " goroutine ", gp.goid, " trace=", hex(detMix(detMix(0, detP(pp).trace), detP(pp).switches)), "\n")
 			if p.dump {
 				goroutineheader(gp)
 				traceback(pc, sp, 0, gp)
@@ -348,6 +371,25 @@ func detStopFire(gp *g, pc, sp uintptr) {
 			}
 		})
 		detStop(i + 1)
+		if p.every != 0 {
+			// The next stop of a periodic point: past where this one
+			// fired, which may be past its point.
+			var here uint64
+			switch p.kind {
+			case 's':
+				here = detP(gp.m.p.ptr()).switches
+			case 'k':
+				here = uint64(now)
+			case 't':
+				if b := gp.bubble; b != nil {
+					here = uint64(b.now - detBubbleStart)
+				}
+			}
+			for p.n <= here {
+				p.n += p.every
+			}
+			p.fired, p.armed = false, false
+		}
 	}
 	detStopsNext()
 	if real := detTicksReal(); real > 0 {

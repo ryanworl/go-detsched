@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched33
+v=go1.27.4-detsched34
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -50,8 +50,8 @@ $ detsched ./testdata/bugcache
 detsched: the summary so far is in /tmp/detsched-334332647/summary, every 30 seconds
 FAIL panic: computed answer twice [recovered, repanicked]
 	log:    /tmp/detsched-334332647/fail-1-1.log
-	replay: cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 GODETSEARCH=trace=0x5a28688c3de0741d /tmp/detsched-334332647/bugcache.test
-	debug:  cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 GODETSEARCH=trace=0x5a28688c3de0741d dlv exec --disable-aslr /tmp/detsched-334332647/debug/bugcache.test
+	replay: cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 GODETSEARCH='trace=0x5a28688c3de0741d machine=p4096.f7ffdffff' /tmp/detsched-334332647/bugcache.test
+	debug:  cd /home/me/go/misc/detsched/testdata/bugcache && GODETSEED=1 GODETBRANCH=0 GODETSEARCH='trace=0x5a28688c3de0741d machine=p4096.f7ffdffff' dlv exec --disable-aslr /tmp/detsched-334332647/debug/bugcache.test
 	the replay reproduced the failure in a new shell
 ^C
 detsched: ./testdata/bugcache: 489 runs, 174 failed, 1 signatures, 0 features, 736.0 runs/s, 1s
@@ -188,7 +188,9 @@ triaging: see what the goroutine at the first difference was doing
 
 The runtime reports, once per stack, each place where a program depends on
 the OS or on real time: waiting for a real file or network connection to
-become ready, staying in a system call for 10 ms of real time, starting a
+become ready, waiting in a system call for 10 ms of real time (a call
+whose thread runs, or waits for a CPU or a disk, keeps the run going
+however long a loaded machine takes), starting a
 subprocess, a timer outside every bubble firing, and a sleep outside every
 bubble ending. Each report says where in the run it happened (`at sN kN`,
 the switch and tick `GODETSTOP` takes) and prints the goroutine's stack;
@@ -217,8 +219,35 @@ This entry means it could not find them, as for a program that ranges
 over `os.Environ()`: run replay lines from the shell that ran
 `detsched`. In det mode `os.Environ()` leaves out the variables replay
 lines, `dlv` and the shell set differently from the search's runs
-(`GODET*`, a `GODEBUG` of only `det` settings, `_` and `OLDPWD`), so from
-that shell the line replays the run; `os.Getenv` still reads them.
+(`GODET*`, `_` and `OLDPWD`), so from that shell the line replays the
+run; `os.Getenv` still reads them. The program never sees `GODEBUG`'s
+`det` settings: `os.Getenv("GODEBUG")` and `os.Environ()` leave them out,
+and leave out `GODEBUG` when nothing else is left.
+
+### Machine lacks CPU features
+
+A binary replays a seed on every machine of its GOOS and GOARCH, as long
+as nothing it reads about the machine changes the work its Go code does.
+In det mode the standard library sees only the CPU features that every
+x86-64-v3 machine (Haswell, any AMD Zen), and on arm64 every Neoverse N1,
+Apple M1, and later, has, so it takes the same code paths, assembly or
+Go, on all of them: AVX-512, SHA-NI, VAES, GFNI, ADX, and arm64's SHA512
+and SHA3 are hidden (`GODEBUG=cpu.*` settings still apply). On
+linux/arm64 the auxiliary vector's HWCAP words are masked the same way,
+for `golang.org/x/sys/cpu` and other code that reads them.
+`runtime.NumCPU()` returns 4 on every machine, and `GOMAXPROCS` is 1. The
+memory size is not read, and the kernel version only by work outside the
+deterministic subset, such as copying real files.
+
+This entry means the machine lacks one of the features kept, so the
+standard library runs other code here: search and replay on machines
+that have them. What det mode cannot hide is what code reads itself: the
+`CPUID` instruction on x86 (as `golang.org/x/sys/cpu` and
+`github.com/klauspost/cpuid` do), sysctl on macOS, `/proc/cpuinfo`, the
+page size (`os.Getpagesize`), the host name and the process ID. So
+replay lines carry the machine's ID (`machine=p4096.f...`: page size and
+CPU features), and a replay that runs another schedule on another
+machine says what differs, such as `CPU features only there: avx512f`.
 
 ### Tests share a fork point
 
@@ -449,9 +478,11 @@ of output added to the program, which is a rebuild, gives another
 schedule. Code that prints diagnostics must run only after an assertion
 has failed (`assert.Failures() > 0`), never behind a variable a passing
 run also reads. Breakpoints, time spent stopped, `GODEBUG=dettrace=2`,
-`GODETSTOP`, `GOTRACEBACK`, attaching a debugger, and copying the binary
-leave the run unchanged; add such a variable just before `GODETSEED=`,
-after `env -u NAME`.
+`GODETSTOP`, `GOTRACEBACK`, attaching a debugger, copying the binary, and
+another machine of the same GOOS and GOARCH, loaded or not (see
+[Machine lacks CPU features](#machine-lacks-cpu-features)), leave the run
+unchanged; add such a variable just before `GODETSEED=`, after
+`env -u NAME`.
 
 The `debug:` line is the replay line with `dlv exec --disable-aslr` before
 the binary, which it replaces with the build without optimizations once
@@ -475,7 +506,14 @@ bubble's clock, to diff two runs; `GODETSTOP=t9.4,s12345,k812345678`
 stops at points in virtual time, switches, or ticks (one per entry of a
 function that calls or loops, and per loop iteration) by calling
 `runtime.detStop`, where a debugger can break; and `GODETSTOP=t9.4:dump`
-prints every goroutine's stack there and runs on.
+prints every goroutine's stack there and runs on. Each stop prints
+`detsched: stop 1 at t9.400000000 s1822 k90267 goroutine 10
+trace=0x...`, with the hash of the schedule so far, and a point followed
+by `*M` stops again every M seconds, switches or ticks. To find where two
+runs that should agree part, such as a replay on two machines, run both
+with `GODETSTOP=s*100000` and compare the stop lines: the first that
+differs brackets the switch, and `GODETSTOP=s1200000*1000` from the last
+line that agrees, then `kN*M`, narrow it to the switch and the tick.
 
 ## Flags
 
@@ -583,10 +621,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched33:
+and release N's version is v0.N.0, so with go1.27.4-detsched34:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.33.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.34.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
@@ -895,9 +933,15 @@ the runtime, where the source has them, so a build without optimizations
 counts the same ticks. It emits a synchronization point before every
 channel operation, `select`, `go` statement, and atomic operation, where
 the perturbation can switch goroutines too. A goroutine in a system call
-keeps the only P; after 10 ms, a watchdog thread hands it off so other
-goroutines can run. cgo callbacks are not supported, and `go build -race`
-fails, because the race detector randomizes the scheduler.
+keeps the only P; after 10 ms, if its thread sleeps in the kernel waiting
+for an event (a pipe, a socket, a child), a watchdog thread hands it off
+so other goroutines can run. A call whose thread runs, or waits for a CPU
+or a disk, keeps the P however long it takes, so a loaded machine does
+not change the schedule. What the standard library reads about the
+machine (CPU features, the number of CPUs) is fixed (see
+[Machine lacks CPU features](#machine-lacks-cpu-features)). cgo callbacks
+are not supported, and `go build -race` fails, because the race detector
+randomizes the scheduler.
 
 Writes to standard output and error through package `syscall` go to an
 in-memory buffer, written at exit, so no goroutine waits on the OS; the

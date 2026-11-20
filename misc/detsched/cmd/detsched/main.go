@@ -462,6 +462,8 @@ var (
 	stopLine      = regexp.MustCompile(`(?m)^detsched: did not finish: (\w+): (\d+) .*\) at switch (\d+), virtual time (\S+)s$`)
 	setupAgain    = regexp.MustCompile(`(?m)^detsched: setup completed again in tests after (\S+): (.+)$`)
 	lastSwitches  = regexp.MustCompile(`(?m)^detsched: the last (\d+) switches went to:\n((?:detsched: \t.*\n)+)`)
+	machineLacks  = regexp.MustCompile(`(?m)^detsched: warning: this machine lacks CPU features that det mode assumes every machine has:([^;]*);`)
+	machineLine   = regexp.MustCompile(`(?m)^detsched: machine=(\S+)$`)
 	setupLine     = regexp.MustCompile(`(?m)^detsched: setup complete at switch (\d+)$`)
 	deadlockLine  = regexp.MustCompile(`(?m)^detsched: potential deadlock: (.*)$`)
 	directiveLine = regexp.MustCompile(`(?m)^detsched: deadlock directive yield=(\S+)$`)
@@ -667,6 +669,11 @@ func (s *search) replayLine(r *result, debug bool) string {
 	// unless the run was stopped from outside, where the replay goes on.
 	if m := traceHash.FindStringSubmatch(trace); m != nil && !r.timedOut && !r.outOfMem {
 		env = addSearch(env, "trace="+m[1])
+		// And the machine it ran on, so that a replay on another
+		// machine that runs another schedule says how they differ.
+		if m := machineLine.FindSubmatch(r.output); m != nil {
+			env = addSearch(env, "machine="+string(m[1]))
+		}
 	}
 	for _, e := range slices.Concat(r.env, s.vars) {
 		v, ok := strings.CutPrefix(e, "GODETSEARCH=")
@@ -1929,6 +1936,11 @@ func (s *search) fallbacks() []fallback {
 		add("seed-1-left-the-deterministic-subset", fmt.Sprintf("seed 1 left the deterministic subset in %d places, first: %s", len(s.left), s.left[0]),
 			"failures may not replay",
 			"move that work into the synctest bubble or onto a sim node; each place's stack is in "+s.temp("seed-1.log"))
+	}
+	if m := machineLacks.FindSubmatch(s.baseOutput); m != nil {
+		add("machine-lacks-cpu-features", "this machine lacks CPU features that det mode assumes every machine has:"+string(m[1]),
+			"the standard library runs other code here than on machines that have them, so replay lines run other schedules there, and theirs here",
+			"search and replay on machines that have them: every x86-64-v3 machine (Haswell, any AMD Zen), and on arm64 Neoverse N1, Apple M1, and later")
 	}
 	if s.aslr != "" {
 		add("aslr", "seed 1 could not run itself again without ASLR: "+s.aslr,
