@@ -791,7 +791,8 @@ func TestSimPrograms(t *testing.T) {
 // the other nodes, and the node's next incarnation, must go on. The
 // package comment of each program says what it guards. Before each fix,
 // between a quarter and all of the seeds failed, except in simzombie's
-// TestWaiter, where 6 of 80 hung.
+// TestWaiter, where 6 of 80 hung, and in simkill's TestKillStarting under
+// PCT, where seeds 2, 4 and 6 ran for hours.
 func TestSimKill(t *testing.T) {
 	cfg := config{parallel: 4}
 	for _, tc := range []struct {
@@ -801,6 +802,7 @@ func TestSimKill(t *testing.T) {
 		n       int
 	}{
 		{pkg: "simkill", perturb: "walk", n: 20},         // a goroutine runs after its memory is unmapped
+		{pkg: "simkill", perturb: "pct", n: 20},          // tens of thousands of goroutines on a paused node
 		{pkg: "simsharedunlock", perturb: "walk", n: 20}, // a mutex shared between nodes
 		{pkg: "simstderr", n: 20},                        // os.Stderr's write lock
 		{pkg: "simlookup", n: 20},                        // net.DefaultResolver's merged lookups

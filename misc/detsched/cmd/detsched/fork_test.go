@@ -691,7 +691,7 @@ func TestSearchDebugFallback(t *testing.T) {
 		t.Errorf("debug line %s, want the optimized binary %s", debug, s.bin)
 	}
 	if r := searchReport(s); !strings.Contains(r, "debug lines run the optimized binary") || !strings.Contains(r, "ran seed 1 on another schedule") ||
-		!regexp.MustCompile(`the builds first differ at switch \d+ \(k\d+ optimized, k\d+ without optimizations\), after goroutine \d+ (was preempted|stopped) in \S+ \S+:\d+ optimized and goroutine \d+ (was preempted|stopped) in \S+ \S+:\d+ without`).MatchString(r) {
+		!regexp.MustCompile(`the builds first differ at switch \d+ \(k\d+ optimized, k\d+ without optimizations\), after goroutine \d+ ((was preempted|stopped) in \S+ \S+:\d+|exited) optimized and goroutine \d+ ((was preempted|stopped) in \S+ \S+:\d+|exited) without`).MatchString(r) {
 		t.Errorf("summary does not say why debug lines run the optimized binary, and where the builds part:\n%s", r)
 	}
 }

@@ -7569,6 +7569,9 @@ func pidlegetSpinning(now int64) (*p, int64) {
 // runqempty reports whether pp has no Gs on its local run queue.
 // It never returns true spuriously.
 func runqempty(pp *p) bool {
+	if goexperiment.DetSched && detPCTQueue.n > 0 {
+		return false // see detPCTQueue
+	}
 	// Defend against a race where 1) pp has G1 in runqnext but runqhead == runqtail,
 	// 2) runqput on pp kicks G1 to the runq, 3) runqget on pp empties runqnext.
 	// Simply observing that runqhead == runqtail and then observing that runqnext == nil

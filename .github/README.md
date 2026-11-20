@@ -34,11 +34,11 @@ Download a release for your platform, `linux-amd64`, `linux-arm64` or
 Each archive unpacks to a directory named after its version:
 
 ```
-v=go1.27.4-detsched28
+v=go1.27.4-detsched29
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
-go version    # go version go1.27.4-detsched28 linux/amd64
+go version    # go version go1.27.4-detsched29 linux/amd64
 ```
 
 The archive's `bin` holds `go`, `gofmt`, `detsched`, and Delve's `dlv`,
@@ -50,7 +50,7 @@ hit-count breakpoints, and JSON output (see
 `SHA256SUMS` in each release lists the archives' checksums. The macOS
 binaries are not notarized. Download them with curl, as above, or remove
 the quarantine that a browser adds before you unpack the archive:
-`xattr -d com.apple.quarantine go1.27.4-detsched28.darwin-arm64.tar.gz`.
+`xattr -d com.apple.quarantine go1.27.4-detsched29.darwin-arm64.tar.gz`.
 
 To build from source instead, with any Go 1.24.6 or later installed:
 
@@ -66,7 +66,7 @@ module; take the version that matches your toolchain, v0.N.0 for
 go1.27.4-detschedN. Tests that use it still build and pass with stock Go:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.28.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.29.0
 ```
 
 ## Versions

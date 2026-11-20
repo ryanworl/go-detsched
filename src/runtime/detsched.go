@@ -1675,9 +1675,11 @@ func detExpRand(pp *p, mean int32) int32 {
 }
 
 // detPickRunnable is called by findRunnable before it takes a goroutine
-// from the run queues. With chance detPerturb.pick, it removes and
-// returns a goroutine picked uniformly from pp's local run queue and the
-// global run queue; the others keep their order. Det mode never uses
+// from the run queues. Under PCT, it returns the runnable goroutine with
+// the highest priority (detPCTPick). Otherwise, with chance
+// detPerturb.pick, it removes and returns a goroutine picked uniformly
+// from pp's local run queue and the global run queue; the others keep
+// their order. Det mode never uses
 // runnext (runqput clears next when there is no sysmon), and with one P
 // no other P touches pp's run queue.
 func detPickRunnable(pp *p) *g {
@@ -1685,9 +1687,15 @@ func detPickRunnable(pp *p) *g {
 	// here each time the OS wakes it while the program waits in real
 	// time, and a draw per wake-up would shift every later choice.
 	lock(&sched.lock)
-	empty := pp.runqtail == atomic.LoadAcq(&pp.runqhead) && sched.runq.size == 0
+	empty := pp.runqtail == atomic.LoadAcq(&pp.runqhead) && sched.runq.size == 0 && detPCTQueue.n == 0
 	unlock(&sched.lock)
-	if empty || !detPerturb.pct && !detChance(pp, detPerturb.pick) {
+	if empty {
+		return nil
+	}
+	if detPerturb.pct || detPCTQueue.n > 0 {
+		return detPCTPick(pp)
+	}
+	if !detChance(pp, detPerturb.pick) {
 		return nil
 	}
 	h := atomic.LoadAcq(&pp.runqhead)
@@ -1698,12 +1706,7 @@ func detPickRunnable(pp *p) *g {
 		unlock(&sched.lock)
 		return nil
 	}
-	var i uint32
-	if detPerturb.pct {
-		i = detPCTPick(pp, h, nl)
-	} else {
-		i = uint32(uint64(uint32(detSchedRand(pp))) * uint64(n) >> 32)
-	}
+	i := uint32(uint64(uint32(detSchedRand(pp))) * uint64(n) >> 32)
 	if i < nl {
 		unlock(&sched.lock)
 		size := uint32(len(pp.runq))
@@ -1942,25 +1945,113 @@ func detPCTWake(pp *p, gp *g) {
 	detPCT.lastQ, detPCT.keep = 1, true
 }
 
-// detPCTPick returns the index of the highest-priority goroutine in pp's
-// local run queue, which has nl goroutines from head h, followed by the
-// global run queue. The caller holds sched.lock.
-func detPCTPick(pp *p, h, nl uint32) uint32 {
-	var best, i uint32
-	bestPrio := int64(-1 << 63)
-	consider := func(gp *g) {
-		if p := detPCTState(pp, gp).prio; p > bestPrio {
-			best, bestPrio = i, p
+// detPCTQueue holds the runnable goroutines under PCT, which picks the
+// one with the highest priority at every switch. Scanning the run queues
+// for it took time in proportion to the goroutines in them at every
+// switch, so tens of thousands of runnable goroutines, such as those a
+// node starts on a paused node, each of which a switch then freezes (see
+// detsimFreeze), took minutes. detPCTPick instead moves the goroutines of
+// the run queues into this binary heap, ordered by priority, and among
+// equal ones by when they came, and takes the first. A goroutine's
+// priority does not change while it waits: PCT changes only the running
+// goroutine's. runqempty counts the heap, so that the scheduler starts an
+// M for it as for the run queues. The heap is outside the Go heap, so
+// that its size changes no allocation of the program.
+var detPCTQueue struct {
+	base uintptr // the entries, as a uintptr so that growing them needs no write barrier
+	cap  int
+	n    int
+	seq  uint64 // the next entry's seq
+}
+
+type detPCTEntry struct {
+	prio int64
+	seq  uint64
+	gp   guintptr
+}
+
+// detPCTAt returns detPCTQueue's ith entry.
+func detPCTAt(i int) *detPCTEntry {
+	return (*detPCTEntry)(unsafe.Pointer(detPCTQueue.base + uintptr(i)*unsafe.Sizeof(detPCTEntry{})))
+}
+
+// before reports whether e runs before f.
+func (e *detPCTEntry) before(f *detPCTEntry) bool {
+	return e.prio > f.prio || e.prio == f.prio && e.seq < f.seq
+}
+
+// detPCTPick moves the goroutines of pp's run queues into detPCTQueue, in
+// their order, and removes and returns the one with the highest priority,
+// or nil if there is none.
+func detPCTPick(pp *p) *g {
+	lock(&sched.lock)
+	for {
+		gp, _ := runqget(pp)
+		if gp == nil {
+			gp = globrunqget()
 		}
-		i++
+		if gp == nil {
+			break
+		}
+		gp.schedlink = 0
+		detPCTPush(detPCTState(pp, gp).prio, gp)
 	}
-	for j := uint32(0); j < nl; j++ {
-		consider(pp.runq[(h+j)%uint32(len(pp.runq))].ptr())
+	q := &detPCTQueue
+	if q.n == 0 {
+		unlock(&sched.lock)
+		return nil
 	}
-	for gp := sched.runq.head.ptr(); gp != nil; gp = gp.schedlink.ptr() {
-		consider(gp)
+	gp := detPCTAt(0).gp.ptr()
+	q.n--
+	*detPCTAt(0) = *detPCTAt(q.n)
+	for i := 0; ; {
+		c := 2*i + 1
+		if c >= q.n {
+			break
+		}
+		if c+1 < q.n && detPCTAt(c+1).before(detPCTAt(c)) {
+			c++
+		}
+		if !detPCTAt(c).before(detPCTAt(i)) {
+			break
+		}
+		*detPCTAt(i), *detPCTAt(c) = *detPCTAt(c), *detPCTAt(i)
+		i = c
 	}
-	return best
+	unlock(&sched.lock)
+	return gp
+}
+
+// detPCTPush adds gp to detPCTQueue with priority prio.
+func detPCTPush(prio int64, gp *g) {
+	q := &detPCTQueue
+	if q.n == q.cap {
+		size := unsafe.Sizeof(detPCTEntry{})
+		n := max(2*q.cap, 1<<10)
+		mem := sysAlloc(uintptr(n)*size, &memstats.other_sys, "detsched PCT run queue")
+		if mem == nil {
+			throw("detsched: out of memory for the PCT run queue")
+		}
+		if q.cap > 0 {
+			memmove(mem, unsafe.Pointer(q.base), uintptr(q.cap)*size)
+			sysFree(unsafe.Pointer(q.base), uintptr(q.cap)*size, &memstats.other_sys)
+		}
+		q.base, q.cap = uintptr(mem), n
+	}
+	i := q.n
+	e := detPCTAt(i)
+	e.prio, e.seq = prio, q.seq
+	e.gp.set(gp)
+	q.n++
+	q.seq++
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !detPCTAt(i).before(detPCTAt(parent)) {
+			break
+		}
+		*detPCTAt(i), *detPCTAt(parent) = *detPCTAt(parent), *detPCTAt(i)
+		i = parent
+	}
 }
 
 // The tape.
