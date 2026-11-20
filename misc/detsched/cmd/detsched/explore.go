@@ -140,7 +140,8 @@ func feedbackKind(i int) string {
 // So they run with GODETBRANCH=0, which runs the timeline without
 // forking its branches, rather than wait for each branch to run its
 // terminal phase. The base run, recorded as the search's first, checks
-// seed 1's timeline but not its branches.
+// seed 1's timeline but not its branches; with -seeds, it is not
+// recorded.
 func (s *search) prepare(ctx context.Context) error {
 	feedback := s.temp("base.feedback")
 	defer os.Remove(feedback)
@@ -286,6 +287,11 @@ func (s *search) prepare(ctx context.Context) error {
 		}
 	}
 	s.canFork = !s.noFork
+	if s.seeds {
+		// The runs are plain seeds from seedBase+1, each with its
+		// composer branches, which the base run did not run.
+		return nil
+	}
 	return s.record(ctx, base, armFresh)
 }
 

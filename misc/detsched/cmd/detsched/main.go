@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	detsched [-run regexp] [-duration d] [-n seeds] [-seed-base n] [-timeout d] [-p n] [-exec binary | package]
+//	detsched [-seeds] [-run regexp] [-duration d] [-n seeds] [-seed-base n] [-timeout d] [-p n] [-json file] [-exec binary | package]
 //	detsched -check [-run regexp] [-n seeds] [-timeout d] [-p n] [package]
 //
 // Detsched builds the tests of the package (by default, the one in the
@@ -32,8 +32,19 @@
 // go test -c does, and pass it with -exec; detsched then runs it in the
 // current directory instead of building a package.
 //
+// With -seeds, detsched runs seeds -seed-base+1, -seed-base+2, and so
+// on, each from its start, without searching: no run is forked from
+// another or directed at a predicted deadlock, so that failure rates
+// compare across commits and every failure replays from its seed.
+//
 // A run that takes longer than -timeout (default 10m) is stopped with
 // SIGQUIT, which prints its goroutines, and counts as a failure.
+//
+// With -json file, detsched also writes the search's events to file, one
+// JSON object per line, for a program such as a CI job: every run, with
+// its trace line, the fallbacks, each group with its replay command as
+// structured fields, and the totals with the exit status. The README
+// describes the schema.
 //
 // With -check, detsched checks that the tests can fail: it plants one
 // mistake at a time in the code under test, such as a dropped lock or an
@@ -77,6 +88,8 @@ var (
 	procs    = flag.Int("p", max(runtime.NumCPU()-1, 1), "run this many programs at once")
 	seedBase = flag.Uint64("seed-base", 0, "add `n` to every seed after seed 1, so machines searching together run disjoint seeds")
 	execFlag = flag.String("exec", "", "run this prebuilt `binary` in the current directory instead of building a package")
+	seedsFlg = flag.Bool("seeds", false, "run seeds -seed-base+1, +2, and on, each from its start, without searching: no forked or directed runs")
+	jsonFlag = flag.String("json", "", "also write the search's events to `file`, one JSON object per line (see the README)")
 	checkFlg = flag.Bool("check", false, "check that the tests can fail: plant one mistake at a time in the code under test, run -n runs (default 100) of each, and report which no run caught")
 )
 
@@ -100,6 +113,10 @@ func main() {
 		pkg = flag.Arg(0)
 	}
 	if *checkFlg {
+		if *jsonFlag != "" || *seedsFlg {
+			fmt.Fprintf(os.Stderr, "detsched: -check takes no -json or -seeds\n")
+			os.Exit(2)
+		}
 		if *execFlag != "" {
 			fmt.Fprintf(os.Stderr, "detsched: -check builds the package, so it takes no -exec\n")
 			os.Exit(2)
@@ -112,12 +129,27 @@ func main() {
 		}
 		os.Exit(code)
 	}
+	var events *jsonWriter
+	if *jsonFlag != "" {
+		var err error
+		if events, err = newJSONWriter(*jsonFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "detsched: -json: %v\n", err)
+			os.Exit(2)
+		}
+	}
 	s, err := newSearch(pkg, *execFlag, *runFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "detsched: %v\n", err)
+		events.write("end", struct {
+			ExitStatus int    `json:"exit_status"`
+			Error      string `json:"error"`
+		}{2, strings.TrimSpace(err.Error())})
+		events.close()
 		os.Exit(2)
 	}
+	s.json = events
 	s.seedBase = *seedBase
+	s.seeds, s.noFork = *seedsFlg, *seedsFlg
 	s.timeout = *timeout
 	s.workers = max(*procs, 1)
 	// For measuring the search: run only fresh, cell, or directed
@@ -142,6 +174,7 @@ func main() {
 		ctx, cancel = context.WithTimeout(ctx, *duration)
 		defer cancel()
 	}
+	s.jsonStart(*runFlag, *seeds, *duration)
 	err = s.run(ctx, *seeds)
 	s.mu.Lock()
 	failed := len(s.groups) > 0
@@ -157,11 +190,19 @@ func main() {
 	}
 	s.summary(os.Stdout, true)
 	s.writeSummary(true)
+	code := 0
+	if err != nil {
+		code = 2
+	} else if failed {
+		code = 1
+	}
+	s.jsonEnd(code, err)
+	events.close()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "detsched: %v\n", err)
 		os.Exit(2)
 	}
-	if len(s.groups) > 0 {
+	if failed {
 		os.Exit(1)
 	}
 	// No failure: keep only the summary, whose path the search printed
@@ -271,6 +312,8 @@ type search struct {
 	attribSem   chan bool               // held by the group whose faults are being found (see attrib.go)
 	attribWG    sync.WaitGroup          // the groups whose faults are being found
 	inCheck     bool                    // a search of -check's
+	json        *jsonWriter             // where -json writes events, or nil
+	seeds       bool                    // run seeds seedBase+1, +2, and on without forking (-seeds)
 }
 
 // An assertCount counts the runs that reached an assertion, and the runs
@@ -286,7 +329,7 @@ type group struct {
 	sig    string           // the signature of the first run
 	runs   int              // runs that failed this way
 	logs   []string         // the kept logs
-	replay string           // the command that replays the first run
+	replay string           // the command line that replays the first run
 	debug  string           // the same under Delve
 	status string           // whether running replay reproduced the failure
 	index  int              // its number, from 1, which its logs' names have
@@ -294,15 +337,36 @@ type group struct {
 	left   string           // for a deadlock at the end of the test, the goroutines left
 	where  string           // for a run that did not finish, the goroutines its last switches went to
 	attrib string           // the faults it needs, once found (see attrib.go), or ""
+
+	// The commands of replay and debug, which they are the lines of (see
+	// setReplay), and the first run.
+	replayCmd, debugCmd replayCmd
+	first               runRef
 }
 
 // An also is a failure of another kind in a group's runs, such as a
 // symptom of the failure the runs fail with first.
 type also struct {
-	sig    string // its signature in the first run that had it
-	runs   int
-	log    string // the log of that run
-	replay string // the command that replays that run
+	sig       string // its signature in the first run that had it
+	runs      int
+	log       string    // the log of that run
+	replay    string    // the command line that replays that run
+	replayCmd replayCmd // its command
+}
+
+// A runRef names a run: its seed, its branch points from the seed, and
+// the composer branch it failed in, or 0.
+type runRef struct {
+	seed   uint64
+	tape   string
+	branch int
+}
+
+// setReplay sets g's replay and debug lines to those of r. The caller
+// holds s.mu.
+func (g *group) setReplay(s *search, r *result) {
+	g.replayCmd, g.debugCmd = s.replayCommand(r, false), s.replayCommand(r, true)
+	g.replay, g.debug = g.replayCmd.line(), g.debugCmd.line()
 }
 
 // keepLogs is how many logs of each group a search keeps.
@@ -644,15 +708,83 @@ func addSearch(env []string, fields ...string) []string {
 
 func (s *search) temp(name string) string { return filepath.Join(s.out, name) }
 
-// replayLine returns a shell command line that runs r again, in place of
-// the branch of a composer timeline it failed in, if any. With debug, it
-// runs it under Delve instead: --disable-aslr because on macOS the
-// program re-executes itself without ASLR, which loses Delve's
-// breakpoints. A run that did not finish replays with the same limits,
-// so that it stops at the same switch, and one stopped from outside stops
-// at the switch it was stopped at; one stopped because memory ran out
-// replays in a subshell that caps its memory, on Linux.
+// replayLine returns a shell command line that runs r again (see
+// replayCommand). With debug, it runs it under Delve instead.
 func (s *search) replayLine(r *result, debug bool) string {
+	return s.replayCommand(r, debug).line()
+}
+
+// A replayCmd is a command that runs a run again: what its replay or
+// debug line runs, and what -json writes of it.
+type replayCmd struct {
+	Cwd   string   `json:"cwd"`
+	Set   envList  `json:"set"`   // variables to set, in the line's order
+	Unset []string `json:"unset"` // variables to remove from the environment
+	Argv  []string `json:"argv"`
+	// The memory to cap the run's address space at, in KiB, with
+	// ulimit -v, or 0.
+	MemoryLimitKiB uint64 `json:"memory_limit_kib,omitempty"`
+}
+
+// An envList is variables as "KEY=value", which JSON writes as an object
+// in their order.
+type envList []string
+
+func (e envList) MarshalJSON() ([]byte, error) {
+	var b bytes.Buffer
+	b.WriteByte('{')
+	for i, kv := range e {
+		k, v, _ := strings.Cut(kv, "=")
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.Write(marshal(k))
+		b.WriteByte(':')
+		b.Write(marshal(v))
+	}
+	b.WriteByte('}')
+	return b.Bytes(), nil
+}
+
+// line returns c as a shell command line.
+func (c replayCmd) line() string {
+	var b strings.Builder
+	if c.MemoryLimitKiB > 0 {
+		fmt.Fprintf(&b, "(ulimit -v %d; ", c.MemoryLimitKiB)
+	}
+	fmt.Fprintf(&b, "cd %s && ", quote(c.Cwd))
+	if len(c.Unset) > 0 {
+		b.WriteString("env")
+		for _, k := range c.Unset {
+			b.WriteString(" -u " + quote(k))
+		}
+		b.WriteString(" ")
+	}
+	for _, e := range c.Set {
+		k, v, _ := strings.Cut(e, "=")
+		fmt.Fprintf(&b, "%s=%s ", k, quote(v))
+	}
+	for i, a := range c.Argv {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(quote(a))
+	}
+	if c.MemoryLimitKiB > 0 {
+		b.WriteString(")")
+	}
+	return b.String()
+}
+
+// replayCommand returns the command that runs r again, in place of the
+// branch of a composer timeline it failed in, if any. With debug, it runs
+// it under Delve instead: --disable-aslr because on macOS the program
+// re-executes itself without ASLR, which loses Delve's breakpoints. A run
+// that did not finish replays with the same limits, so that it stops at
+// the same switch, and one stopped from outside stops at the switch it
+// was stopped at; one stopped because memory ran out replays with its
+// memory capped, on Linux.
+func (s *search) replayCommand(r *result, debug bool) replayCmd {
 	branch, trace := r.stopped()
 	env := []string{fmt.Sprintf("GODETSEED=%d", r.seed), fmt.Sprintf("GODETBRANCH=%d", branch)}
 	if r.tape != "" {
@@ -691,7 +823,7 @@ func (s *search) replayLine(r *result, debug bool) string {
 	// others, such as NO_COLOR, which can change the schedule: of those
 	// seed 1 read, only the ones whose presence changed its schedule (see
 	// findUnset).
-	var unset []string
+	unset := []string{}
 	for _, k := range s.envRead(r) {
 		if slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, k+"=") }) {
 			continue
@@ -704,48 +836,37 @@ func (s *search) replayLine(r *result, debug bool) string {
 			env = append(env, k+"="+v)
 		}
 	}
-	var b strings.Builder
-	capped := r.outOfMem && r.memAtStop > 0 && !debug && runtime.GOOS == "linux"
-	if capped {
+	c := replayCmd{Cwd: s.dir, Set: env, Unset: unset, Argv: []string{s.bin}}
+	if r.outOfMem && r.memAtStop > 0 && !debug && runtime.GOOS == "linux" {
 		// The address space of a run starts at about 1.3 GB.
-		fmt.Fprintf(&b, "(ulimit -v %d; ", (r.memAtStop+r.memAtStop/4+3<<29)>>10)
-	}
-	fmt.Fprintf(&b, "cd %s && ", quote(s.dir))
-	if len(unset) > 0 {
-		b.WriteString("env")
-		for _, k := range unset {
-			b.WriteString(" -u " + quote(k))
-		}
-		b.WriteString(" ")
-	}
-	for _, e := range env {
-		k, v, _ := strings.Cut(e, "=")
-		fmt.Fprintf(&b, "%s=%s ", k, quote(v))
+		c.MemoryLimitKiB = (r.memAtStop + r.memAtStop/4 + 3<<29) >> 10
 	}
 	if debug {
-		b.WriteString("dlv exec --disable-aslr ")
+		c.Argv = []string{"dlv", "exec", "--disable-aslr", s.bin}
+		if len(s.args) > 0 {
+			c.Argv = append(c.Argv, "--")
+		}
 	}
-	b.WriteString(quote(s.bin))
-	if debug && len(s.args) > 0 {
-		b.WriteString(" --")
-	}
-	for _, a := range s.args {
-		b.WriteString(" " + quote(a))
-	}
-	if capped {
-		b.WriteString(")")
-	}
-	return b.String()
+	c.Argv = append(c.Argv, s.args...)
+	return c
 }
 
 // debugLine returns g's debug line, which runs the build without
 // optimizations once it has run seed 1's schedule, so that dlv reads
 // every local. The caller holds s.mu.
 func (s *search) debugLine(g *group) string {
-	if s.debugBin == "" {
-		return g.debug
+	return s.debugCommand(g).line()
+}
+
+// debugCommand returns the command of g's debug line. The caller holds
+// s.mu.
+func (s *search) debugCommand(g *group) replayCmd {
+	c := g.debugCmd
+	if s.debugBin != "" {
+		c.Argv = slices.Clone(c.Argv)
+		c.Argv[3] = s.debugBin // after dlv exec --disable-aslr
 	}
-	return strings.Replace(g.debug, "dlv exec --disable-aslr "+quote(s.bin), "dlv exec --disable-aslr "+quote(s.debugBin), 1)
+	return c
 }
 
 // buildDebug builds the program with -gcflags=all=-N -l, for debug lines,
@@ -1372,7 +1493,8 @@ func waitExited(pid int) error {
 }
 
 // run runs the base run, then launches until ctx is done or, if n is not
-// 0, n runs have run.
+// 0, n runs have run. With s.seeds, the base run is not one of them:
+// the runs are seeds seedBase+1 to seedBase+n.
 func (s *search) run(ctx context.Context, n uint64) error {
 	s.start = time.Now()
 	ctx, cancel := context.WithCancel(ctx)
@@ -1396,7 +1518,11 @@ func (s *search) run(ctx context.Context, n uint64) error {
 	jobs := make(chan uint64)
 	go func() {
 		defer close(jobs)
-		for i := uint64(2); n == 0 || i <= n; i++ {
+		first := uint64(2) // seed 1 was the base run
+		if s.seeds {
+			first = 1
+		}
+		for i := first; n == 0 || i <= n; i++ {
 			select {
 			case jobs <- s.seedBase + i:
 			case <-ctx.Done():
@@ -1577,6 +1703,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	}
 	if r.outOfMem {
 		s.outOfMem++
+		s.jsonRun(r, 0, "")
 		if s.bigStopped != nil && r.memAtStop <= s.bigStopped.memAtStop {
 			s.mu.Unlock()
 			return nil
@@ -1594,6 +1721,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		if e, ok := extentOf(r.output); ok {
 			s.longest.grow(e)
 		}
+		s.jsonRun(r, 0, "")
 		s.mu.Unlock()
 		return nil
 	}
@@ -1607,7 +1735,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	g := s.byKey[r.key()]
 	first := g == nil
 	if first {
-		g = &group{key: r.key(), sig: r.signature(), replay: s.replayLine(r, false), debug: s.replayLine(r, true), status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}}
+		branch, _ := r.stopped()
+		g = &group{key: r.key(), sig: r.signature(), first: runRef{r.seed, r.tape, branch}, status: "replaying", index: len(s.groups) + 1, also: map[string]*also{}}
+		g.setReplay(s, r)
 		if strings.Contains(g.sig, "blocked goroutines remain") {
 			g.left = leftGoroutines(r.output)
 		}
@@ -1623,7 +1753,8 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		s.kinds[g.key] = &also{sig: g.sig}
 	}
 	s.kinds[g.key].runs++
-	line := s.replayLine(r, false)
+	cmd := s.replayCommand(r, false)
+	line := cmd.line()
 	var news []*also  // kinds no run of the group had before
 	var fresh []*also // kinds no run had before
 	for _, f := range r.failures() {
@@ -1638,7 +1769,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 		}
 		s.kinds[k].runs++
 		if g.also[k] == nil {
-			g.also[k] = &also{sig: f, replay: line}
+			g.also[k] = &also{sig: f, replay: line, replayCmd: cmd}
 			news = append(news, g.also[k])
 		}
 		g.also[k].runs++
@@ -1653,6 +1784,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	for _, a := range news {
 		a.log = log
 	}
+	s.jsonRun(r, g.index, log)
 	// Another kind of failure, after the group's, may be another bug,
 	// which its run's replay line shows. The group's first run prints
 	// its other kinds under the group's own lines, once replayed.
@@ -1700,7 +1832,7 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 					s.vars = append(s.vars, v)
 				}
 			}
-			g.replay, g.debug = s.replayLine(r, false), s.replayLine(r, true)
+			g.setReplay(s, r)
 			s.mu.Unlock()
 			if err := writeLog(g.replay); err != nil {
 				return err
@@ -1952,7 +2084,7 @@ func (s *search) fallbacks() []fallback {
 			"replay lines may not reproduce failures in another shell",
 			"run replay lines from the shell that ran detsched")
 	}
-	if m := setupAgain.FindSubmatch(s.baseOutput); m != nil {
+	if m := setupAgain.FindSubmatch(s.baseOutput); m != nil && !s.seeds {
 		others := strings.Fields(string(m[2]))
 		add("tests-share-a-fork-point", fmt.Sprintf("tests after %s complete setup in the same process (%s), but only the first setup of a process is a fork point", m[1], strings.Join(others, ", ")),
 			"every run pays the later tests' setup again, with faults on from the first setup's end",
@@ -2084,7 +2216,9 @@ func (s *search) summary(w io.Writer, final bool) {
 			mix = append(mix, fmt.Sprintf("%d %s", a.launches, armNames[i]))
 		}
 	}
-	if len(mix) > 0 {
+	if s.seeds {
+		fmt.Fprintf(w, "detsched: runs started: %d seeds from %d, each from its start (-seeds)\n", s.arms[armFresh].launches, s.seedBase+1)
+	} else if len(mix) > 0 {
 		fmt.Fprintf(w, "detsched: runs started: %s; %d cells kept; features count %s\n", strings.Join(mix, ", "), len(s.cells), s.novelty)
 	}
 	if len(s.vars) > 0 {

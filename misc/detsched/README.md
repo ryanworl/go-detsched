@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched36
+v=go1.27.4-detsched37
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -82,7 +82,8 @@ with fallbacks finds less, or prints lines that may not replay.
 Then the statistics:
 
 - how runs started (fresh seeds, forks of cells, runs directed at a
-  predicted deadlock), and what counts as a feature;
+  predicted deadlock), and what counts as a feature, or with `-seeds`,
+  which seeds ran;
 - the variables of `detsched`'s environment that the schedule depends on,
   which replay lines set;
 - lock orders that predict a deadlock, with the runs directed at them and
@@ -575,6 +576,20 @@ All are optional.
 - `-seed-base n` adds `n` to every seed after seed 1, so that machines
   splitting a search run disjoint seeds: shard `i` of a search with
   `-seed-base $((i << 32))` runs seeds `i<<32+2`, `i<<32+3`, and on.
+- `-seeds` runs seeds `-seed-base`+1, +2, and on, each once from its
+  start, instead of searching: no run is forked from a stopped program,
+  and none is directed at a predicted deadlock. Use it for a failure rate
+  that compares across commits, or for failures that each replay from
+  their seed alone (`GODETSEED`, with the variables the replay line
+  sets). A composer timeline still forks its branches, as it does when
+  the binary runs on its own. Everything else is as in a search: `-p`,
+  `-timeout`, `-duration`, `-n` (exactly `n` seeds), `-exec`, the
+  variables replay lines set and unset, the `fail-*.log` files, the
+  groups with their replay and debug lines checked in a new shell, the
+  summary, which says which seeds ran, and `-json`, whose `start` has
+  `"mode":"seeds"`. Seed 1 still runs first, as in a search, to check its
+  schedule and find the variables it reads, but it is not one of the
+  runs.
 - `-exec binary` runs a prebuilt binary in the current directory instead
   of building a package, so that one job builds it and every shard runs
   the same file. `detsched` runs a copy it keeps, which replay lines
@@ -585,8 +600,76 @@ All are optional.
   `-n`, search the package with each instead, giving one its own go.mod
   (`GOFLAGS=-modfile=go.before.mod detsched -n 3000 .`), so that debug
   lines keep the build without optimizations.
+- `-json file` also writes the search's events to `file`, one JSON
+  object per line, for a program such as a CI job to read; see
+  [JSON output](#json-output). The text output stays the same.
 - `-check` checks that the tests can fail; see
   [Checking that the tests can fail](#checking-that-the-tests-can-fail).
+
+## JSON output
+
+`-json file` writes one JSON object per line to `file` as the search
+goes, alongside the text output, which does not change. Every object has
+`event`, its kind, and `time`, when it was written (RFC 3339, UTC).
+Times and durations are in seconds, in fields ending in `_s`. A wrapper
+checks `"schema":1` on the `start` event: the schema's number changes
+when a field changes its meaning or goes away, and new fields and events
+may come without a change, so read the fields you know and ignore the
+rest.
+
+The events come in this order: `start`, then a `run` for every run as it
+is recorded, then at the end, a `fallback` for each fallback, a `group`
+for each group, and `end`, which is always the last. If `detsched` fails
+before the search starts, such as when the package does not build, the
+file has only `end`, with `exit_status` 2 and `error`.
+
+```json
+{"event":"start","time":"...","schema":1,"detsched":"go1.27.4-detsched37","mode":"search","package":".","binary":"/tmp/detsched-123/store.test","binary_sha256":"8aef...","cwd":"/src/store","args":["-test.run=^TestStore$"],"run":"^TestStore$","p":7,"seed_base":0,"n":1000,"timeout_s":600,"out":"/tmp/detsched-123"}
+{"event":"run","time":"...","seed":7,"tape":"45:7,51:9","arm":"cell","forked":true,"result":"fail","exit_code":1,"trace":"0x180bd2a3779a224","switches":948814,"syncs":27753685,"machine":"p4096.f7ffdffff.h1f8bfbff.g2.s606a6","elapsed_s":41.2,"signature":"detsched: assertion failed: ...","branch":0,"group":1,"log":"/tmp/detsched-123/fail-1-1.log"}
+{"event":"fallback","time":"...","kind":"seed-1-ran-two-schedules","what":"...","cost":"...","fix":"...","docs":".../README.md#seed-1-ran-two-schedules"}
+{"event":"group","time":"...","id":1,"signature":"...","message":"...","details":"...","runs":147,"logs":["..."],"first":{"seed":7,"tape":"45:7,51:9","branch":0,"log":"..."},"replay":{"cwd":"/src/store","set":{"GODETSEED":"7","GODETBRANCH":"0","GODETSEARCH":"tape=45:7,51:9 trace=0x180bd2a3779a224 machine=..."},"unset":["NO_COLOR"],"argv":["/tmp/detsched-123/store.test","-test.run=^TestStore$"]},"replay_line":"cd /src/store && env -u NO_COLOR GODETSEED=7 ...","debug":{...,"argv":["dlv","exec","--disable-aslr","/tmp/detsched-123/debug/store.test","--","-test.run=^TestStore$"]},"debug_line":"...","reproduced":true,"replay_status":"reproduced","also":[{"signature":"...","runs":14,"log":"...","replay":{...}}],"faults":"needs: sim.disk.fsyncfail ..."}
+{"event":"end","time":"...","runs":1000,"passed":853,"failed":147,"stopped":0,"signatures":1,"features":422,"elapsed_s":1200.4,"first_failure":{"run":6,"after_s":13.3},"slowest_pass_s":51.4,"slowest_fail_s":48.0,"exit_status":1}
+```
+
+- `start`: `detsched`'s version; `mode`, `search`, or `seeds` with
+  `-seeds`; the package
+  argument (or the `-exec` binary), the binary the runs run and its
+  SHA-256, the directory they run in, and its arguments; the flags
+  (`n` and `duration_s` only when set); and `out`, the directory of the
+  logs and the summary.
+- `run`: one per run the counts count, passing ones included, in the
+  order the runs ended. `seed` is `GODETSEED`; `tape`, the branch points
+  of a run forked from a stopped program (`forked`), from which its
+  schedule departs; `yield`, the sites a run directed at a predicted
+  deadlock yields at; `arm`, how it started (`fresh`, `cell`, or
+  `directed`, see [the search](#the-search)). `result` is `pass`,
+  `fail`, or `stopped`, for a run stopped because memory ran low, which
+  counts as neither. `trace`, `switches`, and `syncs` are from the run's
+  first trace line, which is that of a composer branch whose failure
+  came first; two machines that run the same seeds of the same binary
+  compare them, with `machine`, the machine ID the runtime reports. A
+  failing run has its `signature`, the composer `branch` it failed in
+  (0 for the timeline), its `group`, and its `log` if kept.
+- `fallback`: `kind` is the anchor of its section under
+  [Fallbacks](#fallbacks), which does not change; `what`, `cost`, and
+  `fix` are the summary's text.
+- `group`: in the order of the text's groups, with the same counts, logs,
+  and `faults`, `left`, and `where` lines. `replay` is the command the
+  text's replay line runs, from which `detsched` writes that line
+  (`replay_line`), so they always agree: run `argv` in `cwd`, with the
+  variables in `unset` removed from the environment and those in `set`
+  set. When `memory_limit_kib` is there, the line caps the run's address
+  space with `ulimit -v` first. `debug` is the same for the debug line.
+  `reproduced` says whether the replay reproduced the failure in a new
+  shell, and `replay_status` says what it did otherwise, as the text's
+  `WARNING`. `also` has the group's other kinds of failure, each with the
+  replay of its first run.
+- `end`: the totals (`stopped` are the runs memory ran out in), the run
+  and time of the first failure, the slowest passing and failing runs,
+  `exit_status`, the status `detsched` exits with (0 if no run failed, 1
+  if some run did, 2 for an error), and `error`, the error that ended
+  the search, if one did. A second interrupt kills `detsched` before it
+  writes `end`.
 
 ## Checking that the tests can fail
 
@@ -663,10 +746,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched36:
+and release N's version is v0.N.0, so with go1.27.4-detsched37:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.36.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.37.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
