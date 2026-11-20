@@ -28,8 +28,9 @@ import (
 //
 //   - fresh: a new seed. A program that reports the end of its setup
 //     (detsched/sdk/lifecycle) runs setup in a few roots, fork servers
-//     stopped right after it, and each fresh launch forks one with a new
-//     branch seed, which reseeds everything after setup; a program that
+//     each stopped right after its own setup, and each fresh launch forks
+//     one with a new branch seed, which reseeds everything after setup,
+//     including what setup's end draws; a program that
 //     doesn't runs each fresh seed from its beginning, without forking.
 //   - cell: a fork of a cell, a state some run reached first (Go-Explore).
 //   - directed: a new seed, run from its beginning, whose goroutines yield
@@ -68,8 +69,8 @@ var armNames = [numArms]string{"fresh", "cell", "directed"}
 const (
 	maxCells   = 1024 // cells the archive keeps; the least productive goes first
 	liveCells  = 8    // stopped programs of cells kept at once
-	setupRoots = 4    // roots stopped after setup that fresh launches fork
-	rootForks  = 64   // fresh launches a setup root serves before a new seed replaces it
+	setupRoots = 8    // roots stopped after setup that fresh launches fork
+	rootForks  = 32   // fresh launches a setup root serves before a new seed replaces it
 )
 
 // An arm's statistics, decayed so that recent launches count most.
@@ -441,7 +442,7 @@ func (s *search) rootLaunch(ctx context.Context, seed uint64) (float64, error) {
 		}
 	}
 	if len(s.pool) < setupRoots {
-		root = &cell{seed: seed, at: s.stop, pinned: true}
+		root = &cell{seed: seed, pinned: true} // at: its setup's end, once stopped
 		s.pool = append(s.pool, root)
 	}
 	root.chosen++
@@ -677,8 +678,25 @@ func (s *search) stopCell(ctx context.Context, c *cell, p *proc) error {
 	s.mu.Unlock()
 	root := &proc{srv: srv, pid: pid}
 	p.srv, p.pid, p.tape = srv, pid, c.tape
-	if c.at > 0 {
-		ok, err := s.runSrv(ctx, srv, pid, start, func() (bool, error) { return srv.run(c.at) })
+	s.mu.Lock()
+	at := c.at
+	s.mu.Unlock()
+	if at > 0 || c.pinned {
+		run := func() (bool, error) { return srv.run(at) }
+		if at == 0 {
+			// A setup root stops at its own setup's end, not seed 1's:
+			// another seed's setup ends at another switch, and forks past
+			// its end would share what it drew there, such as the
+			// nodes' clock drift, while forks before it would run the
+			// rest of setup again.
+			run = srv.runSetup
+		}
+		ok, err := s.runSrv(ctx, srv, pid, start, run)
+		if err == nil && ok && at == 0 {
+			s.mu.Lock()
+			c.at = srv.at
+			s.mu.Unlock()
+		}
 		if err == errHung {
 			err = errCanceled // only a run to a cell, whose output is not kept
 		}

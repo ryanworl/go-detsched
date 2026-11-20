@@ -38,6 +38,7 @@ const (
 	forkReady   = 5
 
 	forkRunStopNovel = 1
+	forkRunStopSetup = 2
 
 	forkWithControl  = 1
 	forkWithFeedback = 2
@@ -178,6 +179,13 @@ func (s *forkServer) run(n uint64) (bool, error) {
 func (s *forkServer) runNovel() (ok bool, feature int, err error) {
 	ok, novel, err := s.runFlags(0, forkRunStopNovel)
 	return ok, int(novel) - 1, err
+}
+
+// runSetup lets the program run until the switch right after its setup
+// completes (lifecycle.SetupComplete), or false if it ended first.
+func (s *forkServer) runSetup() (bool, error) {
+	ok, _, err := s.runFlags(0, forkRunStopSetup)
+	return ok, err
 }
 
 func (s *forkServer) runFlags(n, flags uint64) (bool, uint64, error) {

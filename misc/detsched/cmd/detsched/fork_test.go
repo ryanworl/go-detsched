@@ -961,6 +961,31 @@ func TestSearchDrift(t *testing.T) {
 	}
 }
 
+// TestSearchSetupRoots checks that each setup root stops right after its
+// own seed's setup, not seed 1's, so that the runs forked from it each
+// draw what setup's end draws. setupdraw's setup takes longer in seed 1
+// than in most seeds, and fails 1 in 16 runs on a draw at setup's end;
+// roots stopped at seed 1's setup's end left each root's runs with one
+// draw, so that they failed all together or not at all.
+func TestSearchSetupRoots(t *testing.T) {
+	s := runSearch(t, "../../testdata/setupdraw", 256)
+	if s.failed < 4 || s.failed > 48 {
+		t.Errorf("%d of %d runs failed, want about 1 in 16:\n%s", s.failed, s.runs, searchReport(s))
+	}
+	g := findGroup(s, "TestDraw")
+	if g == nil {
+		t.Fatalf("no failure:\n%s", searchReport(s))
+	}
+	m := regexp.MustCompile(`GODETSEED=(\d+) .*tape=(\d+):`).FindStringSubmatch(g.replay)
+	if m == nil {
+		t.Fatalf("want a run forked from a setup root: %s", g.replay)
+	}
+	out, _ := s.plain(atou(m[1])).CombinedOutput()
+	if setup := setupLine.FindSubmatch(out); setup == nil || atou(m[2]) != atou(string(setup[1]))+1 {
+		t.Errorf("the run forked at switch %s, want right after its seed's own setup (%q):\n%s", m[2], setup, g.replay)
+	}
+}
+
 // TestSearchShard checks one shard of a search spread over machines: it
 // runs a prebuilt binary in the current directory, from fresh seeds past
 // -seed-base, and each failure's command replays it with that seed and a

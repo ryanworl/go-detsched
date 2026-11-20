@@ -201,7 +201,7 @@ type search struct {
 
 	// Set up by prepare.
 	setup    bool   // the program reports the end of its setup
-	stop     uint64 // the switch right after setup, which setup roots stop at
+	stop     uint64 // the switch right after seed 1's setup
 	novelty  string // what counts as a new feature
 	seen     []byte // features recorded so far, shared with every fork
 	seenFile *os.File

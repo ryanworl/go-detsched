@@ -37,6 +37,7 @@ const (
 // Flags of detForkRun.
 const (
 	detForkRunStopNovel = 1 // also stop at the switch after the first feature not in the seen map
+	detForkRunStopSetup = 2 // also stop at the switch after setup completes (see detSDKSetupComplete)
 )
 
 // Flags of detForkBranch, saying which descriptors follow stdout and
@@ -97,7 +98,7 @@ func detForkLoop(pp *p, here uint64) {
 		if !ok {
 			// The driver is gone: run to the end without stopping.
 			closefd(detFork.fd)
-			detFork.fd, detFork.stop = 0, 0
+			detFork.fd, detFork.stop, detFork.setup = 0, 0, false
 			return
 		}
 		switch cmd[0] {
@@ -107,6 +108,7 @@ func detForkLoop(pp *p, here uint64) {
 				detFork.stop = 0
 			}
 			detFeed.stopNovel = cmd[2]&detForkRunStopNovel != 0
+			detFork.setup = cmd[2]&detForkRunStopSetup != 0 && detSetup == 0
 			detFeed.novel = 0
 			return
 		case detForkBranch:
@@ -245,7 +247,7 @@ func detForkClone(pp *p, b detBranchPoint, flags uint64, fds []int32) (pid int64
 	closefd(fds[0])
 	closefd(fds[1])
 	closefd(detFork.fd)
-	detFork.fd, detFork.stop, detFork.branched = 0, 0, b.switchN
+	detFork.fd, detFork.stop, detFork.setup, detFork.branched = 0, 0, false, b.switchN
 	fds = fds[2:]
 	if flags&detForkWithControl != 0 {
 		detFork.fd, fds = fds[0], fds[1:]
@@ -383,7 +385,7 @@ func detsimBranch(msg string) int {
 		detSDKBranch()
 		return detBranchN
 	}
-	if detFork.fd != 0 && (detFork.stop != 0 || detFeed.stopNovel) {
+	if detFork.fd != 0 && (detFork.stop != 0 || detFeed.stopNovel || detFork.setup) {
 		// The driver runs this process to a stop, to fork runs from it
 		// there: a search's setup root, or the program of a kept cell.
 		// Its output goes nowhere, and a branch's failure here would be
@@ -408,7 +410,7 @@ func detsimBranch(msg string) int {
 		if detFork.fd != 0 {
 			closefd(detFork.fd) // the driver's, as are the feedback descriptor and the seen map
 		}
-		detFork.fd, detFork.stop = 0, 0
+		detFork.fd, detFork.stop, detFork.setup = 0, 0, false
 		if detFeed.out > 0 {
 			closefd(detFeed.out)
 		}

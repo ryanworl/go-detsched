@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched32
+v=go1.27.4-detsched33
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -554,8 +554,10 @@ Each seed runs another schedule: the runtime perturbs the order in which
 goroutines run, choosing for each seed between a random walk and PCT
 (probabilistic concurrency testing) and their parameters. If the program
 reports the end of its setup (`lifecycle.SetupComplete`), `detsched` runs
-setup once in each of a few seeds and forks the stopped processes, each
-fork reseeded right after setup, so fresh seeds don't pay for setup. On
+setup once in each of a few seeds (8 at a time, each forked 32 times),
+stops each process right after its own setup, and forks it, each fork
+reseeded there, so fresh seeds don't pay for setup and draw everything
+from setup's end on anew. On
 top of fresh seeds:
 
 - A run that reaches a state no run reached before makes it a cell. A
@@ -581,10 +583,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched32:
+and release N's version is v0.N.0, so with go1.27.4-detsched33:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.32.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.33.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass

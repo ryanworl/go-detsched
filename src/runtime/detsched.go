@@ -2356,6 +2356,15 @@ func detSDKSetupComplete() {
 		return
 	}
 	detSetup, detSetupTest = detP(getg().m.p.ptr()).switches, detTest
+	if detFork.setup && detFork.fd != 0 {
+		// The driver stops this process here, as a setup root, so that
+		// its runs fork at its own setup's end: at the switch the
+		// gosched below makes, before anything setup's end starts.
+		if detFork.stop == 0 || detFork.stop > detSetup+1 {
+			detFork.stop = detSetup + 1
+		}
+		detFork.setup = false
+	}
 	mcall(gosched_m)
 }
 
@@ -2381,6 +2390,7 @@ func detSDKSetupComplete() {
 var detFork struct {
 	fd       int32  // control socket, or 0
 	stop     uint64 // switch to stop at next, or 0
+	setup    bool   // also stop at the switch after setup completes (detForkRunStopSetup)
 	branched uint64 // switch this process was forked at, or 0
 	lock     mutex  // held by the watchdog while it checks, and while forking
 	watchdog muintptr
