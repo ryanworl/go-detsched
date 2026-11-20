@@ -215,7 +215,9 @@ func (s *search) countFaults(out []byte) {
 	}
 	s.simRuns++
 	injected := injectedFaults(out)
-	if len(injected) == 0 {
+	// The clock drift every node draws when setup completes runs in the
+	// background: a run with only it tested the paths of no fault.
+	if !slices.ContainsFunc(injected, func(f string) bool { return f != "fault: sim.clock.drift" }) {
 		s.noFaultRuns++
 		if slices.Contains(faultsOf(out), "nemesis: a run without faults") {
 			s.calmRuns++

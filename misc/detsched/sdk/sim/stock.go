@@ -13,29 +13,30 @@ const supported = false
 func register()   {}
 func unregister() {}
 
-func runtime_node() int32                { return 0 }
-func runtime_setNode(int32) int32        { return 0 }
-func runtime_call(f func())              { f() }
-func runtime_crash(int32)                {}
-func runtime_halt()                      { select {} }
-func runtime_after(int64, uint64)        {}
-func runtime_now() int64                 { return 0 }
-func runtime_ready(uintptr, int32)       {}
-func runtime_rand() uint64               { return 0 }
-func runtime_epoch() uint64              { return 0 }
-func runtime_branch(string) int          { return 0 }
-func runtime_pause(int32)                {}
-func runtime_resume(int32)               {}
-func runtime_count(int32) int            { return 0 }
-func runtime_stacks(int32, []byte) int   { return 0 }
-func runtime_clock(bool, int64)          {}
-func runtime_onPanic(func(int32, any))   {}
-func runtime_busyOn(bool)                {}
-func runtime_setCPU(int32, int32, int32) {}
-func runtime_nodeName(int32, string)     {}
-func runtime_busyAdd(int64)              {}
-func runtime_wait(int64)                 {}
-func runtime_wake(int32)                 {}
+func runtime_node() int32                                 { return 0 }
+func runtime_setNode(int32) int32                         { return 0 }
+func runtime_call(f func())                               { f() }
+func runtime_crash(int32)                                 {}
+func runtime_halt()                                       { select {} }
+func runtime_after(int64, uint64)                         {}
+func runtime_now() int64                                  { return 0 }
+func runtime_ready(uintptr, int32)                        {}
+func runtime_rand() uint64                                { return 0 }
+func runtime_epoch() uint64                               { return 0 }
+func runtime_branch(string) int                           { return 0 }
+func runtime_pause(int32)                                 {}
+func runtime_resume(int32)                                {}
+func runtime_count(int32) int                             { return 0 }
+func runtime_stacks(int32, []byte) int                    { return 0 }
+func runtime_clock(bool, int64)                           {}
+func runtime_onPanic(func(int32, any))                    {}
+func runtime_busyOn(bool)                                 {}
+func runtime_setCPU(int32, int32, int32)                  {}
+func runtime_setClock(int32, int64, int64, float64, bool) {}
+func runtime_nodeName(int32, string)                      {}
+func runtime_busyAdd(int64)                               {}
+func runtime_wait(int64)                                  {}
+func runtime_wake(int32)                                  {}
 func runtime_busyStats() (uint64, uint64, int64, int64, int32) {
 	return 0, 0, 0, 0, 0
 }

@@ -184,6 +184,8 @@ type Node struct {
 	onStop         []func()
 	cores          int               // its processor's cores; UnlimitedCores
 	speed          float64           // its processor's speed, times the reference core
+	clock          nodeClock         // its clock (see SetClockRate)
+	clockSet       bool              // SetClockRate set its rate, which drift keeps
 	nat            map[uint16]uint16 // with SetNAT, UDP public port by local port
 	natRev         map[uint16]uint16 // local port by public port
 	natNext        uint16            // the next public port to try
@@ -290,6 +292,7 @@ func (w *World) endSetup() {
 	}
 	runtime_call(func() { w.setup = false })
 	w.logEvent("world", "setup complete: faults on")
+	w.drift()
 }
 
 // PanicKind describes a panic that Config.OnPanic gets, by the first line
@@ -452,6 +455,7 @@ func (w *World) AddNode(name, ip string) *Node {
 	}
 	n := &Node{w: w, index: len(w.nodes), name: name, ip: a}
 	n.cores, n.speed = drawCPU()
+	n.clock = nodeClock{anchor: now(), base: now(), rate: 1}
 	runtime_call(func() {
 		n.disk = newDisk(len(w.nodes) + 1)
 		n.disk.mkdirAll(w.tempDir)
@@ -459,6 +463,9 @@ func (w *World) AddNode(name, ip string) *Node {
 		w.nodes = append(w.nodes, n)
 		w.byIP[a] = n
 	})
+	if !w.setup {
+		n.drift()
+	}
 	return n
 }
 
@@ -586,6 +593,7 @@ func (n *Node) Start(f func()) <-chan struct{} {
 	n.starts++
 	runtime_nodeName(inc.handle, n.name+" (start "+strconv.Itoa(n.starts)+")")
 	n.applyCPU()
+	n.applyClock(false)
 	n.w.logEvent(n.name, "start")
 	goAs(inc, func() {
 		f()
@@ -1047,11 +1055,14 @@ var (
 	timeline    = timelineBuf[:0]
 )
 
-// wallNow is the nodes' wall clock, with the world's clock skips, for file
-// times.
+// wallNow is the wall clock of the running goroutine's node, with the
+// world's clock skips, for file times.
 func wallNow() int64 {
 	t := now()
 	if world != nil {
+		if inc := world.incs[runtime_node()]; inc != nil {
+			t = inc.node.clock.local(t)
+		}
 		t += int64(world.skew)
 	}
 	return t

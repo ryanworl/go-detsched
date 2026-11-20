@@ -44,6 +44,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -164,15 +165,15 @@ func main() {
 		os.Exit(1)
 	}
 	// No failure: keep only the summary, whose path the search printed
-	// at its start, the logs it names, and the binary when the summary
-	// has replay lines.
+	// at its start, the logs and seed 1's trace windows it names, and the
+	// binary when the summary has replay lines.
 	keep := s.summaryReplays()
 	s.mu.Lock()
 	debug := s.debugBin != ""
 	s.mu.Unlock()
 	entries, _ := os.ReadDir(s.out)
 	for _, e := range entries {
-		if e.Name() != "summary" && !strings.HasSuffix(e.Name(), ".log") && !(keep && (filepath.Join(s.out, e.Name()) == s.bin || e.Name() == "debug" && debug)) {
+		if e.Name() != "summary" && !strings.HasSuffix(e.Name(), ".log") && !strings.HasSuffix(e.Name(), ".dettrace") && !(keep && (filepath.Join(s.out, e.Name()) == s.bin || e.Name() == "debug" && debug)) {
 			os.RemoveAll(filepath.Join(s.out, e.Name()))
 		}
 	}
@@ -227,7 +228,7 @@ type search struct {
 	lowMem      bool         // memory ran low, which has been reported
 	baseTrace   string       // the trace line of the base run, seed 1
 	unstable    string       // how seed 1 ran two schedules, or ""
-	newShell    bool         // seed 1 runs another schedule in a new shell, for variables findVars did not find
+	newShell    string       // that seed 1 runs another schedule in a new shell, for variables findVars did not find, and where, or ""
 	unsetTried  []string     // variables seed 1 read without having them, tried set
 	unset       []string     // those of them whose presence changes its schedule
 	rechecked   sync.Once    // runs recheck
@@ -761,13 +762,13 @@ func (s *search) buildDebug(ctx context.Context) {
 	// watchdog, while a build that runs another schedule does so every
 	// time. A run guardMem stopped when memory ran low says nothing of
 	// its schedule.
-	for try := 0; err == nil && try < 3 && (r == nil || r.outOfMem || r.trace() != s.baseTrace); try++ {
+	for try := 0; err == nil && try < 3 && (r == nil || s.cutShort(r) != "" || r.trace() != s.baseTrace); try++ {
 		cmd := s.plain(1, append(addSearch(nil, "feedback=1"), "GODETBRANCH=0")...)
 		cmd.Path, cmd.Args[0] = bin, bin
 		r, err = s.exec(context.WithoutCancel(ctx), cmd)
 	}
 	var where string
-	if err == nil && !r.outOfMem && r.trace() != s.baseTrace {
+	if err == nil && s.cutShort(r) == "" && r.trace() != s.baseTrace {
 		where = s.debugDivergence(context.WithoutCancel(ctx), bin)
 	}
 	s.mu.Lock()
@@ -777,9 +778,9 @@ func (s *search) buildDebug(ctx context.Context) {
 	case err != nil:
 		s.debugNote = fmt.Sprintf("building or running it without optimizations failed: %v", truncate(err.Error(), 500))
 		s.notice("debug lines run the optimized binary: building or running it without optimizations failed")
-	case r.outOfMem:
-		s.debugNote = "its runs of seed 1, which check that it runs the same schedules, were stopped three times when memory ran low"
-		s.notice("debug lines run the optimized binary: memory ran low while checking its build without optimizations")
+	case s.cutShort(r) != "":
+		s.debugNote = fmt.Sprintf("its runs of seed 1, which check that it runs the same schedules, were cut short three times: the last was %s", s.cutShort(r))
+		s.notice("debug lines run the optimized binary: its runs of seed 1 were cut short")
 	case r.trace() != s.baseTrace:
 		s.debugNote = fmt.Sprintf("its build without optimizations (-gcflags=all=-N -l) ran seed 1 on another schedule three times (%s, not %s)%s", strings.TrimPrefix(r.trace(), "detsched: "), strings.TrimPrefix(s.baseTrace, "detsched: "), where)
 		s.notice("debug lines run the optimized binary: its build without optimizations runs another schedule")
@@ -798,60 +799,186 @@ func (s *search) codeMods() []string {
 	return s.mods
 }
 
-// debugDivergence runs seed 1 with GODEBUG=dettrace=2 in the optimized
-// build and in bin, the build without optimizations, and returns where
-// their switches first differ, for the note that debug lines keep the
-// optimized binary: the switch, and the tick and the position each build
-// stopped the goroutine that ran before it, which its switch line names.
-// It returns "" if it finds no difference.
+// debugDivergence runs seed 1 in the optimized build and in bin, the
+// build without optimizations, and returns where their switches first
+// differ, for the note that debug lines keep the optimized binary, or ""
+// if it finds no difference.
 func (s *search) debugDivergence(ctx context.Context, bin string) string {
-	// switches returns the run's switch lines, each cut in two: up to
-	// its site, "detsched: switch N kK to goroutine G", and what follows
-	// ", after ".
-	type line struct{ head, after string }
-	switches := func(path string) []line {
-		cmd := s.plain(1, "GODETSEARCH=feedback=1", "GODETBRANCH=0")
-		cmd.Path, cmd.Args[0] = path, path
+	var cmds [2]*exec.Cmd
+	for i, path := range []string{s.bin, bin} {
+		cmds[i] = s.plain(1, "GODETSEARCH=feedback=1", "GODETBRANCH=0")
+		cmds[i].Path, cmds[i].Args[0] = path, path
+	}
+	where, _ := s.divergence(ctx, cmds, [2]string{"debug-optimized.dettrace", "debug-noopt.dettrace"}, [2]string{"optimized", "without optimizations"})
+	if where == "" {
+		return ""
+	}
+	return ": the builds " + where
+}
+
+// The lines of each run's output that divergence keeps: before the first
+// differing switch line, with it, and after it.
+const (
+	windowBefore = 3000
+	windowAfter  = 300
+)
+
+// divergence runs cmds, two runs of seed 1, at once with GODEBUG=dettrace=2,
+// and returns where their switches first differ: "first differ at switch
+// N", with the tick each run was at, the goroutines switched to where
+// they differ, and where each stopped the goroutine that ran before it,
+// which its switch line names, labeled with labels. It returns "" if the
+// switches of both runs are the same as far as the shorter goes. Of each
+// run's output, which can be gigabytes, it keeps only a window in the
+// file in s.out that names says, and returns their paths: the lines
+// around the first difference, or the last lines if there is none, and
+// the run's final trace line.
+func (s *search) divergence(ctx context.Context, cmds [2]*exec.Cmd, names, labels [2]string) (string, [2]string) {
+	var paths, full [2]string
+	var wg sync.WaitGroup
+	for i, cmd := range cmds {
+		paths[i] = s.temp(names[i])
 		godebug := "dettrace=2"
 		if v, ok := lookupEnv(cmd.Env, "GODEBUG"); ok && v != "" {
 			godebug = v + ",dettrace=2"
 		}
 		cmd.Env = append(cmd.Env, "GODEBUG="+godebug)
-		r, err := s.exec(ctx, cmd)
+		f, err := os.CreateTemp(s.out, names[i]+".full")
 		if err != nil {
-			return nil
+			return "", paths
 		}
-		var lines []line
-		for _, l := range strings.Split(string(r.output), "\n") {
-			if strings.HasPrefix(l, "[detsched: ") {
-				break // the output was cut here
+		full[i] = f.Name()
+		defer os.Remove(full[i])
+		defer f.Close()
+		cmd.Stdout = f
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.exec(ctx, cmd)
+		}()
+	}
+	wg.Wait()
+
+	// Compare the runs' switch lines as they are read, keeping each run's
+	// last windowBefore lines.
+	type run struct {
+		sc    *bufio.Scanner
+		n     int      // lines read
+		ring  []string // the last lines read, from ring[n%windowBefore] once full
+		trace string   // the last trace line read
+		at    int      // its line number
+	}
+	var runs [2]*run
+	for i, path := range full {
+		f, err := os.Open(path)
+		if err != nil {
+			return "", paths
+		}
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		sc.Buffer(nil, 1<<20)
+		runs[i] = &run{sc: sc}
+	}
+	read := func(r *run) (string, bool) {
+		if !r.sc.Scan() {
+			return "", false
+		}
+		l := r.sc.Text()
+		if len(r.ring) < windowBefore {
+			r.ring = append(r.ring, l)
+		} else {
+			r.ring[r.n%windowBefore] = l
+		}
+		r.n++
+		if strings.HasPrefix(l, "detsched: trace=") {
+			r.trace, r.at = l, r.n
+		}
+		return l, true
+	}
+	// Each switch line cut in two: up to its site, "detsched: switch N kK
+	// to goroutine G", and what follows ", after ".
+	type line struct{ head, after string }
+	next := func(r *run) (line, bool) {
+		for {
+			l, ok := read(r)
+			if !ok {
+				return line{}, false
 			}
 			if strings.HasPrefix(l, "detsched: switch ") {
 				head, rest, _ := strings.Cut(l, " at ")
 				_, after, _ := strings.Cut(rest, ", after ")
-				lines = append(lines, line{head, after})
+				return line{head, after}, true
 			}
 		}
-		return lines
 	}
-	opt, dbg := switches(s.bin), switches(bin)
-	i := 0
-	for i < len(opt) && i < len(dbg) && opt[i].head == dbg[i].head {
-		i++
+	var where string
+	for {
+		a, oka := next(runs[0])
+		b, okb := next(runs[1])
+		if !oka || !okb {
+			break
+		}
+		if a.head == b.head {
+			continue
+		}
+		n, ka := switchFields(a.head)
+		_, kb := switchFields(b.head)
+		// Name the goroutines switched to where they differ.
+		_, ga, _ := strings.Cut(a.head, " to ")
+		_, gb, _ := strings.Cut(b.head, " to ")
+		if ga != gb {
+			ka += " to " + ga
+			kb += " to " + gb
+		}
+		where = fmt.Sprintf("first differ at switch %s (k%s %s, k%s %s)", n, ka, labels[0], kb, labels[1])
+		if a.after != "" {
+			// The goroutine that ran up to switch n ran another amount
+			// of code in the two runs, or reached another operation:
+			// where each stopped it says what it was running.
+			where = fmt.Sprintf("%s, after %s %s and %s %s", where, a.after, labels[0], b.after, labels[1])
+		}
+		break
 	}
-	if i == len(opt) || i == len(dbg) {
-		return ""
+	for i, r := range runs {
+		if where == "" {
+			for _, ok := read(r); ok; _, ok = read(r) {
+			}
+		}
+		before := r.ring
+		if len(before) == windowBefore {
+			before = append(slices.Clone(r.ring[r.n%windowBefore:]), r.ring[:r.n%windowBefore]...)
+		} else {
+			before = slices.Clone(before)
+		}
+		from, at := r.n-len(before)+1, r.n
+		var after []string
+		for where != "" && len(after) < windowAfter {
+			l, ok := read(r)
+			if !ok {
+				break
+			}
+			after = append(after, l)
+		}
+		last := r.n
+		for _, ok := read(r); ok; _, ok = read(r) {
+		}
+		var b strings.Builder
+		if where != "" {
+			fmt.Fprintf(&b, "# lines %d to %d of the output with GODEBUG=dettrace=2, with the first difference at line %d\n", from, last, at)
+		} else {
+			fmt.Fprintf(&b, "# lines %d to %d of the output with GODEBUG=dettrace=2, the last\n", from, at)
+		}
+		for _, l := range slices.Concat(before, after) {
+			b.WriteString(l + "\n")
+		}
+		if r.at > last {
+			fmt.Fprintf(&b, "# ... the final trace line, at line %d:\n%s\n", r.at, r.trace)
+		}
+		if err := os.WriteFile(paths[i], []byte(b.String()), 0o666); err != nil {
+			paths[i] = ""
+		}
 	}
-	n, k := switchFields(opt[i].head)
-	_, kd := switchFields(dbg[i].head)
-	where := fmt.Sprintf(": the builds first differ at switch %s (k%s optimized, k%s without optimizations)", n, k, kd)
-	if opt[i].after == "" {
-		return where
-	}
-	// The goroutine that ran up to switch n ran another amount of code
-	// in the two builds, or reached another operation: where each build
-	// stopped it says what it was running.
-	return fmt.Sprintf("%s, after %s optimized and %s without optimizations", where, opt[i].after, dbg[i].after)
+	return where, paths
 }
 
 // switchFields returns N and K of a "detsched: switch N kK ..." line.
@@ -1112,8 +1239,12 @@ var errCanceled = errors.New("canceled")
 
 // exec runs cmd in its own process group, which holds the branches it
 // forks, and stops the group when the run takes longer than s.timeout or
-// ctx is done.
+// ctx is done. A cmd.Stdout that is set gets the whole output too.
 func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
+	whole := io.Discard
+	if cmd.Stdout != nil {
+		whole = cmd.Stdout
+	}
 	// The run's output comes through a pipe of our own, so that we can
 	// tell when the branches it left behind closed it, and still reap the
 	// run after stopping them.
@@ -1133,7 +1264,7 @@ func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
 	var out cappedOutput
 	copied := make(chan bool)
 	go func() {
-		io.Copy(&out, pr)
+		io.Copy(io.MultiWriter(&out, whole), pr)
 		close(copied)
 	}()
 	defer pr.Close()
@@ -1304,7 +1435,7 @@ func (s *search) run(ctx context.Context, n uint64) error {
 	// Stopped by a signal, the search ends at once, before what the
 	// sender may kill it for (as a tool's stop often follows SIGTERM
 	// with SIGKILL a second later).
-	if firstErr == nil && !errors.Is(ctx.Err(), context.Canceled) {
+	if firstErr == nil && !errors.Is(ctx.Err(), context.Canceled) && s.baseTrace != "" {
 		s.rechecked.Do(func() {
 			s.mu.Lock()
 			s.printf("detsched: %d runs done; running seed 1 once more, to check that its schedule has not changed, before the summary\n", s.runs)
@@ -1326,18 +1457,21 @@ func (s *search) recheck() {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if s.baseTrace == "" {
+		return // the base run was cut short (see prepare)
+	}
 	// A run guardMem stopped when memory ran low says nothing of its
 	// schedule: run it again, up to three times.
 	var r *result
 	var err error
 	for try := 0; try < 3 && (r == nil || r.outOfMem); try++ {
-		if r, err = s.exec(ctx, s.plain(1, "GODETBRANCH=0")); err != nil {
+		if r, err = s.exec(ctx, s.plain(1, "GODETSEARCH=feedback=1", "GODETBRANCH=0")); err != nil {
 			return
 		}
 	}
-	if r.outOfMem {
+	if cut := s.cutShort(r); cut != "" {
 		s.mu.Lock()
-		s.printf("detsched: seed 1's check was stopped three times when memory ran low; its schedule was not checked again\n")
+		s.printf("detsched: seed 1's check was %s; its schedule was not checked again\n", cut)
 		s.mu.Unlock()
 		return
 	}
@@ -1345,11 +1479,65 @@ func (s *search) recheck() {
 		return
 	}
 	s.mu.Lock()
+	if s.unstable != "" {
+		// The search warned already, and names the trace windows of
+		// its runs, which another comparison would overwrite.
+		s.mu.Unlock()
+		return
+	}
+	base := &result{output: s.baseOutput}
+	what := fmt.Sprintf("seed 1 ran two different schedules: %q at the start of the search, %q %v later", strings.TrimPrefix(s.baseTrace, "detsched: "), strings.TrimPrefix(r.trace(), "detsched: "), time.Since(s.start).Round(time.Second))
+	s.mu.Unlock()
+	what += "; " + s.seedOneDiff(ctx, base, r, "detsched started them alike, but for the file the first wrote its feedback to, and while the search's runs went on")
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.unstable == "" {
-		s.unstable = fmt.Sprintf("seed 1 ran two different schedules: %q at the start of the search, %q %v later", strings.TrimPrefix(s.baseTrace, "detsched: "), strings.TrimPrefix(r.trace(), "detsched: "), time.Since(s.start).Round(time.Second))
+		s.unstable = what
 		s.notice(s.unstable)
 	}
+}
+
+// cutShort says why r's trace line is not that of its whole run, or ""
+// if it ran to its end: it was stopped when memory ran low, at -timeout,
+// or when the search ended.
+func (s *search) cutShort(r *result) string {
+	switch {
+	case r.outOfMem:
+		return "stopped when memory ran low"
+	case r.hung:
+		return "still running when the search ended"
+	case r.timedOut:
+		return fmt.Sprintf("still running at -timeout (%v)", s.timeout)
+	}
+	return ""
+}
+
+// seedOneDiff says what detsched knows of why a and b, two runs of seed
+// 1 that each ran to its end, ran different schedules: where either left
+// the deterministic subset, how detsched started them differently, as
+// started says, and where two more runs of seed 1, started at once with
+// GODEBUG=dettrace=2, first differ, with their traces kept in s.out.
+func (s *search) seedOneDiff(ctx context.Context, a, b *result, started string) string {
+	var parts []string
+	for i, r := range []*result{a, b} {
+		if m := leftReport.Find(r.output); m != nil {
+			first, _, _ := bytes.Cut(m, []byte("\n"))
+			parts = append(parts, fmt.Sprintf("the %s left the deterministic subset: %s", []string{"first", "second"}[i], strings.TrimSuffix(strings.TrimPrefix(string(first), "detsched: "), "; the program no longer runs deterministically")))
+		}
+	}
+	parts = append(parts, started)
+	cmd := func() *exec.Cmd { return s.plain(1, "GODETSEARCH=feedback=1", "GODETBRANCH=0") }
+	where, paths := s.divergence(ctx, [2]*exec.Cmd{cmd(), cmd()}, [2]string{"seed-1-a.dettrace", "seed-1-b.dettrace"}, [2]string{"in the first", "in the second"})
+	return strings.Join(append(parts, divergenceNote(where, paths)), "; ")
+}
+
+// divergenceNote says where two runs with GODEBUG=dettrace=2, whose
+// output is in paths, first differ, as divergence returns it.
+func divergenceNote(where string, paths [2]string) string {
+	if where == "" {
+		return fmt.Sprintf("two more runs of it with GODEBUG=dettrace=2 ran the same switches, as far as both went (%s, %s)", paths[0], paths[1])
+	}
+	return fmt.Sprintf("two more runs of it with GODEBUG=dettrace=2 %s (%s, %s)", where, paths[0], paths[1])
 }
 
 // record records a run, and when it is the first of its group, replays it.
@@ -1735,7 +1923,7 @@ func (s *search) fallbacks() []fallback {
 	if s.unstable != "" {
 		add("seed-1-ran-two-schedules", s.unstable,
 			"failures may not replay: the program depends on something besides its seed",
-			"find what it reads outside a synctest bubble, usually time.Now() at package init: diff two runs of seed 1 with GODEBUG=dettrace=2")
+			"find what it reads outside a synctest bubble, usually time.Now() at package init: see what the goroutine was running where the runs with GODEBUG=dettrace=2 first differ")
 	}
 	if len(s.left) > 0 {
 		add("seed-1-left-the-deterministic-subset", fmt.Sprintf("seed 1 left the deterministic subset in %d places, first: %s", len(s.left), s.left[0]),
@@ -1747,8 +1935,8 @@ func (s *search) fallbacks() []fallback {
 			"schedules may differ between runs, and failures may not replay",
 			"run the binary as a regular program, not set-user-ID, from a writable directory")
 	}
-	if s.newShell {
-		add("new-shell", "seed 1 runs another schedule in a new shell, and detsched could not find which of its variables cause it",
+	if s.newShell != "" {
+		add("new-shell", s.newShell,
 			"replay lines may not reproduce failures in another shell",
 			"run replay lines from the shell that ran detsched")
 	}

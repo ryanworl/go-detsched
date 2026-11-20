@@ -62,6 +62,7 @@ type Nemesis struct {
 	modes  []Mode         // network modes enabled in this storm
 	active []*activeFault // faults to end, by end time
 	down   map[*Node]bool // nodes the nemesis took down or paused
+	rated  map[*Node]bool // nodes whose clock rate the nemesis changed
 
 	storm    bool          // in a storm; otherwise in a calm
 	calls    uint32        // harness callbacks begun and ended; see nemesisNode
@@ -90,6 +91,7 @@ const (
 	FaultThrottle    = "throttle"    // throttle, then unthrottle
 	FaultClockSkip   = "clockskip"   // the wall clock jumps
 	FaultDisk        = "disk"        // one node's syncs slow down or stall
+	FaultClockRate   = "clockrate"   // one node's clock runs fast or slow
 
 	// FaultClockSkipBack, in NemesisConfig.Disable, keeps clock skips
 	// from moving the wall clock back, for a system whose known bugs
@@ -105,7 +107,7 @@ const (
 	PhaseCalm  = "calm"
 )
 
-var allFaults = []string{FaultPartition, FaultClog, FaultLink, FaultRestore, FaultKill, FaultKillProcess, FaultStop, FaultPause, FaultThrottle, FaultClockSkip, FaultDisk}
+var allFaults = []string{FaultPartition, FaultClog, FaultLink, FaultRestore, FaultKill, FaultKillProcess, FaultStop, FaultPause, FaultThrottle, FaultClockSkip, FaultDisk, FaultClockRate}
 
 // The ranges a run's shape, its storms, and its calms draw from,
 // log-uniformly.
@@ -123,7 +125,7 @@ type NemesisConfig struct {
 	// time of each fault, without removed ones).
 	Nodes []*Node
 	// Exclude lists nodes the nemesis never kills, stops, pauses,
-	// throttles, or slows the disk of, such as the clients of a workload
+	// throttles, or slows the disk or changes the clock rate of, such as the clients of a workload
 	// or a coordinator that cannot restart. Network faults still reach
 	// them: a partition puts each in a random group, and clogs and links
 	// pick them like the other nodes, so that a client can reach some
@@ -179,7 +181,7 @@ type nemesisReq struct {
 
 // NewNemesis creates a nemesis for w. Start runs it.
 func (w *World) NewNemesis(cfg NemesisConfig) *Nemesis {
-	return &Nemesis{w: w, cfg: cfg, req: make(chan nemesisReq), done: make(chan struct{}), down: map[*Node]bool{}}
+	return &Nemesis{w: w, cfg: cfg, req: make(chan nemesisReq), done: make(chan struct{}), down: map[*Node]bool{}, rated: map[*Node]bool{}}
 }
 
 // Start runs the nemesis in a goroutine that belongs to no node.
@@ -663,6 +665,28 @@ func (nm *Nemesis) inject() {
 		undo = func() {
 			runtime_call(func() { d.slow, d.stallUntil = 0, 0 })
 			n.wakeDisk()
+		}
+	case FaultClockRate:
+		if len(nodes) == 0 {
+			return
+		}
+		n := nodes[aim(nodes)]
+		if nm.rated[n] {
+			return
+		}
+		old := n.ClockRate()
+		r := float64(logUniform(time.Second/wideRate, time.Second*wideRate)) / float64(time.Second)
+		nm.rated[n] = true
+		n.setClockRate(r)
+		ev.Node, ev.Desc = n, fmt.Sprintf("clockrate %s x%.3g", n.name, r)
+		undo = func() {
+			delete(nm.rated, n)
+			n.setClockRate(old)
+		}
+		if r < 1 {
+			assert.Reachable("nemesis: clockrate slow", nil)
+		} else {
+			assert.Reachable("nemesis: clockrate fast", nil)
 		}
 	case FaultClockSkip:
 		d := time.Duration(1+Intn(3600)) * time.Second

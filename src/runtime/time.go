@@ -18,6 +18,9 @@ import (
 func time_runtimeNow() (sec int64, nsec int32, mono int64) {
 	if bubble := getg().bubble; bubble != nil {
 		if goexperiment.DetSched && detsim.clock {
+			if len(detsimClocks) != 0 {
+				return detsimNodeTime(bubble) // a node's clock; see detsim.go
+			}
 			return detsimTime(bubble) // a simulation's clock; see detsim.go
 		}
 		sec = bubble.now / (1000 * 1000 * 1000)
@@ -43,6 +46,9 @@ func crypto_internal_fips140deps_time_monoTime() (mono int64) {
 func time_runtimeNano() int64 {
 	gp := getg()
 	if gp.bubble != nil {
+		if goexperiment.DetSched && len(detsimClocks) != 0 {
+			return detsimLocal(gp.bubble.now) // a node's clock; see detsim.go
+		}
 		return gp.bubble.now
 	}
 	return nanotime()
@@ -361,9 +367,18 @@ func timeSleep(ns int64) {
 	} else {
 		now = nanotime()
 	}
+	if goexperiment.DetSched && gp.bubble != nil {
+		if c := detsimClockOf(); c != nil {
+			now = c.local(now) // the sleep is on the node's clock
+		}
+	}
 	when := now + ns
 	if when < 0 { // check for overflow.
 		when = maxWhen
+	}
+	if goexperiment.DetSched && t.isFake {
+		*detsimTimerNode(t) = detsimNodeOf()
+		when, _ = detsimWhen(when, 0)
 	}
 	gp.sleepWhen = when
 	if t.isFake {
@@ -418,6 +433,9 @@ func newTimer(when, period int64, f func(arg any, seq uintptr, delay int64), arg
 		t.isFake = true
 	}
 	detsimTimerInit(&t.timer)
+	if goexperiment.DetSched && t.isFake {
+		when, period = detsimWhen(when, period)
+	}
 	t.modify(when, period, f, arg, 0)
 	t.init = true
 	return t
@@ -445,6 +463,9 @@ func resetTimer(t *timeTimer, when, period int64) bool {
 	}
 	if t.isFake && getg().bubble == nil {
 		fatal("reset of synctest timer from outside bubble")
+	}
+	if goexperiment.DetSched && t.isFake {
+		when, period = detsimWhen(when, period)
 	}
 	return t.reset(when, period)
 }

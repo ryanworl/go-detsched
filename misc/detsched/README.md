@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched31
+v=go1.27.4-detsched32
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -172,11 +172,16 @@ something besides its seed, usually the real clock read outside a bubble
 (`time.Now()` in a package variable at init, later compared with bubble
 time), and failures may not replay. Nothing else reports such a read, and
 a program that passes this check is not proven deterministic: a replay
-that does not reproduce is the other sign. Fix it before triaging: build
-the binary as `detsched` does
-(`GOEXPERIMENT=detsched CGO_ENABLED=0 go test -c -o pkg.test`), run
-`GODETSEED=1 GODETBRANCH=0 ./pkg.test` twice with `GODEBUG=dettrace=2`,
-and see what the goroutine at the first difference was doing
+that does not reproduce is the other sign. A run cut short, at `-timeout`
+or when memory ran low, prints the trace line of where it was stopped and
+is not compared. The warning says how `detsched` started the two runs
+differently, whether either left the deterministic subset, and where two
+more runs of seed 1 with `GODEBUG=dettrace=2` first differ: the switch,
+the goroutine each switched to, and where each stopped the goroutine
+that ran before it. The out directory keeps a window of each run's trace,
+the few thousand lines before the first difference and a few hundred
+after, with its final trace line, in the files the warning names. Fix it before
+triaging: see what the goroutine at the first difference was doing
 ([delve.md](delve.md#find-where-two-runs-diverge)).
 
 ### Seed 1 left the deterministic subset
@@ -576,10 +581,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched31:
+and release N's version is v0.N.0, so with go1.27.4-detsched32:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.31.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.32.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
@@ -760,6 +765,21 @@ is set, as on a passing seed's replay line to check what the harness did.
   carries a monotonic reading from the bubble's clock, so `time.Since`,
   timers, and deadlines ignore the skips. `World.Elapsed` is the
   timeline's time.
+- **Clock rates.** Each node's clock runs at its own rate relative to the
+  simulation's, so nodes drift apart while each stays consistent with
+  itself: `time.Now`, monotonic readings, timers, tickers, sleeps,
+  context and socket deadlines, file times, and the node's TCP timeouts
+  (connecting, keepalives, and giving up on data that cannot get through)
+  all run on it, while network latencies and disk speeds are physical.
+  Clocks run together during setup; when setup completes, each node
+  draws a rate within ±1% of 1 (from the fault stream, so runs branched
+  after setup draw their own), as does a node added later; the drift is
+  reported as the fault `fault: sim.clock.drift`, which the summary can
+  say a group needs. `Node.SetClockRate(r)` sets a node's rate
+  from then on (1 keeps it with the simulation's), and its timers keep
+  their times on its clock. A node's clock and rate stay across restarts.
+  The rates are in the timeline (`n1: clock rate 1.00374`), and
+  `testdata/simdrift` shows a lease that breaks under drift.
 - **CPU.** A node's computing takes simulated time. Each node has a
   processor drawn from the fault stream: 1 to 16 cores, or now and then
   unlimited ones, at 0.5 to 2 times the speed of a reference core;
@@ -799,8 +819,10 @@ is set, as on a passing seed's replay line to check what the harness did.
 - **Nemesis.** `World.NewNemesis` injects Antithesis's fault catalog, each
   fault for a random duration: partitions, clogs, and cut links in the
   three modes, restores, kills, process kills (three times as likely as
-  power failures), graceful stops, pauses, throttles, clock skips, and
-  disk faults (syncs 10 to 1000 times as slow, or stalled until the fault
+  power failures), graceful stops, pauses, throttles, clock skips, clock
+  rates (one node's clock runs at 1/4 to 4 times the simulation's, to
+  find timeouts measured on one node and enforced on another), and disk
+  faults (syncs 10 to 1000 times as slow, or stalled until the fault
   ends). It kills and stops nodes only with a `Restart` function. Faults
   come in storms separated by calms, which end every fault but clock
   skips and restart the nodes the nemesis took down. Each run draws its

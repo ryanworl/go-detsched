@@ -99,6 +99,8 @@ func TestFaults(t *testing.T) {
 		b := w.AddNode("b", "10.0.0.2")
 		c := w.AddNode("c", "10.0.0.3")
 		for _, n := range []*sim.Node{a, b, c} {
+			// TestSimFaults compares the durations the nodes measure.
+			n.SetClockRate(1)
 			w.SetLink(a, n, sim.Link{Latency: 10 * time.Millisecond})
 			w.SetLink(n, a, sim.Link{Latency: time.Millisecond})
 		}
@@ -127,6 +129,7 @@ func TestFaults(t *testing.T) {
 			return <-ch
 		}
 		d := w.AddNode("d", "10.0.0.4")
+		d.SetClockRate(1)
 		d.Start(func() {})
 		pa, pb, pd := pid(a), pid(b), pid(d)
 		d.KillProcess()
@@ -1252,6 +1255,9 @@ func TestDiskFaults(t *testing.T) {
 		a := w.AddNode("a", "10.0.0.1")
 		a.SetCPU(sim.UnlimitedCores, 1)
 		b := w.AddNode("b", "10.0.0.2")
+		// The check compares times the nodes measure with the nemesis's.
+		a.SetClockRate(1)
+		b.SetClockRate(1)
 		type span struct {
 			start, end time.Time
 			stall      bool
@@ -1280,7 +1286,7 @@ func TestDiskFaults(t *testing.T) {
 		b.Start(tick(&ticksB))
 		cfg := sim.NemesisConfig{
 			Nodes:   []*sim.Node{a},
-			Disable: []string{sim.FaultPartition, sim.FaultClog, sim.FaultLink, sim.FaultRestore, sim.FaultKill, sim.FaultKillProcess, sim.FaultStop, sim.FaultPause, sim.FaultThrottle, sim.FaultClockSkip},
+			Disable: []string{sim.FaultPartition, sim.FaultClog, sim.FaultLink, sim.FaultRestore, sim.FaultKill, sim.FaultKillProcess, sim.FaultStop, sim.FaultPause, sim.FaultThrottle, sim.FaultClockSkip, sim.FaultClockRate},
 			Event: func(ev sim.Event) {
 				switch {
 				case ev.Kind != sim.FaultDisk:

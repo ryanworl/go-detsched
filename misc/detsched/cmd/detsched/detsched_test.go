@@ -592,34 +592,29 @@ func TestSimBranchInline(t *testing.T) {
 	}
 	// A program the search runs to a stop, as it runs a cell's, forks no
 	// branches, so a process forked from it writes the timeline's output
-	// without theirs: here, a child that goes on as the run did, from the
-	// timeline's last switch, writes what the run with GODETBRANCH=0
-	// wrote.
-	// Its trace line is the one no "detsched: branch" line follows: the
-	// output of another failing branch may come after it.
-	var last string
-	lines := strings.Split(forked.stderr, "\n")
-	for i, l := range lines {
-		if sm := switchesField.FindStringSubmatch(l); sm != nil && (i+1 == len(lines) || !strings.HasPrefix(lines[i+1], "detsched: branch ")) {
-			last = sm[1]
-		}
+	// without theirs: here, a child that goes on as the timeline did,
+	// from its last switch, writes what the run with GODETBRANCH=0 wrote.
+	// The stopped program runs the schedule of GODETBRANCH=0, not the
+	// forking run's timeline, which a branch's failure makes fail: on
+	// failure, the test reports more at its end, which can take more
+	// switches.
+	timeline, _, err := runBin(bin, append(env, "GODETBRANCH=0")...)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if last == "" {
-		t.Fatalf("no trace line of the timeline:\n%s", forked.stderr)
+	last := switchesField.FindStringSubmatch(timeline.trace + " ")
+	if last == nil {
+		t.Fatalf("GODETBRANCH=0: no trace line:\n%s", timeline.stderr)
 	}
 	srv, err := startForkServer(command(bin, env...))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer srv.close()
-	if ok, err := srv.run(atou(last) - 1); !ok || err != nil {
-		t.Fatalf("run to the timeline's last switch: %v, %v", ok, err)
+	if ok, err := srv.run(atou(last[1]) - 1); !ok || err != nil {
+		t.Fatalf("run to the last switch of GODETBRANCH=0's timeline, %s: %v, %v", last[1], ok, err)
 	}
 	child, err := srv.branchOutcome(1|detBranchGoesOn, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	timeline, _, err := runBin(bin, append(env, "GODETBRANCH=0")...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,6 +748,11 @@ func TestSimPrograms(t *testing.T) {
 		{pkg: "simfinblock", exit: 2, want: []string{"main bubble goroutine has exited but blocked goroutines remain", "simfinblock.open.func1"}},
 		// The CPU work of a simulation's nodes takes simulated time.
 		{pkg: "simbusy"},
+		// A node whose clock runs at another rate is consistent with
+		// itself, across a change of rate and a restart, and a lease
+		// that a server and its holder measure on their own clocks breaks
+		// only when the holder's runs slow.
+		{pkg: "simdrift", seeds: []string{"1", "2"}},
 		// A run in which only the simulation's events run collects their
 		// garbage. Before, a week of idle keepalives grew the heap by
 		// 561 MB without a GC.

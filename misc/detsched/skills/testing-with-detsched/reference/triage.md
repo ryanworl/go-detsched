@@ -28,6 +28,7 @@ Decide from evidence, not from the message. Assume the harness until the evidenc
 - `concurrent map writes` in harness code; socket calls failing with `EPERM` (code on a goroutine of no node).
 - `blocked goroutines remain`: a goroutine still running when the test body returned, which the summary names: an unjoined harness goroutine, or one the SUT's `Close` does not wait for.
 - A failure only with a backward clock skip: a check comparing wall-clock times.
+- A failure that needs `nemesis clockrate` or nodes' drawn clock rates (`clock rate` lines in the timeline): a SUT bug when the SUT measures a lease or timeout on one node and enforces it on another without a margin for drift; a harness bug when the check compares `time.Now` across nodes.
 - `branch K died of signal 5`: a breakpoint in a forked branch; keep `GODETBRANCH=K`.
 - A predicted deadlock no directed run failed: likely a false alarm.
 

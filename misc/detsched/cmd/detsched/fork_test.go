@@ -757,6 +757,58 @@ func TestSearchSeedOneBranches(t *testing.T) {
 	}
 }
 
+// TestSearchSeedOneCut checks that runs of seed 1 stopped at -timeout,
+// whose trace lines are those of where each was stopped, are not compared
+// as if they had run to their ends (testdata/memstop): before, two runs of
+// a deterministic program, started at once and stopped at different
+// switches, made the search say that seed 1 ran two different schedules.
+func TestSearchSeedOneCut(t *testing.T) {
+	s := newTestSearch(t, "../../testdata/memstop")
+	s.workers, s.only, s.noFork, s.timeout = 1, armFresh, true, 100*time.Millisecond
+	if err := s.run(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if s.unstable != "" {
+		t.Errorf("runs stopped at -timeout compared as complete: %s", s.unstable)
+	}
+}
+
+// TestSearchSeedOneDivergence checks that when two runs of seed 1 run
+// different schedules (testdata/pidsched, whose schedule depends on its
+// process ID), the search says where two more runs with
+// GODEBUG=dettrace=2 first differ, which goroutines ran and where the one
+// before stopped, and keeps a window of each trace around the difference,
+// with its final trace line, but not the whole traces.
+func TestSearchSeedOneDivergence(t *testing.T) {
+	s := newTestSearch(t, "../../testdata/pidsched")
+	s.workers, s.only, s.noFork = 1, armFresh, true
+	if err := s.run(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`^seed 1 ran two different schedules in two runs started at once: .*; detsched started them alike, but for the file the first wrote its feedback to; two more runs of it with GODEBUG=dettrace=2 first differ at switch (\d+) \(k\d+ to goroutine \d+ in the first, k\d+ to goroutine \d+ in the second\), after goroutine \d+ (stopped|was preempted) in main\.main\S* \S+/main\.go:\d+ in the first and .* in the second \((\S+), (\S+)\)$`).FindStringSubmatch(s.unstable)
+	if m == nil {
+		t.Fatalf("the warning does not say where the runs first differ: %q", s.unstable)
+	}
+	// Each run's window around the difference, which it names, with its
+	// final trace line. Where the runs differ depends on their process
+	// IDs, but it is in the window's first 3000 lines.
+	for _, path := range m[3:] {
+		b, err := os.ReadFile(path)
+		lines := strings.Split(string(b), "\n")
+		var at int
+		_, serr := fmt.Sscanf(lines[0], "# lines 1 to %d of the output with GODEBUG=dettrace=2, with the first difference at line %d", new(int), &at)
+		if err != nil || serr != nil || at >= len(lines) || !strings.HasPrefix(lines[at], "detsched: switch "+m[1]+" ") || !traceLine.Match(b) {
+			t.Errorf("window %s: %v, or its header does not name the line of switch %s, or no trace line:\n%.500s", path, err, m[1], b)
+		}
+		if n := bytes.Count(b, []byte("\n")); n > windowBefore+windowAfter+3 {
+			t.Errorf("window %s has %d lines, the whole trace or most of it", path, n)
+		}
+	}
+	if full, _ := filepath.Glob(s.temp("*.full*")); len(full) > 0 {
+		t.Errorf("whole traces left in the out directory: %q", full)
+	}
+}
+
 // TestSearchMemStoppedSeedOne checks that a run of seed 1 that guardMem
 // stops when memory runs low, in recheck or buildDebug, counts as no
 // answer: before, its cut trace line made the search say that seed 1 ran
@@ -869,8 +921,43 @@ func TestSearchDebugFallback(t *testing.T) {
 		t.Errorf("debug line %s, want the optimized binary %s", debug, s.bin)
 	}
 	if r := searchReport(s); !strings.Contains(r, "debug lines run the optimized binary") || !strings.Contains(r, "ran seed 1 on another schedule") ||
-		!regexp.MustCompile(`the builds first differ at switch \d+ \(k\d+ optimized, k\d+ without optimizations\), after goroutine \d+ ((was preempted|stopped) in \S+ \S+:\d+|exited) optimized and goroutine \d+ ((was preempted|stopped) in \S+ \S+:\d+|exited) without`).MatchString(r) {
+		!regexp.MustCompile(`the builds first differ at switch \d+ \(k\d+( to goroutine \d+)? optimized, k\d+( to goroutine \d+)? without optimizations\), after goroutine \d+ ((was preempted|stopped) in \S+ \S+:\d+|exited) optimized and goroutine \d+ ((was preempted|stopped) in \S+ \S+:\d+|exited) without`).MatchString(r) {
 		t.Errorf("summary does not say why debug lines run the optimized binary, and where the builds part:\n%s", r)
+	}
+}
+
+// TestSearchDrift checks that the search finds simdrift's lease that a
+// server and its holder measure on their own clocks, which breaks in the
+// runs where the clock rates the nodes draw when setup completes put the
+// holder's more than 1% behind the server's: the runs it forks after
+// setup draw their own rates.
+func TestSearchDrift(t *testing.T) {
+	t.Setenv("SIMDRIFT_DRAWN", "1")
+	t.Setenv("TMPDIR", t.TempDir())
+	s, err := newSearch("../../testdata/simdrift", "", "^TestDrawn$")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if s.debugDone != nil {
+			<-s.debugDone
+		}
+	})
+	s.workers = 4
+	if err := s.run(context.Background(), 200); err != nil {
+		t.Fatal(err)
+	}
+	g := findGroup(s, "TestDrawn")
+	if g == nil || g.status != "reproduced" {
+		t.Fatalf("want the lease broken, reproduced:\n%s", searchReport(s))
+	}
+	if log, err := os.ReadFile(g.logs[0]); err != nil || !bytes.Contains(log, []byte("two clients held the lease")) {
+		t.Errorf("the failure's log does not say the lease broke: %v\n%s", err, log)
+	}
+	// The same run, with the drift turned off, passes.
+	off := regexp.MustCompile(`trace=0x[0-9a-f]+`).ReplaceAllString(g.replay, "faultoff=sim.clock.drift")
+	if out, err := exec.Command("sh", "-c", off).CombinedOutput(); err != nil || !strings.Contains(off, "faultoff=") {
+		t.Errorf("%s: %v, want a pass without the drift\n%s", off, err, out)
 	}
 }
 

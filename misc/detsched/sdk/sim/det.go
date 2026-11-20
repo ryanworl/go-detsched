@@ -104,6 +104,9 @@ func runtime_onPanic(f func(node int32, v any))
 //go:linkname runtime_busyOn
 func runtime_busyOn(on bool)
 
+//go:linkname runtime_setClock
+func runtime_setClock(node int32, anchor, base int64, rate float64, rescale bool)
+
 //go:linkname runtime_setCPU
 func runtime_setCPU(node int32, cores, speed int32)
 

@@ -414,7 +414,7 @@ func (w *World) connect(s *socket, a [6]uintptr) (uintptr, uintptr) {
 	}
 	// The connection attempt fails after connectTimeout unless it
 	// completes first.
-	w.event(int64(connectTimeout), func() { fail(uintptr(syscall.ETIMEDOUT)) })
+	w.event(inc.node.delay(int64(connectTimeout)), func() { fail(uintptr(syscall.ETIMEDOUT)) })
 	// The SYN arrives after one latency. If it cannot arrive, it waits
 	// for a link or node to change, as retransmitted SYNs would.
 	var syn func()
@@ -597,7 +597,7 @@ func (w *World) armKeepalive(s *socket) {
 	s.kaGen++
 	if s.ka {
 		gen := s.kaGen
-		w.event(cmp.Or(s.kaIdle, defKeepIdle), func() { w.keepalive(s, gen) })
+		w.event(s.inc.node.delay(cmp.Or(s.kaIdle, defKeepIdle)), func() { w.keepalive(s, gen) })
 	}
 }
 
@@ -607,7 +607,7 @@ func (w *World) keepalive(s *socket, gen int) {
 	if gen != s.kaGen || !s.ka || s.udp != nil || s.dead || !s.inc.alive || s.state != sConnected && s.state != sConnecting {
 		return
 	}
-	idle := cmp.Or(s.kaIdle, defKeepIdle)
+	idle := s.inc.node.delay(cmp.Or(s.kaIdle, defKeepIdle))
 	next := idle
 	if c := s.c; s.state == sConnected {
 		i := s.side
@@ -671,9 +671,9 @@ func (w *World) pump(c *conn, i int) {
 			} else if out.heldFrom == 0 {
 				out.heldFrom = now()
 				from := out.heldFrom
-				timeout := int64(tcpTimeout)
+				timeout := src.inc.node.delay(int64(tcpTimeout))
 				if out.segs[0].probe {
-					timeout = int64(cmp.Or(src.kaCnt, defKeepCnt)) * cmp.Or(src.kaIntvl, defKeepIntvl)
+					timeout = src.inc.node.delay(int64(cmp.Or(src.kaCnt, defKeepCnt)) * cmp.Or(src.kaIntvl, defKeepIntvl))
 				}
 				w.event(timeout, func() {
 					if out.heldFrom == from && len(out.segs) > 0 {

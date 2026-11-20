@@ -894,6 +894,13 @@ func detsimDeadline(d int64) int64 {
 	if d <= 0 {
 		return d
 	}
+	if c := detsimClockOf(); c != nil {
+		// d is a duration on the node's clock.
+		if l := c.local(detsimNow()) + d; l > 0 {
+			return c.global(l)
+		}
+		return 1<<63 - 1
+	}
 	d += detsimNow()
 	if d <= 0 {
 		d = 1<<63 - 1
@@ -948,7 +955,7 @@ func detsimBuggifyRand() uint64 { return detsimRand() }
 func detsimBuggifyEpoch() uint64 { return detsim.epoch }
 
 func detsimBuggifyCall(f func())             { detsimCall(f) }
-func detsimBuggifyFaultOff(site string) bool  { return detFaultOff("", site) }
+func detsimBuggifyFaultOff(site string) bool { return detFaultOff("", site) }
 
 func detsimSetClock(on bool, skew int64) { detsim.clock, detsim.skew = on, skew }
 
@@ -966,6 +973,146 @@ var detsimStartNano int64
 func detsimTime(bubble *synctestBubble) (sec int64, nsec int32, mono int64) {
 	t := bubble.now + detsim.skew
 	return t / 1e9, int32(t % 1e9), bubble.now + detsimStartNano
+}
+
+// detsimNodeTime is detsimTime once some node's clock runs at another
+// rate (detsimSetNodeClock): on such a node, both readings come from its
+// clock instead of the bubble's.
+func detsimNodeTime(bubble *synctestBubble) (sec int64, nsec int32, mono int64) {
+	now := detsimLocal(bubble.now)
+	t := now + detsim.skew
+	return t / 1e9, int32(t % 1e9), now + detsimStartNano
+}
+
+// A detsimClock is the clock of a node whose clock runs at a rate other
+// than the bubble's: at the bubble's time t, it reads base + rate·(t −
+// anchor). The simulation keeps a node's clock across its restarts and
+// gives each new handle of the node the same one.
+type detsimClock struct {
+	anchor, base int64
+	rate         float64
+}
+
+// detsimClocks holds the clocks of node handles, by handle; a handle
+// past its end, or with rate 0, uses the bubble's clock. It stays empty,
+// and reading a clock costs a length check, until a node's clock leaves
+// the simulation's.
+var detsimClocks []detsimClock
+
+// local returns c's reading at the bubble's time t.
+func (c *detsimClock) local(t int64) int64 {
+	return c.base + int64(float64(t-c.anchor)*c.rate)
+}
+
+// global returns the first bubble time at which c reads l or later.
+func (c *detsimClock) global(l int64) int64 {
+	if l >= maxWhen/2 {
+		return l
+	}
+	q := float64(l-c.base) / c.rate
+	t := int64(q)
+	if float64(t) < q {
+		t++
+	}
+	t += c.anchor
+	for c.local(t) < l {
+		t++
+	}
+	for c.local(t-1) >= l {
+		t--
+	}
+	return t
+}
+
+// detsimClockOf returns the clock of the running goroutine's node, or nil
+// for the bubble's clock.
+func detsimClockOf() *detsimClock {
+	if len(detsimClocks) == 0 {
+		return nil
+	}
+	return detsimClockOfNode(detsimNodeOf())
+}
+
+func detsimClockOfNode(node int32) *detsimClock {
+	if node <= 0 || int(node) >= len(detsimClocks) || detsimClocks[node].rate == 0 {
+		return nil
+	}
+	return &detsimClocks[node]
+}
+
+// detsimLocal returns the running goroutine's node's reading of the
+// bubble's time t.
+func detsimLocal(t int64) int64 {
+	if c := detsimClockOf(); c != nil {
+		return c.local(t)
+	}
+	return t
+}
+
+// detsimWhen converts when, a time on the running goroutine's node's
+// clock at which a timer of the bubble is to fire, to the bubble's clock,
+// and period, a duration on the node's clock, to one on the bubble's.
+func detsimWhen(when, period int64) (int64, int64) {
+	c := detsimClockOf()
+	if c == nil {
+		return when, period
+	}
+	if when > 0 {
+		// A time the node's clock has reached is due now: the bubble's
+		// clock reached it at or before now.
+		when = c.global(when)
+		if b := getg().bubble; b != nil {
+			when = max(when, b.now)
+		}
+	}
+	if period > 0 {
+		period = max(int64(float64(period)/c.rate+0.5), 1)
+	}
+	return when, period
+}
+
+// detsimSetNodeClock gives node handle node a clock that reads base at the
+// bubble's time anchor and runs at rate from then on, rate 1 being the
+// bubble's. Called by the simulation for each handle of a node whose clock
+// rate is not 1, from a goroutine of the node's bubble. With rescale, the
+// handle's timers in that bubble keep their times on the node's clock:
+// those set before, at its old rate, fire at the bubble time the new
+// clock reaches them.
+func detsimSetNodeClock(node int32, anchor, base int64, rate float64, rescale bool) {
+	if node <= 0 || rate <= 0 {
+		return
+	}
+	for int(node) >= len(detsimClocks) {
+		detsimClocks = append(detsimClocks, detsimClock{})
+	}
+	old := detsimClocks[node]
+	if old.rate == 0 {
+		old = detsimClock{rate: 1}
+	}
+	c := detsimClock{anchor: anchor, base: base, rate: rate}
+	detsimClocks[node] = c
+	bubble := getg().bubble
+	if !rescale || bubble == nil {
+		return
+	}
+	// Collect first: modify marks timers in the heap and may run one.
+	var ts []*timer
+	lock(&bubble.timers.mu)
+	for _, tw := range bubble.timers.heap {
+		if t := tw.timer; t.isFake && *detsimTimerNode(t) == node && t.when > bubble.now {
+			ts = append(ts, t)
+		}
+	}
+	unlock(&bubble.timers.mu)
+	for _, t := range ts {
+		when, period := max(c.global(old.local(t.when)), bubble.now), t.period
+		if period > 0 {
+			period = max(int64(float64(period)*old.rate/rate+0.5), 1)
+		}
+		if when != t.when || period != t.period {
+			t.modify(when, period, nil, nil, 0)
+		}
+	}
 }
 
 // detsimSemacquire is called when the calling goroutine, of a live node or

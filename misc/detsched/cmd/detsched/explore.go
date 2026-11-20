@@ -181,18 +181,38 @@ func (s *search) prepare(ctx context.Context) error {
 		}
 	}
 	trace := base.trace()
-	if trace == "" {
+	cut := s.cutShort(base)
+	if trace == "" && cut == "" {
 		return fmt.Errorf("%s printed no detsched trace line; build it with a detsched toolchain and GOEXPERIMENT=detsched\n%s", s.bin, truncate(string(base.output), 2000))
 	}
-	s.baseTrace, s.baseOutput = trace, base.output
-	if s.built {
+	s.baseOutput = base.output
+	// A run stopped before its end prints the trace line of where it was
+	// stopped, which says nothing of whether another run, stopped
+	// elsewhere, ran the same schedule: such a check has no answer.
+	if cut == "" {
+		s.baseTrace = trace
+	} else {
+		s.mu.Lock()
+		s.printf("detsched: seed 1 was %s, so its schedule cannot be checked against other runs of it\n", cut)
+		s.mu.Unlock()
+	}
+	if s.built && cut == "" {
 		s.debugDone = make(chan bool)
 		go s.buildDebug(ctx)
+	} else if s.built {
+		s.debugNote = fmt.Sprintf("seed 1 was %s, so it could not check that its build without optimizations runs the same schedule", cut)
 	}
-	if runs[1].trace() != trace {
-		s.unstable = fmt.Sprintf("seed 1 ran two different schedules in two runs started at once: %q, then %q", strings.TrimPrefix(trace, "detsched: "), strings.TrimPrefix(runs[1].trace(), "detsched: "))
+	switch {
+	case cut != "":
+	case s.cutShort(runs[1]) != "":
+		s.mu.Lock()
+		s.printf("detsched: the second of two runs of seed 1 started at once was %s, so it was not compared with the first\n", s.cutShort(runs[1]))
+		s.mu.Unlock()
+	case runs[1].trace() != trace:
+		s.unstable = fmt.Sprintf("seed 1 ran two different schedules in two runs started at once: %q, then %q; %s", strings.TrimPrefix(trace, "detsched: "), strings.TrimPrefix(runs[1].trace(), "detsched: "),
+			s.seedOneDiff(ctx, base, runs[1], "detsched started them alike, but for the file the first wrote its feedback to"))
 		s.notice(s.unstable)
-	} else if runs[2].trace() != trace {
+	case s.cutShort(runs[2]) == "" && runs[2].trace() != trace:
 		vars, ok, err := s.findVars(ctx, shellRun, trace)
 		if err != nil {
 			return err
@@ -200,7 +220,8 @@ func (s *search) prepare(ctx context.Context) error {
 		if !ok {
 			// The variables found are not enough, so the schedule depends
 			// on something else; keep them off replay lines.
-			s.newShell = true
+			where, paths := s.divergence(ctx, [2]*exec.Cmd{s.plain(1, "GODETBRANCH=0"), shellRun(vars)}, [2]string{"seed-1.dettrace", "seed-1-new-shell.dettrace"}, [2]string{"here", "in a new shell"})
+			s.newShell = "seed 1 runs another schedule in a new shell, and detsched could not find which of its variables cause it; " + divergenceNote(where, paths)
 			s.notice("seed 1 runs another schedule in a new shell")
 		} else {
 			s.vars = vars

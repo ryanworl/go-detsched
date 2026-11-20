@@ -33,6 +33,7 @@ import _ "unsafe" // for go:linkname
 //go:linkname detsimSetPanic github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_onPanic
 //go:linkname detsimBranch github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_branch
 //go:linkname detsimBusyOn github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_busyOn
+//go:linkname detsimSetNodeClock github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_setClock
 //go:linkname detsimSetCPU github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_setCPU
 //go:linkname detsimSetName github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_nodeName
 //go:linkname detsimBusyAdd github.com/ryanworl/go-detsched/misc/detsched/sdk/sim.runtime_busyAdd

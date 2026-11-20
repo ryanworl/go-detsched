@@ -109,6 +109,7 @@ func TestKV(t *testing.T) {
 
 - To excuse a check during faults, ask `x.CalmSince()` (or `Nemesis.CalmSince()`), which says whether every fault has ended, and since when. Don't count faults from `Event`.
 - Clock skips move wall clocks; `time.Since` and timers ignore them. A SUT that times leases by wall clock sees them end early or late by the skip.
+- Each node's clock drifts: from setup's end it runs within ±1% of the simulation's, and a nemesis `clockrate` fault runs one at 1/4 to 4 times. A lease or timeout measured on one node and enforced on another must allow for that drift, as on real machines; don't call `SetClockRate(1)` to hide a failure that needs it. Compare times only within one node, and stamp harness checks with `w.Elapsed()`.
 - Syncs take simulated time, up to seconds under the slow-sync faults, so a lease or election timeout can expire during one. Count a lease from when it was granted (`testdata/simlease` is an example of this bug).
 - Disable a fault site (`buggify.Disable("sim.disk.fsyncfail")`) only when the SUT documents that it does not survive that fault, with a comment saying so.
 
