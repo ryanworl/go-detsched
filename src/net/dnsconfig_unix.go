@@ -16,6 +16,10 @@ import (
 )
 
 // See resolv.conf(5) on a Linux machine.
+//
+// Under GOEXPERIMENT=detsched, nothing in this file counts ticks (see
+// parse.go), and it joins addresses and ports itself rather than with
+// JoinHostPort, which counts.
 func dnsReadConfig(filename string) *dnsConfig {
 	conf := &dnsConfig{
 		ndots:    1,
@@ -54,7 +58,11 @@ func dnsReadConfig(filename string) *dnsConfig {
 				// just an IP address. Otherwise we need DNS
 				// to look it up.
 				if _, err := netip.ParseAddr(f[1]); err == nil {
-					conf.servers = append(conf.servers, JoinHostPort(f[1], "53"))
+					if bytealg.IndexByteString(f[1], ':') >= 0 {
+						conf.servers = append(conf.servers, "["+f[1]+"]:53")
+					} else {
+						conf.servers = append(conf.servers, f[1]+":53")
+					}
 				}
 			}
 

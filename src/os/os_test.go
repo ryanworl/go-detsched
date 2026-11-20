@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"internal/goexperiment"
 	"internal/testenv"
 	"io"
 	"io/fs"
@@ -2014,6 +2015,9 @@ func testWindowsHostname(t *testing.T, hostname string) {
 }
 
 func TestHostname(t *testing.T) {
+	if goexperiment.DetSched {
+		t.Skip("GOEXPERIMENT=detsched: the host name is localhost on every machine")
+	}
 	t.Parallel()
 
 	hostname, err := Hostname()

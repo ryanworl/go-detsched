@@ -17,6 +17,10 @@ var (
 )
 
 func (f *File) writeTo(w io.Writer) (written int64, handled bool, err error) {
+	if goexperiment.DetSched {
+		// See readFrom.
+		return 0, false, nil
+	}
 	pfd, network := getPollFDAndNetwork(w)
 	// TODO(panjf2000): same as File.spliceToFile.
 	if pfd == nil || !pfd.IsStream || !isUnixOrTCP(string(network)) {
@@ -41,8 +45,14 @@ func (f *File) writeTo(w io.Writer) (written int64, handled bool, err error) {
 }
 
 func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
-	if goexperiment.DetSched && (f.pfd.Sysfd == 1 || f.pfd.Sysfd == 2) {
-		// Writes to fds 1 and 2 go to the runtime's buffer; see syscall.Write.
+	if goexperiment.DetSched {
+		// Copy in Go, as io.Copy does: whether copy_file_range(2),
+		// splice(2) or sendfile(2) works depends on the kernel and on
+		// the file systems of both files, and copying in Go instead
+		// counts ticks, so the copy would count other ticks on another
+		// machine. And writes to fds 1 and 2 go to the runtime's buffer
+		// (see syscall.Write), and a simulated file is never copied by
+		// the kernel either.
 		return 0, false, nil
 	}
 	// Neither copy_file_range(2) nor splice(2) supports destinations opened with

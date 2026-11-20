@@ -14,6 +14,14 @@ import (
 	"time"
 )
 
+// Under GOEXPERIMENT=detsched, nothing in this file or in
+// dnsconfig_unix.go counts ticks or synchronization points (see
+// detFuncPkgCounts in cmd/compile/internal/ir): the first lookup of any
+// name parses /etc/resolv.conf, which a container's runtime writes for
+// each container, so how much work parsing it does must not depend on
+// what it holds. readLine reads with File.Read, not io.ReadFull, which
+// counts.
+
 type file struct {
 	file  *os.File
 	data  []byte
@@ -50,14 +58,17 @@ func (f *file) readLine() (s string, ok bool) {
 	if s, ok = f.getLineFromData(); ok {
 		return
 	}
-	if len(f.data) < cap(f.data) {
+	for len(f.data) < cap(f.data) {
 		ln := len(f.data)
-		n, err := io.ReadFull(f.file, f.data[ln:cap(f.data)])
+		n, err := f.file.Read(f.data[ln:cap(f.data)])
 		if n >= 0 {
 			f.data = f.data[0 : ln+n]
 		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if err == io.EOF {
 			f.atEOF = true
+		}
+		if err != nil {
+			break
 		}
 	}
 	s, ok = f.getLineFromData()

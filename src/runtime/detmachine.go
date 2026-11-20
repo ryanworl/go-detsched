@@ -88,8 +88,11 @@ type detMachineBufT struct {
 //	           block size DC ZVA clears
 //	sSIG       x86: CPUID leaf 1's EAX, the family, model, and stepping
 //	cFAMILY    darwin/arm64: sysctl hw.cpufamily
+//	nNOFILE    Linux: the hard limit of open files (RLIMIT_NOFILE)
+//	uRELEASE   Linux: the kernel's release, as uname gives it, with
+//	           underscores for its dots; always the last field
 //
-// all but p in hex. Two machines with the same ID take the same code
+// p and n in decimal, u as text, and the others in hex. Two machines with the same ID take the same code
 // paths in code that reads the CPU itself.
 func detMachineID() string {
 	m := &detMachineBuf
@@ -112,6 +115,22 @@ func detMachineID() string {
 		if v, ok := detCPUFamily(); ok {
 			m.field('c', v)
 		}
+		if v, ok := detNofileMax(); ok {
+			m.field('n', v)
+		}
+		if r := detKernelRelease(); r != "" {
+			// Last: its dots are underscores, and it may hold any
+			// other character.
+			m.put('.')
+			m.put('u')
+			for i := 0; i < len(r); i++ {
+				c := r[i]
+				if c == '.' {
+					c = '_'
+				}
+				m.put(c)
+			}
+		}
 	}
 	return slicebytetostringtmp(&m.buf[0], m.n)
 }
@@ -128,7 +147,7 @@ func (m *detMachineBufT) field(c byte, v uint64) {
 	}
 	m.put(c)
 	base := uint64(16)
-	if c == 'p' {
+	if c == 'p' || c == 'n' {
 		base = 10
 	}
 	var d [20]byte
@@ -156,8 +175,9 @@ func (m *detMachineBufT) put(c byte) {
 // A detMachine is a parsed machine ID: the value of each field, by its
 // letter, and which fields it has.
 type detMachine struct {
-	v   [26]uint64
-	has uint32
+	v       [26]uint64
+	has     uint32
+	release string // field u
 }
 
 func (d *detMachine) get(c byte) (uint64, bool) {
@@ -172,10 +192,14 @@ func detMachineParse(id string) (d detMachine, ok bool) {
 			return d, false
 		}
 		base := uint64(16)
-		if c == 'p' {
+		if c == 'p' || c == 'n' {
 			base = 10
 		}
 		id = id[1:]
+		if c == 'u' {
+			d.release, d.has = id, d.has|1<<(c-'a')
+			break
+		}
 		var v uint64
 		n := 0
 		for ; n < len(id) && id[n] != '.'; n++ {
@@ -278,16 +302,27 @@ func detMachineDiffer() {
 		{'z', "DCZID", false},
 		{'s', "CPUID signature", false},
 		{'c', "hw.cpufamily", false},
+		{'n', "RLIMIT_NOFILE", false},
+		{'u', "kernel", false},
 		{'p', "page size", false},
 	} {
 		tv, tok := t.get(f.c)
 		hv, hok := h.get(f.c)
 		switch {
+		case f.c == 'u':
+			if t.release == h.release {
+				continue
+			}
+			print(" kernel ")
+			detPrintRelease(t.release)
+			print(" there, ")
+			detPrintRelease(h.release)
+			print(" here;")
 		case tv == hv && tok == hok:
 		case f.bits && tok && hok:
 			print(" ", f.name, " bits only there ", hex(tv&^hv), ", only here ", hex(hv&^tv), ";")
-		case f.c == 'p':
-			print(" page size ", tv, " there, ", hv, " here;")
+		case f.c == 'p' || f.c == 'n':
+			print(" ", f.name, " ", tv, " there, ", hv, " here;")
 		default:
 			print(" ", f.name, " ")
 			if tok {
@@ -304,11 +339,26 @@ func detMachineDiffer() {
 			print(" here;")
 		}
 	}
-	print(" det mode hides these from the standard library, but code that reads the CPU or the page size itself, such as golang.org/x/sys/cpu on x86 and darwin or github.com/klauspost/cpuid on x86, can choose other code by them, and so count other ticks, as can code that reads files about the machine that det mode does not replace\n")
+	print(" det mode hides the CPU from the standard library and shows every machine the same files about it, but code that reads the CPU or the page size itself, such as golang.org/x/sys/cpu on x86 and darwin or github.com/klauspost/cpuid on x86, can choose other code by them, and so count other ticks, as can code whose system calls another kernel or limit answers otherwise, or that reads files about the machine that det mode does not replace\n")
 }
 
 // detBisectHint tells the user of a replay that ran another schedule than
 // its replay line's how to find where the two runs part.
 func detBisectHint() {
 	print("detsched: to find where this run and the search's part, run the replay line here and where the search ran with GODETSTOP='s*100000' before GODETSEED=, and compare the stop lines: the first that differs brackets the switch; narrow it with GODETSTOP='sN*1000' from the last line that agrees, then to the tick with GODETSTOP='kN*100', and print both runs' stacks there with GODETSTOP=kN:dump\n")
+}
+
+// detPrintRelease prints a kernel release from a machine ID, with dots
+// for its underscores, or "unknown".
+func detPrintRelease(r string) {
+	if r == "" {
+		print("unknown")
+	}
+	for i := 0; i < len(r); i++ {
+		if r[i] == '_' {
+			print(".")
+		} else {
+			print(string(r[i : i+1]))
+		}
+	}
 }

@@ -18,16 +18,22 @@ import (
 // /proc/self/mountinfo, and the cgroup's cpu.max; memory-limit packages
 // read memory.max, /proc/meminfo, or sysinfo(2); others count the
 // processors in /proc/cpuinfo or /proc/stat, or read the CPUs online.
-// Parsing them counts ticks by their contents, as long as each machine's,
-// so in det mode the program sees one description, the same on every
-// machine: four CPUs (as runtime.NumCPU returns, see detNumCPU) with the
-// features det mode keeps, 16 GiB of memory, and a container at the root
-// of a cgroup v2 hierarchy without CPU or memory limits. Opening one of
-// these files outside every simulated node (whose file system is the
-// simulation's) gives a file that holds det mode's contents instead, a
-// cgroup v1 file does not exist, and sysinfo and sched_getaffinity for
-// the process report the same machine. Other files and the process's
-// real limits and affinity stay as they are.
+// Later, the first lookup of a name, even of localhost, reads
+// /etc/hosts, which a container runtime writes for each container, and
+// code reads the host name and the kernel's version. Parsing them counts
+// ticks by their contents, as long as each machine's, so in det mode the
+// program sees one description, the same on every machine: four CPUs (as runtime.NumCPU returns, see detNumCPU) with the
+// features det mode keeps, 16 GiB of memory, a container at the root of
+// a cgroup v2 hierarchy without CPU or memory limits, named localhost,
+// on Linux 6.8.0. Opening one of these files outside every simulated node
+// (whose file system is the simulation's) gives a file that holds det
+// mode's contents instead, a cgroup v1 file does not exist, and sysinfo,
+// sched_getaffinity, and uname for the process report the same machine.
+// Other files and the process's real limits and affinity stay as they
+// are. /etc/resolv.conf, which the first lookup also reads, stays the
+// machine's own, so that a lookup that reaches DNS works wherever it
+// would without det mode, and package net parses it without counting
+// ticks (see net/parse.go).
 
 // System calls det mode answers, and memfd_create and pwrite64 to make
 // the files; 0 on other architectures.
@@ -37,6 +43,8 @@ const (
 	detSysSchedGetaffinity = 204*goarch.IsAmd64 + 123*goarch.IsArm64
 	detSysMemfdCreate      = 319*goarch.IsAmd64 + 279*goarch.IsArm64
 	detSysPwrite           = 18*goarch.IsAmd64 + 68*goarch.IsArm64
+	detSysUname            = 63*goarch.IsAmd64 + 160*goarch.IsArm64
+	detSysPrctl            = 157*goarch.IsAmd64 + 167*goarch.IsArm64
 )
 
 // detMemKB is the memory det mode's machine has, in KiB.
@@ -67,7 +75,33 @@ var detMachineFiles = [...]struct{ path, content string }{
 	{"/sys/fs/cgroup/memory.min", "0\n"},
 	{"/sys/fs/cgroup/memory.swap.max", "max\n"},
 	{"/sys/fs/cgroup/pids.max", "max\n"},
+
+	// What the container's runtime writes for each container, and the
+	// kernel's name and version, as uname reports them too.
+	{"/etc/hostname", detHostname + "\n"},
+	{"/etc/hosts", detHosts},
+	{"/proc/sys/kernel/hostname", detHostname + "\n"},
+	{"/proc/sys/kernel/domainname", "(none)\n"},
+	{"/proc/sys/kernel/osrelease", detRelease + "\n"},
+	{"/proc/sys/kernel/ostype", "Linux\n"},
+	{"/proc/version", "Linux version " + detRelease + " (detsched) " + detKernelVersion + "\n"},
+	{"/proc/sys/net/core/somaxconn", "4096\n"},
 }
+
+// The host name, kernel release and version det mode's machine has.
+const (
+	detHostname      = "localhost"
+	detRelease       = "6.8.0"
+	detKernelVersion = "#1 SMP PREEMPT_DYNAMIC"
+)
+
+const detHosts = `127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::	ip6-localnet
+ff00::	ip6-mcastprefix
+ff02::1	ip6-allnodes
+ff02::2	ip6-allrouters
+`
 
 const detMeminfo = `MemTotal:       16777216 kB
 MemFree:        15728640 kB
@@ -268,14 +302,34 @@ func detMachineFile(path string) (content string, enoent, found bool) {
 // syscall_detMachineSyscall answers, for package syscall's Syscall,
 // Syscall6, and RawSyscall, the system calls of a goroutine on no
 // simulated node that describe the machine: openat of one of its files
-// (see detMachineFile), and sysinfo and sched_getaffinity. It reports
-// whether it answered the call. It must not grow the stack: the
+// (see detMachineFile), and sysinfo, sched_getaffinity, and uname. It
+// reports whether it answered the call. It must not grow the stack: the
 // arguments may point into it.
+//
+// On every goroutine, simulated nodes' too, since they share the CPU, it
+// fails prctl's PR_SVE_GET_VL and PR_SME_GET_VL, and their SET_VL, with
+// EINVAL, as on a CPU without SVE or SME: det mode hides both from the
+// HWCAP words (see detHWCapKeep), and code that asks the kernel for the
+// vector length instead would learn of them.
 //
 //go:linkname syscall_detMachineSyscall syscall.detMachineSyscall
 //go:nosplit
 func syscall_detMachineSyscall(trap, a1, a2, a3 uintptr) (r1, errno uintptr, ok bool) {
-	if detSysOpenat == 0 || trap != detSysOpenat && trap != detSysSysinfo && trap != detSysSchedGetaffinity {
+	const (
+		_EINVAL        = 22
+		_PR_SVE_SET_VL = 50
+		_PR_SVE_GET_VL = 51
+		_PR_SME_SET_VL = 63
+		_PR_SME_GET_VL = 64
+	)
+	if detSysPrctl != 0 && trap == detSysPrctl {
+		switch a1 {
+		case _PR_SVE_SET_VL, _PR_SVE_GET_VL, _PR_SME_SET_VL, _PR_SME_GET_VL:
+			return ^uintptr(0), _EINVAL, true
+		}
+		return
+	}
+	if detSysOpenat == 0 || trap != detSysOpenat && trap != detSysSysinfo && trap != detSysSchedGetaffinity && trap != detSysUname {
 		return
 	}
 	gp := getg()
@@ -347,6 +401,19 @@ func detMachineSyscall(trap, a1, a2, a3 uintptr) (r1, errno uintptr, ok bool) {
 		p[13] = 1024              // mem_unit, then padding
 		return 0, 0, true
 	}
+	if trap == detSysUname {
+		// struct utsname: six fields of 65 bytes.
+		u := (*[6][65]byte)(unsafe.Pointer(a1))
+		machine := "x86_64"
+		if GOARCH == "arm64" {
+			machine = "aarch64"
+		}
+		for i, v := range [6]string{"Linux", detHostname, detRelease, detKernelVersion, machine, "(none)"} {
+			u[i] = [65]byte{}
+			copy(u[i][:], v)
+		}
+		return 0, 0, true
+	}
 	if trap == detSysSchedGetaffinity {
 		if a1 != 0 && int(a1) != getpid() {
 			return 0, 0, false
@@ -358,4 +425,98 @@ func detMachineSyscall(trap, a1, a2, a3 uintptr) (r1, errno uintptr, ok bool) {
 		return 8, 0, true
 	}
 	return 0, 0, false
+}
+
+// getdents64, for os_runtime_detReadDir; 0 on other architectures.
+const detSysGetdents64 = 217*goarch.IsAmd64 + 61*goarch.IsArm64
+
+// os_runtime_detReadDir reads the whole directory open as fd, for package
+// os outside every simulated node, and returns its linux_dirent64
+// records sorted by name, or ok false where it does not. The order of
+// the kernel's records depends on the file system (ext4 orders them by a
+// hash seeded per file system, tmpfs by when they were made, overlayfs
+// and virtiofs by their own rules), and code that reads them in that
+// order, or reads them in chunks, counts other ticks on another machine;
+// so os reads them from here, where reading and sorting count no ticks.
+//
+//go:linkname os_runtime_detReadDir os.runtime_detReadDir
+func os_runtime_detReadDir(fd uintptr) (records []byte, errno uintptr, ok bool) {
+	if detSysGetdents64 == 0 || detsimNodeOf() != 0 {
+		return nil, 0, false
+	}
+	const _EINTR = 4
+	var all []byte
+	chunk := make([]byte, 8192)
+	for {
+		n, _, e := linux.Syscall6(detSysGetdents64, fd, uintptr(unsafe.Pointer(&chunk[0])), uintptr(len(chunk)), 0, 0, 0)
+		if e == _EINTR {
+			continue
+		}
+		if e != 0 {
+			return nil, e, true
+		}
+		if n == 0 {
+			break
+		}
+		all = append(all, chunk[:n]...)
+	}
+	// Each record: d_ino (8), d_off (8), d_reclen (2), d_type (1), and
+	// d_name, ended by a NUL.
+	const nameOff = 19
+	var offs []int32
+	for off := 0; off+nameOff <= len(all); {
+		reclen := int(all[off+16]) | int(all[off+17])<<8
+		if reclen < nameOff || off+reclen > len(all) {
+			break
+		}
+		offs = append(offs, int32(off))
+		off += reclen
+	}
+	name := func(off int32) []byte {
+		b := all[off+nameOff : int(off)+(int(all[off+16])|int(all[off+17])<<8)]
+		for i, c := range b {
+			if c == 0 {
+				return b[:i]
+			}
+		}
+		return b
+	}
+	less := func(a, b int32) bool {
+		x, y := name(a), name(b)
+		for i := 0; i < len(x) && i < len(y); i++ {
+			if x[i] != y[i] {
+				return x[i] < y[i]
+			}
+		}
+		return len(x) < len(y)
+	}
+	// Heapsort.
+	siftDown := func(root, n int) {
+		for {
+			child := 2*root + 1
+			if child >= n {
+				return
+			}
+			if child+1 < n && less(offs[child], offs[child+1]) {
+				child++
+			}
+			if !less(offs[root], offs[child]) {
+				return
+			}
+			offs[root], offs[child] = offs[child], offs[root]
+			root = child
+		}
+	}
+	for i := len(offs)/2 - 1; i >= 0; i-- {
+		siftDown(i, len(offs))
+	}
+	for i := len(offs) - 1; i > 0; i-- {
+		offs[0], offs[i] = offs[i], offs[0]
+		siftDown(0, i)
+	}
+	records = make([]byte, 0, len(all))
+	for _, off := range offs {
+		records = append(records, all[off:int(off)+(int(all[off+16])|int(all[off+17])<<8)]...)
+	}
+	return records, 0, true
 }

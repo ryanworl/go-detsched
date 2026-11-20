@@ -10,8 +10,11 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -108,6 +111,65 @@ var filesSum = func() int {
 	if os.Getenv("MACHINE_FILES") != "" {
 		fmt.Printf("files: cgroup %s mount %s cpu.max %q memory.max %q v1 %q %q\n", cgroupPath, mount, cpuMax, memMax, v1Quota, v1Mem)
 		fmt.Printf("files: processors %d stat %d online %s affinity %d memtotal %d sysinfo %d\n", processors, stat, online, affinity, memTotal, sysinfoTotal)
+	}
+	return n
+}()
+
+// hostSum reads what a container's runtime and kernel give each
+// container, as code does after init: the host name, the kernel's release,
+// /etc/resolv.conf and /etc/hosts through a lookup of localhost, a
+// directory's entries in the order the file system gives them, stopping
+// at the first that matches as code that looks for one does, and a copy
+// of one file to another, which the kernel can do on some file systems.
+// With MACHINE_FILES set it prints what it found.
+var hostSum = func() int {
+	n := 0
+	host, _ := os.Hostname()
+	var u syscall.Utsname
+	syscall.Uname(&u)
+	release := ""
+	for _, c := range u.Release {
+		if c == 0 {
+			break
+		}
+		release += string(rune(c))
+	}
+	addrs, err := net.LookupHost("localhost")
+	if err != nil {
+		addrs = []string{err.Error()}
+	}
+	dir, err := os.MkdirTemp("", "machine")
+	first := ""
+	copied := int64(0)
+	if err == nil {
+		defer os.RemoveAll(dir)
+		for i := range 40 {
+			os.WriteFile(filepath.Join(dir, "entry"+strconv.Itoa(i*37%41)), make([]byte, i*100), 0o644)
+		}
+		if f, err := os.Open(dir); err == nil {
+			names, _ := f.Readdirnames(-1)
+			f.Close()
+			for _, name := range names {
+				n += len(name)
+				if strings.HasSuffix(name, "7") {
+					first = name
+					break
+				}
+			}
+		}
+		src, err1 := os.Open(filepath.Join(dir, "entry"+strconv.Itoa(39*37%41)))
+		dst, err2 := os.Create(filepath.Join(dir, "copy"))
+		if err1 == nil && err2 == nil {
+			copied, _ = io.Copy(dst, src)
+		}
+		src.Close()
+		dst.Close()
+	}
+	for i := range len(host) + len(release) + len(strings.Join(addrs, " ")) {
+		n += leaf(i)
+	}
+	if os.Getenv("MACHINE_FILES") != "" {
+		fmt.Printf("host: %s release %s localhost %v first %s copied %d\n", host, release, addrs, first, copied)
 	}
 	return n
 }()

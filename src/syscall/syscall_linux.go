@@ -58,8 +58,9 @@ func detsimSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr, raw bool) (r1, r2, errn
 // detMachineSyscall answers, under GOEXPERIMENT=detsched, the system calls
 // that describe the machine, outside every simulated node, as the same
 // machine on every machine: openat of /proc/cpuinfo, /proc/meminfo, the
-// cgroup's files and others, sysinfo, and sched_getaffinity. It reports
-// whether it answered the call. It is provided by the runtime
+// cgroup's files, /etc/hosts and others, sysinfo, sched_getaffinity, and
+// uname. It reports whether it answered the call. It is provided by the
+// runtime
 // (runtime/detmachinefiles_linux.go).
 func detMachineSyscall(trap, a1, a2, a3 uintptr) (r1, errno uintptr, ok bool)
 

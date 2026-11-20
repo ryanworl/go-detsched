@@ -8,6 +8,7 @@ package os_test
 
 import (
 	"bytes"
+	"internal/goexperiment"
 	"io"
 	"math/rand"
 	. "os"
@@ -25,6 +26,9 @@ type (
 )
 
 func TestCopyFile(t *testing.T) {
+	if goexperiment.DetSched {
+		t.Skip("GOEXPERIMENT=detsched: files are copied in Go, not with copy_file_range")
+	}
 	sizes := []int{
 		1,
 		42,

@@ -4,6 +4,12 @@
 
 package runtime
 
+import (
+	"internal/goarch"
+	"internal/runtime/syscall/linux"
+	"unsafe"
+)
+
 // detAuxv returns the value of auxiliary vector entry tag that det mode
 // gives the process instead of val: the HWCAP words with only the bits of
 // detHWCapKeep, so that code that chooses by them, in the standard
@@ -67,11 +73,23 @@ var detAuxvTags = [...]uintptr{
 // detAuxvBuf holds the vector det mode shows, with its AT_NULL entry.
 var detAuxvBuf [2*len(detAuxvTags) + 2]uintptr
 
+// detMinSigStkSz is AT_MINSIGSTKSZ in det mode. The kernel's value is the
+// size of its signal frame, which holds the vector registers, and so
+// grows with the SVE or SME vector length on arm64 and the XSAVE area on
+// x86: code that read it would learn of the features det mode hides.
+// This is more than any of those frames needs.
+const detMinSigStkSz = 16384
+
 // detAuxvCanon returns the vector of detAuxvTags with the values of the
-// kernel's vector kv (as detAuxv masked them), for getAuxv.
+// kernel's vector kv (as detAuxv masked them), and detMinSigStkSz, for
+// getAuxv.
 func detAuxvCanon(kv []uintptr) []uintptr {
 	for i, tag := range detAuxvTags {
 		detAuxvBuf[2*i] = tag
+		if tag == detAT_MINSIGSTKSZ {
+			detAuxvBuf[2*i+1] = detMinSigStkSz
+			continue
+		}
 		for j := 0; j+1 < len(kv); j += 2 {
 			if kv[j] == tag {
 				detAuxvBuf[2*i+1] = kv[j+1]
@@ -80,4 +98,39 @@ func detAuxvCanon(kv []uintptr) []uintptr {
 		}
 	}
 	return detAuxvBuf[: 2*len(detAuxvTags) : 2*len(detAuxvTags)]
+}
+
+// detKernelBuf holds the kernel's release, as the kernel's uname gives
+// it, for the machine ID.
+var detKernelBuf [6][65]byte
+
+// detKernelRelease returns the kernel's release, which det mode's uname
+// hides (see detMachineSyscall).
+func detKernelRelease() string {
+	const sysUname = 63*goarch.IsAmd64 + 160*goarch.IsArm64
+	if sysUname == 0 {
+		return ""
+	}
+	if detKernelBuf[2][0] == 0 {
+		linux.Syscall6(sysUname, uintptr(unsafe.Pointer(&detKernelBuf)), 0, 0, 0, 0, 0)
+	}
+	n := 0
+	for n < len(detKernelBuf[2]) && detKernelBuf[2][n] != 0 {
+		n++
+	}
+	return slicebytetostringtmp(&detKernelBuf[2][0], n)
+}
+
+// detNofileMax returns the hard limit of open files.
+func detNofileMax() (uint64, bool) {
+	const sysPrlimit64 = 302*goarch.IsAmd64 + 261*goarch.IsArm64
+	const rlimitNofile = 7
+	var lim [2]uint64
+	if sysPrlimit64 == 0 {
+		return 0, false
+	}
+	if _, _, e := linux.Syscall6(sysPrlimit64, 0, rlimitNofile, 0, uintptr(unsafe.Pointer(&lim)), 0, 0); e != 0 {
+		return 0, false
+	}
+	return lim[1], true
 }

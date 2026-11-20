@@ -12,6 +12,7 @@ import (
 	"math/bits"
 	"os"
 	"slices"
+	"syscall"
 	_ "unsafe"
 )
 
@@ -21,11 +22,15 @@ func runtime_getAuxv() []uintptr
 // auxvSum ranges over the auxiliary vector, as golang.org/x/sys/cpu does
 // through getAuxv to find AT_HWCAP on arm64, and over /proc/self/auxv, as
 // github.com/klauspost/cpuid does, and does work for each HWCAP bit set,
-// as a library that chooses code by them would. With MACHINE_AUXV set it
-// prints the vector's tags, and whether the file holds the same vector.
+// as a library that chooses code by them would, and for each byte of
+// AT_MINSIGSTKSZ and of the SVE vector length that prctl gives, which
+// grow with the vector registers. With MACHINE_AUXV set it prints the
+// vector's tags, whether the file holds the same vector, AT_MINSIGSTKSZ
+// and what prctl(PR_SVE_GET_VL) returned.
 var auxvSum = func() int {
-	const atHWCap, atHWCap2 = 16, 26
+	const atHWCap, atHWCap2, atMinSigStkSz = 16, 26, 51
 	n := 0
+	var minSigStkSz uint64
 	a := runtime_getAuxv()
 	var tags, vec []uint64
 	for len(a) >= 2 {
@@ -36,6 +41,20 @@ var auxvSum = func() int {
 		if tag == atHWCap || tag == atHWCap2 {
 			n += hwcapSum(uint64(val))
 		}
+		if tag == atMinSigStkSz {
+			minSigStkSz = uint64(val)
+		}
+	}
+	const prSVEGetVL = 51
+	vl, _, e := syscall.Syscall(syscall.SYS_PRCTL, prSVEGetVL, 0, 0)
+	sve := e.Error()
+	if e == 0 {
+		sve = fmt.Sprint(vl)
+	} else {
+		vl = 0
+	}
+	for i := range int(minSigStkSz>>8 + uint64(vl)) {
+		n += leaf(i)
 	}
 	b, err := os.ReadFile("/proc/self/auxv")
 	var file []uint64
@@ -53,6 +72,7 @@ var auxvSum = func() int {
 	if os.Getenv("MACHINE_AUXV") != "" {
 		fmt.Println("auxv tags:", tags)
 		fmt.Println("auxv file same:", slices.Equal(vec, file))
+		fmt.Println("auxv minsigstksz:", minSigStkSz, "sve vl:", sve)
 	}
 	return n
 }()

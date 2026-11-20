@@ -6,6 +6,7 @@ package os_test
 
 import (
 	"bytes"
+	"internal/goexperiment"
 	"internal/poll"
 	"io"
 	"net"
@@ -16,6 +17,9 @@ import (
 )
 
 func TestSendFile(t *testing.T) {
+	if goexperiment.DetSched {
+		t.Skip("GOEXPERIMENT=detsched: files are copied in Go, not with sendfile")
+	}
 	sizes := []int{
 		1,
 		42,

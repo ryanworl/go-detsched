@@ -7,6 +7,7 @@ package os_test
 import (
 	"bytes"
 	"errors"
+	"internal/goexperiment"
 	"internal/poll"
 	"internal/testpty"
 	"io"
@@ -22,6 +23,9 @@ import (
 )
 
 func TestSpliceFile(t *testing.T) {
+	if goexperiment.DetSched {
+		t.Skip("GOEXPERIMENT=detsched: files are copied in Go, not with splice")
+	}
 	sizes := []int{
 		1,
 		42,

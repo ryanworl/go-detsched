@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched37
+v=go1.27.4-detsched38
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -239,7 +239,10 @@ auxiliary vector is the same on every machine and kernel, in
 `/proc/self/auxv`: the same entries in the same order, and HWCAP words
 that keep only what the standard library chooses code by (on arm64 FP,
 ASIMD, AES, PMULL, SHA1, SHA2, CRC32 and atomics, so not `HWCAP_CPUID`,
-with which libraries would read the ID registers). `runtime.NumCPU()`
+with which libraries would read the ID registers). `AT_MINSIGSTKSZ`,
+which grows with the vector registers, is the same everywhere, and
+`prctl`'s `PR_SVE_GET_VL` and `PR_SME_GET_VL` fail as on a CPU without
+SVE or SME. `runtime.NumCPU()`
 returns 4 on every machine, and `GOMAXPROCS` is 1. The runtime does not
 read the memory size, and reads the kernel version only for work outside
 the deterministic subset, such as copying real files.
@@ -268,18 +271,48 @@ smaller real memory limit, and files these directories hold that are not
 listed, such as `memory.current` or `/sys/devices/system/cpu/cpu0/`, are
 the machine's own.
 
+The container and the kernel are fixed the same way. A container's
+runtime writes `/etc/hosts`, `/etc/resolv.conf` and `/etc/hostname` for
+each container, and the first lookup of any name, even `localhost` in
+`net.Listen("tcp", "localhost:0")`, reads the first two. In det mode,
+outside simulated nodes, the host name is `localhost` (`os.Hostname`,
+`uname`, `/etc/hostname`, `/proc/sys/kernel/hostname`), `/etc/hosts`
+holds only the loopback names, and `uname`, `/proc/version` and
+`/proc/sys/kernel/osrelease` report Linux 6.8.0. `/etc/resolv.conf`
+stays the machine's own, so a lookup that reaches DNS works wherever it
+would without det mode, and package `net` parses it without counting
+ticks, so what it holds does not move the schedule, unless it is
+missing, names no name server or says `options no-reload`, which changes
+how often `net` reads it again.
+Files are copied in Go rather than by `copy_file_range`, `splice` or
+`sendfile`, which work on some file systems and kernels and not others.
+`os.File.ReadDir`, `Readdir` and `Readdirnames` return a real
+directory's entries sorted by name: the order the kernel gives them in
+depends on the file system (ext4 hashes names with a seed of its own,
+tmpfs orders them by when they were made), so code that stops at the
+first entry it wants did different work on another machine. Code that
+reads directories with `syscall.Getdents` or `golang.org/x/sys/unix`
+still sees the kernel's order. The kernel's real release and the hard
+limit of open files, which some code reads with `getrlimit`, stay
+visible, and the machine ID names them.
+
 This entry means the machine lacks one of the features kept, so the
 standard library runs other code here: search and replay on machines
 that have them. What det mode cannot hide is what code reads itself: the
 `CPUID` instruction on x86 (as `golang.org/x/sys/cpu` and
 `github.com/klauspost/cpuid` do), the ID registers on arm64 by code that
 does not check `HWCAP_CPUID`, sysctl on macOS, files about the machine
-other than those above, the page size (`os.Getpagesize`), the host name
-and the process ID. So replay lines carry the machine's ID (`machine=p4096.f...`:
-page size, CPU features, the kernel's HWCAP words, and the CPU's ID
-registers or signature), and a replay that runs another schedule on
+other than those above, the page size (`os.Getpagesize`), and the
+process ID. So replay lines carry the machine's ID (`machine=p4096.f...`:
+page size, CPU features, the kernel's HWCAP words, the CPU's ID
+registers or signature, the hard limit of open files, and the kernel's
+release), and a replay that runs another schedule on
 another machine says what differs, such as `CPU features only there:
-avx512f` or `MIDR 0x410fd401 there, unknown here`. To find the code that
+avx512f`, `MIDR 0x410fd401 there, unknown here` or `kernel
+6.10.14-linuxkit there, 6.1.0-28-cloud-arm64 here`. Only a replay line
+checks this: comparing the trace lines of `-seeds` runs on two machines
+does not, so replay a seed whose trace differs with its replay line on
+the other machine to see what differs. To find the code that
 differs, run the replay line on both machines with `GODETSTOP='s*100000'`
 and compare the stop lines (see `GODETSTOP` under
 [Replaying a failure](#replaying-a-failure)): the first that differs
@@ -624,7 +657,7 @@ before the search starts, such as when the package does not build, the
 file has only `end`, with `exit_status` 2 and `error`.
 
 ```json
-{"event":"start","time":"...","schema":1,"detsched":"go1.27.4-detsched37","mode":"search","package":".","binary":"/tmp/detsched-123/store.test","binary_sha256":"8aef...","cwd":"/src/store","args":["-test.run=^TestStore$"],"run":"^TestStore$","p":7,"seed_base":0,"n":1000,"timeout_s":600,"out":"/tmp/detsched-123"}
+{"event":"start","time":"...","schema":1,"detsched":"go1.27.4-detsched38","mode":"search","package":".","binary":"/tmp/detsched-123/store.test","binary_sha256":"8aef...","cwd":"/src/store","args":["-test.run=^TestStore$"],"run":"^TestStore$","p":7,"seed_base":0,"n":1000,"timeout_s":600,"out":"/tmp/detsched-123"}
 {"event":"run","time":"...","seed":7,"tape":"45:7,51:9","arm":"cell","forked":true,"result":"fail","exit_code":1,"trace":"0x180bd2a3779a224","switches":948814,"syncs":27753685,"machine":"p4096.f7ffdffff.h1f8bfbff.g2.s606a6","elapsed_s":41.2,"signature":"detsched: assertion failed: ...","branch":0,"group":1,"log":"/tmp/detsched-123/fail-1-1.log"}
 {"event":"fallback","time":"...","kind":"seed-1-ran-two-schedules","what":"...","cost":"...","fix":"...","docs":".../README.md#seed-1-ran-two-schedules"}
 {"event":"group","time":"...","id":1,"signature":"...","message":"...","details":"...","runs":147,"logs":["..."],"first":{"seed":7,"tape":"45:7,51:9","branch":0,"log":"..."},"replay":{"cwd":"/src/store","set":{"GODETSEED":"7","GODETBRANCH":"0","GODETSEARCH":"tape=45:7,51:9 trace=0x180bd2a3779a224 machine=..."},"unset":["NO_COLOR"],"argv":["/tmp/detsched-123/store.test","-test.run=^TestStore$"]},"replay_line":"cd /src/store && env -u NO_COLOR GODETSEED=7 ...","debug":{...,"argv":["dlv","exec","--disable-aslr","/tmp/detsched-123/debug/store.test","--","-test.run=^TestStore$"]},"debug_line":"...","reproduced":true,"replay_status":"reproduced","also":[{"signature":"...","runs":14,"log":"...","replay":{...}}],"faults":"needs: sim.disk.fsyncfail ..."}
@@ -746,10 +779,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched37:
+and release N's version is v0.N.0, so with go1.27.4-detsched38:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.37.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.38.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass

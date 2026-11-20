@@ -9,6 +9,7 @@ package os
 import (
 	"internal/byteorder"
 	"internal/goarch"
+	"internal/goexperiment"
 	"io"
 	"runtime"
 	"sync"
@@ -22,6 +23,10 @@ type dirInfo struct {
 	buf  *[]byte // buffer for directory I/O
 	nbuf int     // length of buf; return value from Getdirentries
 	bufp int     // location of next record in buf.
+
+	// Under GOEXPERIMENT=detsched, buf holds the whole directory, sorted
+	// by name (see readdir), and is not the pool's.
+	det bool
 }
 
 const (
@@ -38,7 +43,7 @@ var dirBufPool = sync.Pool{
 }
 
 func (d *dirInfo) close() {
-	if d.buf != nil {
+	if d.buf != nil && !d.det {
 		dirBufPool.Put(d.buf)
 		d.buf = nil
 	}
@@ -61,7 +66,30 @@ func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEn
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if goexperiment.DetSched && d.buf == nil && !d.det {
+		// The whole directory, sorted by name, so that the entries come
+		// in the same order, and in one chunk, on every file system.
+		var records []byte
+		var errno uintptr
+		ok := false
+		if err := f.pfd.RawControl(func(fd uintptr) {
+			records, errno, ok = runtime_detReadDir(fd)
+		}); err == nil && ok {
+			if errno != 0 {
+				return names, dirents, infos, &PathError{Op: "readdirent", Path: f.name, Err: syscall.Errno(errno)}
+			}
+			d.det = true
+			d.buf, d.nbuf, d.bufp = &records, len(records), 0
+		}
+	}
 	if d.buf == nil {
+		if d.det {
+			// Read to the end before.
+			if n > 0 {
+				return nil, nil, nil, io.EOF
+			}
+			return nil, nil, nil, nil
+		}
 		d.buf = dirBufPool.Get().(*[]byte)
 	}
 
@@ -80,6 +108,10 @@ func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEn
 
 	for n != 0 {
 		// Refill the buffer if necessary
+		if d.bufp >= d.nbuf && d.det {
+			d.buf = nil
+			break // EOF
+		}
 		if d.bufp >= d.nbuf {
 			d.bufp = 0
 			var errno error

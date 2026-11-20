@@ -75,17 +75,20 @@ func detFuncPkgCounts(fn *Func) bool {
 		return DetInlPkgCounts[i]
 	}
 	path := fn.Sym().Pkg.Path
-	if file, ok := detNoCountFiles[path]; ok && strings.HasSuffix(pos.Base().Filename(), file) {
-		return false
+	for _, file := range detNoCountFiles[path] {
+		if strings.HasSuffix(pos.Base().Filename(), file) {
+			return false
+		}
 	}
 	return DetPkgCounts(path)
 }
 
-// detNoCountFiles maps packages to a file of theirs where nothing counts
-// ticks, because how much work its code does depends on addresses or on
+// detNoCountFiles maps packages to files of theirs where nothing counts
+// ticks, because how much work their code does depends on addresses or on
 // the set of types in the binary, which differ between an optimized build
-// and one with -N -l. Each file declares its own copy of anything it would
-// otherwise call that counts, such as atomic.Pointer's methods.
+// and one with -N -l, or on files that differ between machines. Each file
+// declares its own copy of anything it would otherwise call that counts,
+// such as atomic.Pointer's methods.
 //
 //   - The hash tries of internal/sync (sync.Map, and the caches of
 //     reflect, encoding/json, encoding/gob and others keyed by types) and
@@ -93,10 +96,16 @@ func detFuncPkgCounts(fn *Func) bool {
 //     which for a pointer, such as a reflect.Type, is its address.
 //   - reflect's typesByString, which ArrayOf, SliceOf, PointerTo and
 //     others call: it binary-searches the types of the binary.
-var detNoCountFiles = map[string]string{
-	"internal/sync": "/hashtriemap.go",
-	"unique":        "/canonmap.go",
-	"reflect":       "/typesbystring.go",
+//   - net's parsing of /etc/resolv.conf, which the first lookup of any
+//     name reads, even of localhost, and a container's runtime writes
+//     for each container, with net's helpers for parsing files and
+//     netip's parsing of addresses, which it calls.
+var detNoCountFiles = map[string][]string{
+	"internal/sync": {"/hashtriemap.go"},
+	"unique":        {"/canonmap.go"},
+	"reflect":       {"/typesbystring.go"},
+	"net":           {"/dnsconfig_unix.go", "/parse.go"},
+	"net/netip":     {"/parse.go"},
 }
 
 // DetFuncCounts reports whether fn counts ticks and synchronization
