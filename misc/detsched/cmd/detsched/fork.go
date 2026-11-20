@@ -72,8 +72,10 @@ var forkReasons = map[uint64]struct{ why, fix string }{
 }
 
 // branchReasons maps the runtime's description of why a branch of a
-// composer timeline did not run (runtime.detForkWhy) to the reason.
+// composer timeline did not run (runtime.detForkWhy, or a failed fork,
+// whose errno follows ": ") to the reason.
 var branchReasons = map[string]uint64{
+	"fork failed":                     7,
 	"cgo":                             forkCgo,
 	"the P is not on the main thread": forkNotM0,
 	"an M is locked to a goroutine, in a system call, or slow to park":         forkBusyM,

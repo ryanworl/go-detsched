@@ -1717,10 +1717,13 @@ func detPickRunnable(pp *p) *g {
 		atomic.StoreRel(&pp.runqhead, h+1)
 		return gp
 	}
+	// The global run queue's index (detRunq) finds the goroutine, and
+	// the one before it, whose link to it is cut.
 	var prev *g
-	gp := sched.runq.head.ptr()
-	for i -= nl; i > 0; i-- {
-		prev, gp = gp, gp.schedlink.ptr()
+	k := int(i - nl)
+	gp := detRunqRemove(k)
+	if k > 0 {
+		prev = detRunqAt(k - 1)
 	}
 	if prev == nil {
 		sched.runq.head = gp.schedlink
@@ -1734,6 +1737,139 @@ func detPickRunnable(pp *p) *g {
 	sched.runq.size--
 	unlock(&sched.lock)
 	return gp
+}
+
+// detRunq indexes the global run queue by position, so that
+// detPickRunnable finds its uniform pick, and the goroutine before it, in
+// O(log n) instead of walking the queue's links: with tens of thousands of
+// runnable goroutines, the walk cost every picking switch as much as the
+// queue is long. Its slots hold the queue's goroutines in order, with
+// holes where goroutines left, and a Fenwick tree counts the occupied
+// ones. The global run queue's functions (globrunqput and the like) keep
+// it in step, under sched.lock. It lives outside the Go heap, and is
+// reached through uintptrs, so that it needs no write barriers, as those
+// functions may run during a stop of the world.
+var detRunq struct {
+	slots  uintptr // [cap]guintptr
+	tree   uintptr // [cap+1]int32, 1-based
+	cap    int
+	lo, hi int // the slots in use
+	n      int // goroutines in it
+}
+
+// detRunqSlot returns detRunq's slot i.
+//
+//go:nosplit
+func detRunqSlot(i int) *guintptr {
+	return (*guintptr)(unsafe.Pointer(detRunq.slots + uintptr(i)*goarch.PtrSize))
+}
+
+// detRunqTree returns entry i of detRunq's Fenwick tree.
+//
+//go:nosplit
+func detRunqTree(i int) *int32 {
+	return (*int32)(unsafe.Pointer(detRunq.tree + uintptr(i)*4))
+}
+
+// detRunqAdd adds d to the count of slot i.
+//
+//go:nowritebarrierrec
+func detRunqAdd(i int, d int32) {
+	for j := i + 1; j <= detRunq.cap; j += j & -j {
+		*detRunqTree(j) += d
+	}
+}
+
+// detRunqFind returns the slot of the kth goroutine, from 0.
+//
+//go:nowritebarrierrec
+func detRunqFind(k int) int {
+	pos := 0
+	for step := 1 << (bits.Len(uint(detRunq.cap)) - 1); step > 0; step >>= 1 {
+		if next := pos + step; next <= detRunq.cap && int(*detRunqTree(next)) <= k {
+			pos = next
+			k -= int(*detRunqTree(next))
+		}
+	}
+	return pos
+}
+
+// detRunqGrow moves detRunq's goroutines, in order, into new slots with
+// room on both sides.
+//
+//go:nowritebarrierrec
+func detRunqGrow() {
+	q := &detRunq
+	ptr := unsafe.Sizeof(guintptr(0))
+	n := max(1<<10, 4*(q.n+1))
+	slots := sysAlloc(uintptr(n)*ptr, &memstats.other_sys, "detsched run queue")
+	tree := sysAlloc(uintptr(n+1)*4, &memstats.other_sys, "detsched run queue")
+	if slots == nil || tree == nil {
+		throw("detsched: out of memory for the run queue's index")
+	}
+	oldSlots, oldTree, oldCap, lo, hi := q.slots, q.tree, q.cap, q.lo, q.hi
+	q.slots, q.tree, q.cap = uintptr(slots), uintptr(tree), n
+	q.lo = n / 4
+	q.hi = q.lo
+	for i := lo; i < hi; i++ {
+		if gp := *(*guintptr)(unsafe.Pointer(oldSlots + uintptr(i)*ptr)); gp != 0 {
+			*detRunqSlot(q.hi) = gp
+			*detRunqTree(q.hi + 1) = 1
+			q.hi++
+		}
+	}
+	for i := 1; i <= n; i++ { // turn the counts into a Fenwick tree
+		if j := i + i&-i; j <= n {
+			*detRunqTree(j) += *detRunqTree(i)
+		}
+	}
+	if oldCap > 0 {
+		sysFree(unsafe.Pointer(oldSlots), uintptr(oldCap)*ptr, &memstats.other_sys)
+		sysFree(unsafe.Pointer(oldTree), uintptr(oldCap+1)*4, &memstats.other_sys)
+	}
+}
+
+// detRunqPush adds gp at the tail of detRunq, or at its head if front.
+//
+//go:nowritebarrierrec
+func detRunqPush(gp *g, front bool) {
+	q := &detRunq
+	if front && q.lo == 0 || !front && q.hi == q.cap {
+		detRunqGrow()
+	}
+	i := q.hi
+	if front {
+		q.lo--
+		i = q.lo
+	} else {
+		q.hi++
+	}
+	detRunqSlot(i).set(gp)
+	detRunqAdd(i, 1)
+	q.n++
+}
+
+// detRunqRemove removes and returns the kth goroutine of detRunq, from 0.
+//
+//go:nowritebarrierrec
+func detRunqRemove(k int) *g {
+	q := &detRunq
+	i := detRunqFind(k)
+	gp := detRunqSlot(i).ptr()
+	*detRunqSlot(i) = 0
+	detRunqAdd(i, -1)
+	q.n--
+	if q.n == 0 {
+		q.lo, q.hi = q.cap/4, q.cap/4
+	}
+	return gp
+}
+
+// detRunqAt returns the kth goroutine of detRunq, from 0.
+//
+//go:nowritebarrierrec
+func detRunqAt(k int) *g {
+	return detRunqSlot(detRunqFind(k)).ptr()
 }
 
 // detSyncs is the number of synchronization points left before the

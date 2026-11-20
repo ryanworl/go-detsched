@@ -206,6 +206,79 @@ func TestForkTree(t *testing.T) {
 	}
 }
 
+// TestForkStoppedBranches checks that a program the search runs to a stop
+// forks none of the composer branches it passes (testdata/simbranchstop,
+// whose branches all fail and run on past the next stop): before, a
+// branch a setup root or a cell's program forked failed in every run
+// forked from it, and its replay line applied the run's branch points
+// inside the branch, which ran another schedule. A run forked from a
+// cell's program reports a branch it reached itself, and the replay
+// lines of the branch and of the timeline, with the run's tape, run the
+// schedules the run printed.
+func TestForkStoppedBranches(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/simbranchstop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	env := []string{"GODETSEED=1"}
+	base, _, err := runBin(bin, append(env, "GODETBRANCH=0")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switches := atou(switchesField.FindStringSubmatch(base.trace + " ")[1])
+	s, err := startForkServer(command(bin, env...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	// A cell's program, as a search stops one: the root runs to a third
+	// of the run and forks a child that goes on as it, to two thirds.
+	if ok, err := s.run(switches / 3); !ok || err != nil {
+		t.Fatalf("run to switch %d: %v, %v", switches/3, ok, err)
+	}
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	pid, cell, err := s.branch(1|detBranchGoesOn, 0, branchFiles{stdout: devnull, stderr: devnull, control: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cell.close()
+		s.wait(pid)
+	}()
+	if ok, err := cell.run(2 * switches / 3); !ok || err != nil {
+		t.Fatalf("cell: run to switch %d: %v, %v", 2*switches/3, ok, err)
+	}
+	got, err := cell.branchOutcome(2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`branch (\d+) fails`).FindStringSubmatch(got.stdout)
+	traces := traceLine.FindAllString(got.stderr, -1)
+	if got.exitCode == 0 || m == nil || len(traces) == 0 {
+		t.Fatalf("forked run: exit status %d, want a failing branch, and the timeline's trace line after the branch's:\n%+v", got.exitCode, got)
+	}
+	tape := fmt.Sprintf("GODETSEARCH=tape=%d:%d,%d:2", s.at, uint64(1|detBranchGoesOn), cell.at)
+	branch, _, err := runBin(bin, append(env, tape, "GODETBRANCH="+m[1])...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.trace != got.trace || !strings.Contains(branch.stdout, m[0]) {
+		t.Errorf("GODETBRANCH=%s %s ran %s, printing %q; the forked run's branch ran %s", m[1], tape, branch.trace, branch.stdout, got.trace)
+	}
+	timeline, _, err := runBin(bin, append(env, tape, "GODETBRANCH=0")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.TrimPrefix(traces[0], "detsched: "); timeline.trace != want {
+		t.Errorf("GODETBRANCH=0 %s ran %s; the forked run's timeline ran %s", tape, timeline.trace, want)
+	}
+}
+
 // TestForkRefused checks that a program with a file registered with the
 // network poller, or a regular file open, refuses to fork, and that it
 // continues normally after.
@@ -636,6 +709,84 @@ func TestSearchCompose(t *testing.T) {
 	out, _ = exec.Command("sh", "-c", strings.Replace(debug, "dlv exec --disable-aslr ", "", 1)).CombinedOutput()
 	if !strings.Contains(string(out), s.groups[0].sig) || strings.Contains(string(out), "warning: this run's schedule is not") {
 		t.Errorf("%s printed\n%.3000s\nwant %s on the same schedule", debug, out, s.groups[0].sig)
+	}
+}
+
+// TestSearchSeedOneBranches checks that the runs of seed 1 that the search
+// compares with the base run, which runs the timeline without its
+// composer branches, run without them too (testdata/simbranchstop, whose
+// branches all fail): with them, a failing branch's trace line comes
+// first, and the search said that seed 1 ran two different schedules and
+// that debug lines run the optimized binary.
+func TestSearchSeedOneBranches(t *testing.T) {
+	s := newTestSearch(t, "../../testdata/simbranchstop")
+	s.workers, s.only, s.noFork = 2, armFresh, true
+	if err := s.run(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	<-s.debugDone
+	if s.unstable != "" || s.debugBin == "" {
+		t.Errorf("seed 1 rechecked as unstable (%q), or debug lines kept the optimized binary (%s):\n%s", s.unstable, s.debugNote, searchReport(s))
+	}
+}
+
+// TestSearchMemStoppedSeedOne checks that a run of seed 1 that guardMem
+// stops when memory runs low, in recheck or buildDebug, counts as no
+// answer: before, its cut trace line made the search say that seed 1 ran
+// two different schedules, and that the build without optimizations ran
+// another one. testdata/memstop computes long enough to be stopped.
+func TestSearchMemStoppedSeedOne(t *testing.T) {
+	s := newTestSearch(t, "../../testdata/memstop")
+	s.workers, s.only, s.noFork = 1, armFresh, true
+	if err := s.run(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	<-s.debugDone
+	if s.unstable != "" || s.debugBin == "" {
+		t.Fatalf("with memory to spare, seed 1 rechecked as unstable (%q), or debug lines kept the optimized binary (%s)", s.unstable, s.debugNote)
+	}
+	// Now memory is low, as guardMem sees it, and it stops every run.
+	defer func(f func() (uint64, uint64)) { readMemory = f }(readMemory)
+	readMemory = func() (uint64, uint64) { return 1, 100 }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.guardMem(ctx)
+	s.recheck()
+	s.debugBin, s.debugDone = "", make(chan bool)
+	os.RemoveAll(s.temp("debug"))
+	s.buildDebug(ctx)
+	if s.unstable != "" || !strings.Contains(s.debugNote, "memory ran low") {
+		t.Errorf("seed 1 rechecked as unstable (%q), or the debug note does not say that memory ran low: %s", s.unstable, s.debugNote)
+	}
+}
+
+// TestSearchBranchLimit checks that a run whose first branch fails, and
+// whose second then stops at the livelock limit, after the timeline's
+// output (testdata/simbranchlimit), replays the first: the failure the
+// search reports is the first branch's, which comes first. Before, the
+// replay line took the second branch's number and trace, from the last
+// "did not finish" in the output, without its limits, and ran it to a
+// pass.
+func TestSearchBranchLimit(t *testing.T) {
+	s := newTestSearch(t, "../../testdata/simbranchlimit")
+	s.workers, s.only, s.noFork = 2, armFresh, true
+	if err := s.run(context.Background(), 3); err != nil {
+		t.Fatal(err)
+	}
+	g := findGroup(s, "detsched: assertion failed: the first branch's check holds")
+	if g == nil || len(s.groups) != 1 {
+		t.Fatalf("want one group, for the first branch:\n%s", searchReport(s))
+	}
+	log, err := os.ReadFile(g.logs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := traceHash.FindSubmatch(log)
+	if !bytes.Contains(log, []byte("detsched: branch 2 (GODETBRANCH=2 runs it in place)")) || trace == nil {
+		t.Fatalf("the run did not stop the second branch at a limit after the first branch's failure:\n%s", log)
+	}
+	if g.status != "reproduced" || !strings.Contains(g.replay, " GODETBRANCH=1 ") || !strings.Contains(g.replay, "trace="+string(trace[1])) {
+		t.Errorf("replay %s %s, want GODETBRANCH=1 and the first branch's trace=%s", g.replay, g.status, trace[1])
 	}
 }
 

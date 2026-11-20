@@ -7373,6 +7373,9 @@ func mgetSpecific(mp *m) *m {
 func globrunqput(gp *g) {
 	assertLockHeld(&sched.lock)
 
+	if goexperiment.DetSched {
+		detRunqPush(gp, false)
+	}
 	sched.runq.pushBack(gp)
 }
 
@@ -7384,6 +7387,9 @@ func globrunqput(gp *g) {
 func globrunqputhead(gp *g) {
 	assertLockHeld(&sched.lock)
 
+	if goexperiment.DetSched {
+		detRunqPush(gp, true)
+	}
 	sched.runq.push(gp)
 }
 
@@ -7396,6 +7402,13 @@ func globrunqputhead(gp *g) {
 func globrunqputbatch(batch *gQueue) {
 	assertLockHeld(&sched.lock)
 
+	if goexperiment.DetSched {
+		gp := batch.head.ptr()
+		for range batch.size {
+			detRunqPush(gp, false)
+			gp = gp.schedlink.ptr()
+		}
+	}
 	sched.runq.pushBackAll(*batch)
 	*batch = gQueue{}
 }
@@ -7409,6 +7422,9 @@ func globrunqget() *g {
 		return nil
 	}
 
+	if goexperiment.DetSched {
+		detRunqRemove(0)
+	}
 	return sched.runq.pop()
 }
 
@@ -7425,6 +7441,11 @@ func globrunqgetbatch(n int32) (gp *g, q gQueue) {
 
 	gp = sched.runq.pop()
 	n--
+	if goexperiment.DetSched {
+		for range n + 1 {
+			detRunqRemove(0)
+		}
+	}
 
 	for ; n > 0; n-- {
 		gp1 := sched.runq.pop()

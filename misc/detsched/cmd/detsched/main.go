@@ -480,10 +480,12 @@ func (r *result) trace() string { return string(traceLine.Find(r.output)) }
 // stopped returns the branch of the composer timeline that a run
 // stopped at one of its limits stopped in, or 0 for the timeline, and
 // the trace line printed where it stopped, or for another run, those of
-// its failure.
+// its failure. A run whose failure came first, such as a branch's
+// assertion, is another run, though a branch forked after it stopped at
+// a limit, with a report after the timeline's.
 func (r *result) stopped() (int, string) {
 	i := bytes.Index(r.output, []byte("detsched: did not finish: "))
-	if i < 0 {
+	if i < 0 || !r.runaway() {
 		return r.branch(), r.trace()
 	}
 	rest := r.output[i:]
@@ -735,7 +737,9 @@ func (s *search) debugLine(g *group) string {
 // and runs seed 1 in it: with detsched's ticks, which count where the
 // source has them, it runs the same schedule as the optimized build
 // unless the program reads its own stacks or its work depends on heap
-// addresses, and then debug lines keep the optimized binary.
+// addresses, and then debug lines keep the optimized binary. Like the
+// base run, it runs the timeline without its composer branches
+// (GODETBRANCH=0), whose trace lines would come first if they failed.
 func (s *search) buildDebug(ctx context.Context) {
 	defer close(s.debugDone)
 	dir := filepath.Join(s.out, "debug")
@@ -748,14 +752,15 @@ func (s *search) buildDebug(ctx context.Context) {
 	// Up to three runs: a run on a loaded machine can leave the
 	// deterministic subset, such as when a system call outlasts the
 	// watchdog, while a build that runs another schedule does so every
-	// time.
-	for try := 0; err == nil && try < 3 && (r == nil || r.trace() != s.baseTrace); try++ {
-		cmd := s.plain(1, addSearch(nil, "feedback=1")...)
+	// time. A run guardMem stopped when memory ran low says nothing of
+	// its schedule.
+	for try := 0; err == nil && try < 3 && (r == nil || r.outOfMem || r.trace() != s.baseTrace); try++ {
+		cmd := s.plain(1, append(addSearch(nil, "feedback=1"), "GODETBRANCH=0")...)
 		cmd.Path, cmd.Args[0] = bin, bin
 		r, err = s.exec(context.WithoutCancel(ctx), cmd)
 	}
 	var where string
-	if err == nil && r.trace() != s.baseTrace {
+	if err == nil && !r.outOfMem && r.trace() != s.baseTrace {
 		where = s.debugDivergence(context.WithoutCancel(ctx), bin)
 	}
 	s.mu.Lock()
@@ -765,6 +770,9 @@ func (s *search) buildDebug(ctx context.Context) {
 	case err != nil:
 		s.debugNote = fmt.Sprintf("building or running it without optimizations failed: %v", truncate(err.Error(), 500))
 		s.notice("debug lines run the optimized binary: building or running it without optimizations failed")
+	case r.outOfMem:
+		s.debugNote = "its runs of seed 1, which check that it runs the same schedules, were stopped three times when memory ran low"
+		s.notice("debug lines run the optimized binary: memory ran low while checking its build without optimizations")
 	case r.trace() != s.baseTrace:
 		s.debugNote = fmt.Sprintf("its build without optimizations (-gcflags=all=-N -l) ran seed 1 on another schedule three times (%s, not %s)%s", strings.TrimPrefix(r.trace(), "detsched: "), strings.TrimPrefix(s.baseTrace, "detsched: "), where)
 		s.notice("debug lines run the optimized binary: its build without optimizations runs another schedule")
@@ -795,7 +803,7 @@ func (s *search) debugDivergence(ctx context.Context, bin string) string {
 	// ", after ".
 	type line struct{ head, after string }
 	switches := func(path string) []line {
-		cmd := s.plain(1, "GODETSEARCH=feedback=1")
+		cmd := s.plain(1, "GODETSEARCH=feedback=1", "GODETBRANCH=0")
 		cmd.Path, cmd.Args[0] = path, path
 		godebug := "dettrace=2"
 		if v, ok := lookupEnv(cmd.Env, "GODEBUG"); ok && v != "" {
@@ -1167,18 +1175,33 @@ func (s *search) run(ctx context.Context, n uint64) error {
 	return firstErr
 }
 
-// recheck runs seed 1 once more, a minute or more after the base run in
-// real time, and warns if it runs another schedule: a program that reads
-// the real clock outside a bubble, such as at init, often runs the same
-// schedule in two runs started at once. A signal, also after -duration
-// ended the search, stops it and goes on to the summary.
+// recheck runs seed 1 once more, without its composer branches as the
+// base run, a minute or more after it in real time, and warns if it runs
+// another schedule: a program that reads the real clock outside a
+// bubble, such as at init, often runs the same schedule in two runs
+// started at once. A signal, also after -duration ended the search,
+// stops it and goes on to the summary.
 func (s *search) recheck() {
 	ctx := s.signals
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	r, err := s.exec(ctx, s.plain(1))
-	if err != nil || r.trace() == s.baseTrace {
+	// A run guardMem stopped when memory ran low says nothing of its
+	// schedule: run it again, up to three times.
+	var r *result
+	var err error
+	for try := 0; try < 3 && (r == nil || r.outOfMem); try++ {
+		if r, err = s.exec(ctx, s.plain(1, "GODETBRANCH=0")); err != nil {
+			return
+		}
+	}
+	if r.outOfMem {
+		s.mu.Lock()
+		s.printf("detsched: seed 1's check was stopped three times when memory ran low; its schedule was not checked again\n")
+		s.mu.Unlock()
+		return
+	}
+	if r.trace() == s.baseTrace {
 		return
 	}
 	s.mu.Lock()
@@ -1381,8 +1404,9 @@ func replayVerdict(status string) string {
 // not run because the process could not fork. s.mu must be held.
 func (s *search) countSkipped(out []byte) {
 	if m := skippedLine.FindSubmatch(out); m != nil {
+		why, _, _ := strings.Cut(string(m[1]), ": ")
 		s.skipped++
-		s.skipWhy[branchReasons[string(m[1])]]++
+		s.skipWhy[branchReasons[why]]++
 	}
 }
 

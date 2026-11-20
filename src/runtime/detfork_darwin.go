@@ -55,9 +55,16 @@ func detForkFork() (r, errno uintptr) {
 	return c.r, c.errno
 }
 
-// detForkSelf records the pthread of the child's only thread.
+// detForkSelf records the pthread of the child's only thread and gives
+// it its signal stack again: unlike Linux, macOS does not keep the
+// forking thread's alternate signal stack in the child. Without it a
+// signal, such as the SIGSEGV of a nil dereference that the program
+// recovers from, is handled on the goroutine's stack, where the handler
+// finds no signal stack it knows and waits for good for an M that a
+// program without cgo never has.
 func detForkSelf() {
 	getg().m.procid = uint64(pthread_self())
+	minitSignalStack()
 }
 
 // detForkResetM resets the runtime's per-thread state of mp, an M in a

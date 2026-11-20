@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched29
+v=go1.27.4-detsched30
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -569,10 +569,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched29:
+and release N's version is v0.N.0, so with go1.27.4-detsched30:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.29.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.30.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TestCheck checks that each corpus program inside the deterministic
@@ -589,10 +590,11 @@ func TestSimBranchInline(t *testing.T) {
 	if inline.trace != forked.trace { // the first trace line, the branch's
 		t.Errorf("%s: trace %q, want the forked branch's %q", m[2], inline.trace, forked.trace)
 	}
-	// A process forked from the timeline after the branch failed, as a
-	// search forks a cell's stopped program, writes the branch's output
-	// too: here, a child that goes on as the run did, from the timeline's
-	// last switch, writes what the run wrote.
+	// A program the search runs to a stop, as it runs a cell's, forks no
+	// branches, so a process forked from it writes the timeline's output
+	// without theirs: here, a child that goes on as the run did, from the
+	// timeline's last switch, writes what the run with GODETBRANCH=0
+	// wrote.
 	// Its trace line is the one no "detsched: branch" line follows: the
 	// output of another failing branch may come after it.
 	var last string
@@ -617,8 +619,12 @@ func TestSimBranchInline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child.stdout != forked.stdout || child.exitCode != forked.exitCode {
-		t.Errorf("forked after the branch failed: exit status %d, stdout\n%s\nwant %d and the run's\n%s", child.exitCode, child.stdout, forked.exitCode, forked.stdout)
+	timeline, _, err := runBin(bin, append(env, "GODETBRANCH=0")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.stdout != timeline.stdout || child.exitCode != timeline.exitCode {
+		t.Errorf("forked from the program stopped after the branch: exit status %d, stdout\n%s\nwant %d and, as with GODETBRANCH=0,\n%s", child.exitCode, child.stdout, timeline.exitCode, timeline.stdout)
 	}
 	passing := []string{"GODETSEED=1"}
 	a, _, err := runBin(bin, passing...)
@@ -758,6 +764,14 @@ func TestSimPrograms(t *testing.T) {
 			"detsched: branch 1 did not run: the process cannot fork now",
 			"the second branch passes branch 2 exited with status 1 (GODETBRANCH=2 runs it in place)",
 		}},
+		// A forked branch that recovers from a nil dereference passes, as
+		// it does in place; before, on macOS, it hung. A branch that
+		// wait4 fails for is reported with the errno; before, as exit
+		// status 1.
+		{pkg: "simbranchsignal", exit: 3, want: []string{
+			"the second branch passes branch 2: wait4 failed: ECHILD (GODETBRANCH=2 runs it in place)",
+			"timeline done",
+		}},
 	} {
 		if tc.seeds == nil {
 			tc.seeds = []string{"1"}
@@ -822,6 +836,34 @@ func TestSimKill(t *testing.T) {
 		}
 		if len(x.failures) > 0 {
 			t.Errorf("%s %s: got %s, want no failures", tc.pkg, strings.Join(tc.env, " "), x.report())
+		}
+	}
+}
+
+// TestManyRunnable checks that a switch costs little with tens of
+// thousands of runnable goroutines, under each perturbation strategy
+// (testdata/manyrunnable). The random walk's uniform pick walked the global
+// run queue to its pick, and PCT scanned it for the highest priority, so
+// each run took from half a minute to over ten.
+func TestManyRunnable(t *testing.T) {
+	bin, cleanup, err := build(config{}, "../../testdata/manyrunnable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	for _, tc := range []struct{ seed, perturb string }{{"4", "walk"}, {"5", "walk"}, {"2", "pct"}} {
+		cmd := command(bin, "GODETSEED="+tc.seed, "GODETSEARCH=perturb="+tc.perturb)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		timer := time.AfterFunc(30*time.Second, func() { cmd.Process.Kill() })
+		err := cmd.Wait()
+		timer.Stop()
+		if wall := time.Since(start); err != nil || stdout.String() != "449985000\n" {
+			t.Errorf("GODETSEED=%s perturb=%s: %v after %v, output %q, want 449985000 within 30s\n%s", tc.seed, tc.perturb, err, wall.Round(time.Millisecond), stdout.String(), stderr.String())
 		}
 	}
 }

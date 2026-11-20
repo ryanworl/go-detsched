@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -128,12 +129,23 @@ func feedbackKind(i int) string {
 	return feedbackKinds[min(i>>feedbackBits, len(feedbackKinds)-1)]
 }
 
-// prepare runs the base run, seed 1, twice, and sets up the search from
-// it: the root switch, the switch limit, the feedback kinds that count,
-// and the seen map.
+// prepare runs the base run, seed 1, three times, and sets up the search
+// from it: the root switch, the switch limit, the feedback kinds that
+// count, and the seen map.
+//
+// What it takes from these runs is the main timeline's: its trace line,
+// output, switches, and feedback, which a branch of a composer timeline
+// (sim.Branch) never adds to, as a branch closes the feedback descriptor.
+// So they run with GODETBRANCH=0, which runs the timeline without
+// forking its branches, rather than wait for each branch to run its
+// terminal phase. The base run, recorded as the search's first, checks
+// seed 1's timeline but not its branches.
 func (s *search) prepare(ctx context.Context) error {
 	feedback := s.temp("base.feedback")
 	defer os.Remove(feedback)
+	shellRun := func(vars []string) *exec.Cmd {
+		return s.shellRun(append([]string{"GODETBRANCH=0"}, vars...))
+	}
 	// The third run checks that the base run needs no variables of our
 	// environment that a new shell lacks.
 	var runs [3]*result
@@ -143,12 +155,12 @@ func (s *search) prepare(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			cmd := s.plain(1, addSearch(nil, "feedback=1")...)
+			cmd := s.plain(1, append(addSearch(nil, "feedback=1"), "GODETBRANCH=0")...)
 			switch i {
 			case 0:
-				cmd = s.plain(1, addSearch(nil, "feedback="+feedback)...)
+				cmd = s.plain(1, append(addSearch(nil, "feedback="+feedback), "GODETBRANCH=0")...)
 			case 2:
-				cmd = s.shellRun(nil)
+				cmd = shellRun(nil)
 			}
 			runs[i], errs[i] = s.exec(ctx, cmd)
 		}()
@@ -181,7 +193,7 @@ func (s *search) prepare(ctx context.Context) error {
 		s.unstable = fmt.Sprintf("seed 1 ran two different schedules in two runs started at once: %q, then %q", strings.TrimPrefix(trace, "detsched: "), strings.TrimPrefix(runs[1].trace(), "detsched: "))
 		s.notice(s.unstable)
 	} else if runs[2].trace() != trace {
-		vars, ok, err := s.findVars(ctx, s.shellRun, trace)
+		vars, ok, err := s.findVars(ctx, shellRun, trace)
 		if err != nil {
 			return err
 		}
@@ -806,6 +818,9 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 	hung := err == errHung
 	timedOut := errors.Is(err, os.ErrDeadlineExceeded) || hung
 	child.close()
+	// Untrack it before the wait reaps it, after which guardMem's signals
+	// could reach another process.
+	outOfMem, memAtStop := untrack()
 	p.mu.Lock()
 	_, werr := p.srv.wait(pid)
 	p.mu.Unlock()
@@ -818,7 +833,7 @@ func (s *search) forkRun(ctx context.Context, p *proc, c *cell, bseed uint64) (*
 	hits, _ := os.ReadFile(fb.Name())
 	output, size := readOutput(out.Name())
 	r := &result{seed: c.seed, yield: c.yield, tape: tape, output: output, outputSize: size, exitCode: -1, timedOut: timedOut, hung: hung, wall: time.Since(start), limits: p.limits}
-	r.outOfMem, r.memAtStop = untrack()
+	r.outOfMem, r.memAtStop = outOfMem, memAtStop
 	var novelAt uint64
 	if len(hits) == len(s.seen)+32 {
 		r.exitCode = int(int64(binary.LittleEndian.Uint64(hits[len(s.seen):])))
@@ -893,11 +908,14 @@ func (s *search) closeAll() {
 	}
 }
 
+// readMemory is memory, which tests replace.
+var readMemory = memory
+
 // memLow reports whether less than a quarter of the memory is available,
 // and reports it the first time. A run may take much more memory than the
 // base run. s.mu must be held.
 func (s *search) memLow() bool {
-	avail, total := memory()
+	avail, total := readMemory()
 	low := avail < total/4
 	if low && !s.lowMem {
 		s.lowMem = true
@@ -950,7 +968,7 @@ func (s *search) guardMem(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		if avail, total := memory(); avail >= total/10 {
+		if avail, total := readMemory(); avail >= total/10 {
 			continue
 		}
 		s.mu.Lock()
@@ -989,8 +1007,10 @@ var errHung = errors.New("still running when the search ended")
 // runSrv runs f, which waits for a reply from srv, within the run's
 // timeout from start, and stops process pid when it passes or ctx is
 // done: with SIGQUIT, for its stacks, after the timeout or when the run
-// may hang (errHung), else with SIGKILL. It then clears the deadline,
-// since srv may be kept and serve other runs.
+// may hang (errHung), and then SIGKILL if it has not exited in 10s, else
+// with SIGKILL. It signals pid only before it returns, while the process
+// is not yet reaped. It then clears the deadline, since srv may be kept
+// and serve other runs.
 func (s *search) runSrv(ctx context.Context, srv *forkServer, pid int, start time.Time, f func() (bool, error)) (bool, error) {
 	srv.conn.SetReadDeadline(start.Add(s.timeout))
 	stop := context.AfterFunc(ctx, func() { srv.conn.SetReadDeadline(time.Now()) })
@@ -1002,14 +1022,18 @@ func (s *search) runSrv(ctx context.Context, srv *forkServer, pid int, start tim
 		}
 		err = errHung
 	}
-	srv.conn.SetReadDeadline(time.Time{})
 	if errors.Is(err, os.ErrDeadlineExceeded) || err == errHung {
+		// SIGQUIT, for the goroutines' stacks, then SIGKILL if it has not
+		// exited in 10s, which closes its end of the control socket. Wait
+		// here rather than kill it later: the caller reaps it next, after
+		// which pid may be another process's.
 		syscall.Kill(pid, syscall.SIGQUIT)
-		go func() {
-			time.Sleep(10 * time.Second)
+		srv.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if _, err := io.Copy(io.Discard, srv.conn); errors.Is(err, os.ErrDeadlineExceeded) {
 			syscall.Kill(pid, syscall.SIGKILL)
-		}()
+		}
 	}
+	srv.conn.SetReadDeadline(time.Time{})
 	return ok, err
 }
 

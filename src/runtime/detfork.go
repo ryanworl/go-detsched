@@ -14,7 +14,10 @@ import (
 // Fork mode for GOEXPERIMENT=detsched. See the comment above detFork.
 // detfork_linux.go and detfork_darwin.go have the system calls.
 
-const detMAP_SHARED = 1
+const (
+	detMAP_SHARED = 1
+	detECHILD     = 10 // wait4's errno for a child it cannot wait for, on Linux and macOS
+)
 
 // Commands from the driver, and replies to it: four little-endian
 // uint64s, an operation and its arguments.
@@ -342,8 +345,8 @@ func detForkProcess() (pid int64, child bool) {
 // parent waits, so its schedule does not change. A branch's output shows
 // only if it fails: the branch writes it to memory it shares with the
 // parent, which puts it at the head of its own buffered output, so that a
-// driver sees the branch's failure first, and a process forked from the
-// parent later, such as a search's cell, has the output with the failure.
+// driver sees the branch's failure first. A process the driver runs to a
+// stop, to fork runs from it there, forks no branches.
 // A branch reports only the assertions that fail in it, not those the
 // timeline failed before it forked. When the timeline had failed already,
 // its failure came first, so the branch's output goes after the
@@ -353,10 +356,11 @@ func detForkProcess() (pid int64, child bool) {
 // detsimBranch forks a branch that ends the timeline. In the child it
 // returns the branch's number, from 1, which GODETBRANCH takes to run
 // the branch in place. In the parent it waits for the child and returns
-// 0; a child that exits with a nonzero status records the assertion
-// failure msg in the parent. It returns 0 without forking when the
-// process cannot fork now, is a branch itself, or a branch failed after it
-// had. Package sim calls it (see detsim_sdk.go).
+// 0; a child that exits with a nonzero status, or that wait4 fails for,
+// records the assertion failure msg in the parent, with the status or
+// wait4's errno. It returns 0 without forking when the process cannot
+// fork now, is a branch itself, or a branch failed after it had. Package
+// sim calls it (see detsim_sdk.go).
 func detsimBranch(msg string) int {
 	if detBranchChild || detOut.late.head != nil {
 		return 0
@@ -378,6 +382,16 @@ func detsimBranch(msg string) int {
 		detBranchChild = true
 		detSDKBranch()
 		return detBranchN
+	}
+	if detFork.fd != 0 && (detFork.stop != 0 || detFeed.stopNovel) {
+		// The driver runs this process to a stop, to fork runs from it
+		// there: a search's setup root, or the program of a kept cell.
+		// Its output goes nowhere, and a branch's failure here would be
+		// copied into every run forked from it, whose replay lines could
+		// not reproduce it: a replay runs the branch in place, where the
+		// run's later branch points apply inside it. The runs fork the
+		// branches they reach themselves, as the plain runs do.
+		return 0
 	}
 	if r := detForkCheck(); r != 0 {
 		print("detsched: branch ", detBranchN, " did not run: the process cannot fork now (", detForkWhy(r), ")\n")
@@ -408,38 +422,52 @@ func detsimBranch(msg string) int {
 		defer munmap(unsafe.Pointer(share), detShareSize)
 	}
 	if pid < 0 {
+		// The system refused, such as for the limit on processes: say so,
+		// as for a refusal above, rather than pass over the branch.
+		print("detsched: branch ", detBranchN, " did not run: the process cannot fork now (fork failed: ")
+		if -pid == _EAGAIN {
+			print("EAGAIN)\n")
+		} else {
+			print("errno ", -pid, ")\n")
+		}
 		return 0
 	}
 	var status int32
+	var e uintptr
 	for {
-		_, e := detForkWait4(pid, &status, 0)
+		_, e = detForkWait4(pid, &status, 0)
 		if e != _EINTR {
-			if e != 0 {
-				status = 1 << 8
-			}
 			break
 		}
 	}
-	if status != 0 {
-		var buf, nbuf [20]byte
-		code := uint64(status>>8) & 0xff
-		what := " exited with status "
-		if sig := status & 0x7f; sig != 0 {
-			code, what = uint64(sig), " died of signal "
-		}
-		if share != nil {
-			detOutTakeBranch(share, detBranchN, detSDK.failures > 0)
-		}
+	if e != 0 || status != 0 {
 		// Build the details on the stack: a heap allocation here, which a
 		// replay with GODETBRANCH does not make, would move every later
 		// allocation, and with it the schedule of a program whose work
 		// depends on heap addresses.
+		var buf, nbuf [20]byte
+		what := " exited with status "
+		code := itoa(buf[:], uint64(status>>8)&0xff)
+		if sig := status & 0x7f; sig != 0 {
+			what, code = " died of signal ", itoa(buf[:], uint64(sig))
+		}
+		if e != 0 {
+			// The child's status is unknown, and so is whether it is
+			// done writing its output: report the wait's error rather
+			// than a status the child may never have had.
+			what, code = ": wait4 failed: errno ", itoa(buf[:], uint64(e))
+			if e == detECHILD {
+				what, code = ": wait4 failed: ", buf[:copy(buf[:], "ECHILD")]
+			}
+		} else if share != nil {
+			detOutTakeBranch(share, detBranchN, detSDK.failures > 0)
+		}
 		n := itoa(nbuf[:], uint64(detBranchN))
 		var d [96]byte
 		k := copy(d[:], "branch ")
 		k += copy(d[k:], n)
 		k += copy(d[k:], what)
-		k += copy(d[k:], itoa(buf[:], code))
+		k += copy(d[k:], code)
 		k += copy(d[k:], " (GODETBRANCH=")
 		k += copy(d[k:], n)
 		k += copy(d[k:], " runs it in place)")
