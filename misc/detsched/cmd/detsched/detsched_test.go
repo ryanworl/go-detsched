@@ -422,7 +422,7 @@ func TestStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	stop := regexp.MustCompile(`(?m)^detsched: stop (\d) at t(-|\d+)(?:\.\d{9})? s(\d+) k(\d+) goroutine \d+ trace=0x[0-9a-f]+$`)
+	stop := regexp.MustCompile(`(?m)^detsched: stop (\d) at t(-|\d+)(?:\.\d{9})? s(\d+) k(\d+) goroutine \d+ in \S+ \(\S+:\d+\) trace=0x[0-9a-f]+$`)
 	for _, seed := range []string{"1", "2", "3"} {
 		env := []string{"GODETSEED=" + seed, "GODETBRANCH=0", "SIMCOMPOSE_BUG=1"}
 		base, _, err := runBin(bin, env...)
@@ -512,7 +512,7 @@ func TestMachine(t *testing.T) {
 	}
 	defer cleanup()
 	stopLines := regexp.MustCompile(`(?m)^detsched: stop .*$`)
-	runEnv := func(env []string, prefix ...string) string {
+	runBinEnv := func(bin string, env []string, prefix ...string) string {
 		t.Helper()
 		cmd := exec.Command(bin)
 		if len(prefix) > 0 {
@@ -529,6 +529,10 @@ func TestMachine(t *testing.T) {
 			t.Fatalf("%v %v: exit status %d, %d stops:\n%s%s", prefix, env, o.exitCode, len(stops), o.stdout, o.stderr)
 		}
 		return o.trace + "\n" + strings.Join(stops, "\n")
+	}
+	runEnv := func(env []string, prefix ...string) string {
+		t.Helper()
+		return runBinEnv(bin, env, prefix...)
 	}
 	var hidden []string
 	switch runtime.GOARCH {
@@ -568,6 +572,24 @@ func TestMachine(t *testing.T) {
 				t.Errorf("GODETSEED=%s on one CPU: %s on all", seed, differ(o, base))
 			}
 		}
+		// Another x86 machine: QEMU's, whose CPU and auxiliary vector,
+		// shorter than the kernel's, differ from this machine's.
+		if qemu := lookQEMU("x86_64"); qemu != "" && runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+			if o := runEnv([]string{seedEnv}, qemu, "-cpu", "max"); o != base {
+				t.Errorf("GODETSEED=%s under %s -cpu max: %s natively", seed, qemu, differ(o, base))
+			}
+		}
+	}
+	if runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") {
+		// The program sees the same auxiliary vector on every kernel,
+		// in getAuxv and in /proc/self/auxv.
+		o, _, err := runBin(bin, "GODETSEED=1", "MACHINE_AUXV=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "auxv tags: [33 51 16 6 17 3 4 5 7 8 9 11 12 13 14 23 25 26 27 28 29 30 31 15]\nauxv file same: true\n"; !strings.HasPrefix(o.stdout, want) {
+			t.Errorf("the program saw another auxiliary vector than det mode's:\n%s\nwant:\n%s", o.stdout, want)
+		}
 	}
 	// A replay that runs another schedule than its line's, on a machine
 	// with another ID than the line's, says how the machines differ.
@@ -576,9 +598,58 @@ func TestMachine(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := regexp.MustCompile(`(?m)^detsched: machine=(p\d+\.f[0-9a-f]+\S*)$`).FindStringSubmatch(o.stderr)
-	if id == nil || !strings.Contains(o.stderr, "detsched: it ran on another machine than the search's run (machine=p65536.f0, here "+id[1]+"):") || !strings.Contains(o.stderr, "page size 65536 there") {
-		t.Errorf("a replay with another machine's ID did not say how the machines differ:\n%s", o.stderr)
+	if id == nil || !strings.Contains(o.stderr, "detsched: it ran on another machine than the search's run (machine=p65536.f0, here "+id[1]+"):") || !strings.Contains(o.stderr, "page size 65536 there") || !strings.Contains(o.stderr, "GODETSTOP='s*100000'") {
+		t.Errorf("a replay with another machine's ID did not say how the machines differ, and how to find where the runs part:\n%s", o.stderr)
 	}
+	t.Run("qemu-arm64", func(t *testing.T) { testMachineARM64(t, runBinEnv, differ) })
+}
+
+// testMachineARM64 runs testdata/machine for linux/arm64 under QEMU as
+// CPUs of several kinds, whose features, ID registers, and auxiliary
+// vectors differ: those that have every feature det mode keeps run the
+// same schedule, and one without warns.
+func testMachineARM64(t *testing.T, runEnv func(string, []string, ...string) string, differ func(a, b string) string) {
+	qemu := lookQEMU("aarch64")
+	if qemu == "" || runtime.GOOS != "linux" {
+		t.Skip("needs qemu-aarch64 on Linux")
+	}
+	t.Setenv("GOOS", "linux")
+	t.Setenv("GOARCH", "arm64")
+	t.Setenv("CGO_ENABLED", "0")
+	bin, cleanup, err := build(config{}, "../../testdata/machine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	for _, seed := range []string{"1", "2"} {
+		env := []string{"GODETSEED=" + seed}
+		base := runEnv(bin, env, qemu, "-cpu", "neoverse-v1")
+		for _, cpu := range []string{"neoverse-n1", "max"} {
+			if o := runEnv(bin, env, qemu, "-cpu", cpu); o != base {
+				t.Errorf("GODETSEED=%s as %s: %s as neoverse-v1", seed, cpu, differ(o, base))
+			}
+		}
+	}
+	// Cortex-A72 lacks LSE atomics.
+	cmd := exec.Command(qemu, "-cpu", "cortex-a72", bin)
+	cmd.Env = append(os.Environ(), "GODETSEED=1")
+	o, _, err := run(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(o.stderr, "detsched: warning: this machine lacks CPU features that det mode assumes every machine has: HWCAP 0x100;") {
+		t.Errorf("as cortex-a72, no warning that it lacks atomics:\n%s", o.stderr)
+	}
+}
+
+// lookQEMU returns the path of QEMU's user-mode emulator for arch, or "".
+func lookQEMU(arch string) string {
+	for _, name := range []string{"qemu-" + arch + "-static", "qemu-" + arch} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // TestLongSyscall checks that system calls that take far longer than the

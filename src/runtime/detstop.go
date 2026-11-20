@@ -29,11 +29,11 @@ import (
 // switches, or ticks after it ("s*M" is "sM*M"), and by ":dump". The run
 // stops at the first tick at or after each point: the runtime prints
 //
-//	detsched: stop I at tD sN kN goroutine G trace=0xH
+//	detsched: stop I at tD sN kN goroutine G in F (FILE:LINE) trace=0xH
 //
-// to standard error, with the current position (t- outside a bubble) and
-// the hash of the schedule so far, which the trace line at exit ends
-// with, prints the stack of every goroutine for ":dump", and calls detStop(I),
+// to standard error, with the current position (t- outside a bubble),
+// the function and line goroutine G is at, inlined or not, and the hash
+// of the schedule so far, which the trace line at exit ends with, prints the stack of every goroutine for ":dump", and calls detStop(I),
 // on which a debugger breaks: in a debugger, the frame below detPreempt
 // is where goroutine G is. When the stop is at the last tick of G's
 // quantum, detPreempt yields after it, as it would have without the
@@ -47,7 +47,9 @@ import (
 // on two machines, or two builds, with GODETSTOP=s*100000, and the first
 // stop line that differs brackets the switch where they do; then narrow
 // it with a finer period from the last line that agrees, such as
-// GODETSTOP=s1200000*1000, down to the switch, and to the tick with kN*M.
+// GODETSTOP=s1200000*1000, down to the switch, and to the tick with kN*M,
+// whose lines differ in the goroutine's position where the runs part
+// within one goroutine's quantum.
 //
 // Ticks are the run's finest clock: the compiler counts one at every
 // function entry and loop back edge in user code (see detsched.go), so no
@@ -362,7 +364,19 @@ func detStopFire(gp *g, pc, sp uintptr) {
 				print("-")
 			}
 			pp := gp.m.p.ptr()
-			print(" s", detP(pp).switches, " k", now, " goroutine ", gp.goid, " trace=", hex(detMix(detMix(0, detP(pp).trace), detP(pp).switches)), "\n")
+			print(" s", detP(pp).switches, " k", now, " goroutine ", gp.goid, " in ")
+			if name, file, line := detSitePos(pc); name != "" {
+				for i := len(file) - 1; i >= 0; i-- {
+					if file[i] == '/' {
+						file = file[i+1:]
+						break
+					}
+				}
+				print(name, " (", file, ":", line, ")")
+			} else {
+				print("?")
+			}
+			print(" trace=", hex(detMix(detMix(0, detP(pp).trace), detP(pp).switches)), "\n")
 			if p.dump {
 				goroutineheader(gp)
 				traceback(pc, sp, 0, gp)

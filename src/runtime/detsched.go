@@ -960,6 +960,7 @@ func detTraceReport() {
 	if detExpectTrace != 0 && h != detExpectTrace {
 		print("detsched: warning: this run's schedule is not the one its replay line was printed for (trace=", hex(detExpectTrace), "), so it may not do what that run did. Its environment, the files it reads, or the binary differ from the search's: a variable set here that the search's environment did not have, such as NO_COLOR, can change the schedule; unset it with env -u NAME\n")
 		detMachineDiffer()
+		detBisectHint()
 	}
 	detMachineReport()
 	if detBranchChild {

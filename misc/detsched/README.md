@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched34
+v=go1.27.4-detsched35
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -232,22 +232,38 @@ In det mode the standard library sees only the CPU features that every
 x86-64-v3 machine (Haswell, any AMD Zen), and on arm64 every Neoverse N1,
 Apple M1, and later, has, so it takes the same code paths, assembly or
 Go, on all of them: AVX-512, SHA-NI, VAES, GFNI, ADX, and arm64's SHA512
-and SHA3 are hidden (`GODEBUG=cpu.*` settings still apply). On
-linux/arm64 the auxiliary vector's HWCAP words are masked the same way,
-for `golang.org/x/sys/cpu` and other code that reads them.
-`runtime.NumCPU()` returns 4 on every machine, and `GOMAXPROCS` is 1. The
-memory size is not read, and the kernel version only by work outside the
-deterministic subset, such as copying real files.
+and SHA3 are hidden (`GODEBUG=cpu.*` settings still apply). On Linux the
+auxiliary vector is the same on every machine and kernel, in
+`golang.org/x/sys/cpu`'s and `golang.org/x/sys/unix`'s view and in
+`/proc/self/auxv`: the same entries in the same order, and HWCAP words
+that keep only what the standard library chooses code by (on arm64 FP,
+ASIMD, AES, PMULL, SHA1, SHA2, CRC32 and atomics, so not `HWCAP_CPUID`,
+with which libraries would read the ID registers). `runtime.NumCPU()`
+returns 4 on every machine, and `GOMAXPROCS` is 1. The memory size is not
+read, and the kernel version only by work outside the deterministic
+subset, such as copying real files.
 
 This entry means the machine lacks one of the features kept, so the
 standard library runs other code here: search and replay on machines
 that have them. What det mode cannot hide is what code reads itself: the
 `CPUID` instruction on x86 (as `golang.org/x/sys/cpu` and
-`github.com/klauspost/cpuid` do), sysctl on macOS, `/proc/cpuinfo`, the
-page size (`os.Getpagesize`), the host name and the process ID. So
-replay lines carry the machine's ID (`machine=p4096.f...`: page size and
-CPU features), and a replay that runs another schedule on another
-machine says what differs, such as `CPU features only there: avx512f`.
+`github.com/klauspost/cpuid` do), the ID registers on arm64 by code that
+does not check `HWCAP_CPUID`, sysctl on macOS, files that describe the
+machine (`/proc/cpuinfo`, `/proc/meminfo`, `/proc/self/mountinfo`, and the
+cgroup's, which `go.uber.org/automaxprocs` and memory-limit packages read
+in their `init`), the page size (`os.Getpagesize`), the host name and the
+process ID. So replay lines carry the machine's ID (`machine=p4096.f...`:
+page size, CPU features, the kernel's HWCAP words, and the CPU's ID
+registers or signature), and a replay that runs another schedule on
+another machine says what differs, such as `CPU features only there:
+avx512f` or `MIDR 0x410fd401 there, unknown here`. To find the code that
+differs, run the replay line on both machines with `GODETSTOP='s*100000'`
+and compare the stop lines (see `GODETSTOP` under
+[Replaying a failure](#replaying-a-failure)): the first that differs
+brackets the switch, `GODETSTOP='sN*1000'` and then `kN*100` from the last
+line that agrees narrow it to a tick, and `GODETSTOP=kN:dump` there
+prints each machine's stacks, whose difference names the code. The
+warning of a replay that runs another schedule says so too.
 
 ### Tests share a fork point
 
@@ -507,13 +523,17 @@ stops at points in virtual time, switches, or ticks (one per entry of a
 function that calls or loops, and per loop iteration) by calling
 `runtime.detStop`, where a debugger can break; and `GODETSTOP=t9.4:dump`
 prints every goroutine's stack there and runs on. Each stop prints
-`detsched: stop 1 at t9.400000000 s1822 k90267 goroutine 10
-trace=0x...`, with the hash of the schedule so far, and a point followed
-by `*M` stops again every M seconds, switches or ticks. To find where two
-runs that should agree part, such as a replay on two machines, run both
-with `GODETSTOP=s*100000` and compare the stop lines: the first that
-differs brackets the switch, and `GODETSTOP=s1200000*1000` from the last
-line that agrees, then `kN*M`, narrow it to the switch and the tick.
+`detsched: stop 1 at t9.400000000 s1822 k90267 goroutine 10 in
+main.worker (main.go:42) trace=0x...`, with where the goroutine is and
+the hash of the schedule so far, and a point followed by `*M` stops again
+every M seconds, switches or ticks. To find where two runs that should
+agree part, such as a replay on two machines, run both with
+`GODETSTOP=s*100000` and compare the stop lines: the first that differs
+brackets the switch, and `GODETSTOP=s1200000*1000` from the last line
+that agrees, then `kN*M`, narrow it to the switch and the tick; when
+one goroutine ran different code within its quantum, as package
+initialization can, the `kN*M` lines differ in where it is, and
+`GODETSTOP=kN:dump` prints its stack.
 
 ## Flags
 
@@ -621,10 +641,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched34:
+and release N's version is v0.N.0, so with go1.27.4-detsched35:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.34.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.35.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass

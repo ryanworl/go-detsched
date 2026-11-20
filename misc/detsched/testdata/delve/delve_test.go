@@ -234,7 +234,7 @@ func TestTracePositions(t *testing.T) {
 	}
 }
 
-var stopRegexp = regexp.MustCompile(`(?m)^detsched: stop 1 (at t\S+ s\d+ k\d+ goroutine \d+) trace=0x[0-9a-f]+$`)
+var stopRegexp = regexp.MustCompile(`(?m)^detsched: stop 1 (at t\S+ s\d+ k\d+ goroutine \d+) in \S+ \(\S+:\d+\) trace=0x[0-9a-f]+$`)
 
 // runtimeStop runs the replay of f with GODETSTOP=point and returns the
 // position of the runtime's stop line, "at tD sN kN goroutine G".

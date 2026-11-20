@@ -217,7 +217,7 @@ goroutine running there. It works after the program exited too.
 To end a window too, put `GODETSTOP` among the replay line's variables,
 after its `cd`. It lists points, separated by commas; at the first tick
 of a goroutine's own code at or after each, the program prints
-`detsched: stop 1 at t10.025092087 s1822 k90267 goroutine 10 trace=0x...`, calls
+`detsched: stop 1 at t10.025092087 s1822 k90267 goroutine 10 in main.worker (main.go:42) trace=0x...`, calls
 `runtime.detStop`, where Delve can break, and runs on unchanged:
 
 ```
@@ -465,7 +465,11 @@ The first line that differs between the two machines' files brackets the
 switch where they part. Run both again from the last line that agrees
 with a finer period, such as `GODETSTOP='s1200000*1000'`, then `s*1` over
 that range or `kN*M` for the tick, and take the `dettrace=2` trace only
-around it.
+around it. When the runs part within one goroutine's quantum, as when
+package initialization does more work on one machine, the switches agree
+but the `kN*M` stop lines differ in where the goroutine is: narrow the
+period until two consecutive ticks part, then run both with
+`GODETSTOP=kN:dump` at the first and compare the stacks.
 
 ## Attach to a spinning or hung run
 

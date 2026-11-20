@@ -299,12 +299,29 @@ func Mknod(path string, mode uint32, dev int) (err error) {
 }
 
 func Open(path string, mode int, perm uint32) (fd int, err error) {
+	if goexperiment.DetSched {
+		if fd, ok := detAuxvFile(path, mode); ok {
+			return fd, nil
+		}
+	}
 	return openat(_AT_FDCWD, path, mode|O_LARGEFILE, perm)
 }
+
+// detAuxvFile opens a file that holds the auxiliary vector the runtime
+// shows the program, if path is /proc/self/auxv and the caller is on no
+// simulated node, so that code that reads that file sees the vector
+// getAuxv returns: the same on every machine (see runtime.detAuxvCanon).
+// Provided by the runtime.
+func detAuxvFile(path string, flags int) (fd int, ok bool)
 
 //sys	openat(dirfd int, path string, flags int, mode uint32) (fd int, err error)
 
 func Openat(dirfd int, path string, flags int, mode uint32) (fd int, err error) {
+	if goexperiment.DetSched {
+		if fd, ok := detAuxvFile(path, flags); ok {
+			return fd, nil
+		}
+	}
 	return openat(dirfd, path, flags|O_LARGEFILE, mode)
 }
 

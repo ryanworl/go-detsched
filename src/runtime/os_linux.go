@@ -251,6 +251,9 @@ func sysargs(argc int32, argv **byte) {
 
 	if pairs := sysauxv(auxvp[:]); pairs != 0 {
 		auxv = auxvp[: pairs*2 : pairs*2]
+		if goexperiment.DetSched {
+			auxv = detAuxvCanon(auxv)
+		}
 		return
 	}
 	// In some situations we don't get a loader-provided
@@ -291,6 +294,9 @@ func sysargs(argc int32, argv **byte) {
 	auxvreadbuf[len(auxvreadbuf)-2] = _AT_NULL
 	pairs := sysauxv(auxvreadbuf[:])
 	auxv = auxvreadbuf[: pairs*2 : pairs*2]
+	if goexperiment.DetSched {
+		auxv = detAuxvCanon(auxv)
+	}
 }
 
 // secureMode holds the value of AT_SECURE passed in the auxiliary vector.
@@ -305,7 +311,7 @@ func sysauxv(auxv []uintptr) (pairs int) {
 		if goexperiment.DetSched {
 			// The masked value is what every reader of the auxiliary
 			// vector in the process sees: internal/cpu, and
-			// golang.org/x/sys/cpu through getAuxv.
+			// golang.org/x/sys/cpu through getAuxv (see detAuxvCanon).
 			val = detAuxv(tag, val)
 			auxv[i+1] = val
 		}
