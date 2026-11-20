@@ -79,6 +79,8 @@ var detFeed struct {
 	yield  [8]uint64
 	nyield int
 	hold   uint32 // chance out of 16 that a goroutine holds at a site, or 0 before the first
+
+	holding int32 // goroutines yielding in detFeedHold
 }
 
 // detFeedHoldYields is how many times a goroutine that acquired a lock at
@@ -430,8 +432,13 @@ func internal_sync_runtime_detLocked(l unsafe.Pointer) {
 // when it can close only on a later iteration. Under PCT the goroutine drops below
 // every other, so it runs again only when they are blocked or demoted;
 // otherwise it yields while another goroutine is runnable, at most
-// detFeedHoldYields times. Whether another is runnable depends only on
-// the schedule so far, so the schedule stays deterministic.
+// detFeedHoldYields times, and only while some other runnable goroutine
+// is not holding too: goroutines that all hold, such as two that lock
+// their own mutexes at the same site, would only hand the P back and
+// forth. Whether another is runnable depends only on the schedule so far,
+// so the schedule stays deterministic. A hold's yields are not a
+// livelock, so they count toward maxstuck as preemptions do: not at all
+// (see detrunaway.go).
 func detFeedHold() {
 	gp := getg()
 	pp := gp.m.p.ptr()
@@ -448,15 +455,21 @@ func detFeedHold() {
 		s := detPCTState(pp, gp)
 		s.prio, s.used = detPCT.lowest, 0
 		detPCT.lowest--
+		detRunaway.preempted = true
 		mcall(gosched_m)
 		return
 	}
+	detFeed.holding++
+	detG(gp).holding = true
 	for range detFeedHoldYields {
-		if runqempty(pp) && sched.runq.size == 0 {
-			return
+		if pp.runqtail-pp.runqhead+uint32(sched.runq.size) <= uint32(detFeed.holding-1) {
+			break // nothing runnable, or only other holders
 		}
+		detRunaway.preempted = true
 		mcall(gosched_m)
 	}
+	detFeed.holding--
+	detG(gp).holding = false
 }
 
 //go:linkname internal_sync_runtime_detUnlocked internal/sync.runtime_detUnlocked

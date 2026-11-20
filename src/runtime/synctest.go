@@ -39,6 +39,13 @@ type synctestBubble struct {
 	active  int // other sources of activity
 
 	detNext *synctestBubble // next in detBubbles; GOEXPERIMENT=detsched only
+
+	// detRejoined is set when finalizers or cleanups started a goroutine
+	// in the bubble after it blocked, so that the goroutine its blocking
+	// woke waits for it to block again, and detStarted counts those
+	// goroutines (see detGCDispatch).
+	detRejoined bool
+	detStarted  uint64
 }
 
 // changegstatus is called when the non-lock status of a g changes.
@@ -231,7 +238,25 @@ func synctestRun(f func()) {
 		if bubble.active < 0 {
 			throw("active < 0")
 		}
+		if goexperiment.DetSched && detGCPendingIn(bubble) {
+			// Finalizers or cleanups of the bubble are due: run
+			// them before the clock moves or a deadlock is reported.
+			started := bubble.detStarted
+			unlock(&bubble.mu)
+			detGCDispatch()
+			lock(&bubble.mu)
+			bubble.detRejoined = bubble.detRejoined || bubble.detStarted != started
+		}
+		if goexperiment.DetSched && bubble.detRejoined {
+			// Woken for a block that a finalizer's goroutine ended:
+			// wait for the bubble to block again.
+			bubble.detRejoined = false
+			continue
+		}
 		next := bubble.timers.wakeTime()
+		if goexperiment.DetSched && (next == 0 || bubble.done) && bubble.total != 1 && detGCBeforeDeadlock(bubble) {
+			continue
+		}
 		if next == 0 {
 			break
 		}

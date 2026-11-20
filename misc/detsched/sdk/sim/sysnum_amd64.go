@@ -15,5 +15,6 @@ const (
 	sysFaccessat2    = 439
 	sysNewfstatat    = 262
 	sysSendmmsg      = 307
+	sysInotifyInit   = 253
 	sysMemfdCreate   = 319
 )

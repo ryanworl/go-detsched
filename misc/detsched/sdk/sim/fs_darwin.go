@@ -32,7 +32,31 @@ const (
 	_F_OFD_GETLK  = 1<<20 + 36
 	_F_OFD_SETLK  = 1<<20 + 37
 	_F_OFD_SETLKW = 1<<20 + 38
+
+	_F_PREALLOCATE = syscall.F_PREALLOCATE
 )
+
+// preallocate is fcntl(F_PREALLOCATE) with the fstore_t at p: it gives
+// the file blocks without changing its size, from its allocated end
+// (F_PEOFPOSMODE) or from the offset, as fallocate's
+// FALLOC_FL_KEEP_SIZE does.
+func (w *World) preallocate(f *openFile, p unsafe.Pointer) uintptr {
+	fs := (*syscall.Fstore_t)(p)
+	off := fs.Offset
+	switch fs.Posmode {
+	case syscall.F_PEOFPOSMODE:
+		off += f.ino.alloc
+	case syscall.F_VOLPOSMODE:
+	default:
+		return uintptr(syscall.EINVAL)
+	}
+	fs.Bytesalloc = 0
+	if e := w.fallocate(f, false, off, fs.Length); e != 0 {
+		return e
+	}
+	fs.Bytesalloc = fs.Length
+	return 0
+}
 
 // fillStatfs fills the statfs result at p for dk: a file system of 64GiB
 // that is empty unless the disk is full, as free space is not simulated.
@@ -55,7 +79,7 @@ func fillStat(dk *disk, n *inode, st *syscall.Stat_t) {
 		st.Nlink = 2
 	} else {
 		st.Mode |= syscall.S_IFREG
-		st.Size = int64(len(n.data))
+		st.Size = n.size
 		st.Blocks = (st.Size + 511) / 512
 	}
 	st.Blksize = 4096

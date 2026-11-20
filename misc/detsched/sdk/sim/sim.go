@@ -80,6 +80,8 @@ package sim
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -133,6 +135,7 @@ const (
 // World is a simulated network of nodes.
 type World struct {
 	cfg       Config
+	tempDir   string // os.TempDir, which every node's disk has
 	nodes     []*Node
 	byIP      map[[4]byte]*Node
 	incs      map[int32]*incarnation // by node handle
@@ -159,6 +162,7 @@ type World struct {
 	skew      time.Duration
 	closing   bool // Close is killing the nodes
 	noNodeMsg bool // printed noNodeSocket's message
+	watchMsg  bool // printed noWatch's message
 }
 
 // Node is a machine in a World: an address, a disk, and, while it is up,
@@ -248,6 +252,7 @@ func NewWorld(cfg Config) *World {
 		links:    make(map[[2]int]Link),
 		failed:   make(map[string]bool),
 		setup:    !setupDone,
+		tempDir:  filepath.Clean(os.TempDir()),
 	}
 	// Handling a message takes no simulated time, so without rounding
 	// two events almost never fall at the same instant, where the
@@ -449,6 +454,7 @@ func (w *World) AddNode(name, ip string) *Node {
 	n.cores, n.speed = drawCPU()
 	runtime_call(func() {
 		n.disk = newDisk(len(w.nodes) + 1)
+		n.disk.mkdirAll(w.tempDir)
 		n.disk.drawDisk()
 		w.nodes = append(w.nodes, n)
 		w.byIP[a] = n
@@ -532,6 +538,7 @@ func (n *Node) WipeDisk() {
 	}
 	runtime_call(func() {
 		d := newDisk(n.index + 1)
+		d.mkdirAll(n.w.tempDir)
 		d.latency, d.bandwidth = n.disk.latency, n.disk.bandwidth
 		n.disk = d
 	})

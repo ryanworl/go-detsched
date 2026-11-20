@@ -15,5 +15,6 @@ const (
 	sysFaccessat2    = 439
 	sysNewfstatat    = 79
 	sysSendmmsg      = 269
+	sysInotifyInit   = 1 << 20 // arm64 has only inotify_init1
 	sysMemfdCreate   = 279
 )

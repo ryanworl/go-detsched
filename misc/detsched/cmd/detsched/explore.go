@@ -206,6 +206,11 @@ func (s *search) prepare(ctx context.Context) error {
 			s.vars = vars
 		}
 	}
+	if s.unstable == "" {
+		if err := s.findUnset(ctx, base, append(addSearch(nil, "feedback=1"), "GODETBRANCH=0")); err != nil {
+			return err
+		}
+	}
 	// Where seed 1 left the deterministic subset, with the stacks in its
 	// log.
 	if reports := leftReport.FindAll(base.output, -1); len(reports) > 0 {

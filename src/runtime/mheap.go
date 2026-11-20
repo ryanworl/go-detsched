@@ -2108,6 +2108,7 @@ func addfinalizer(p unsafe.Pointer, f *funcval, nret uintptr, fint *_type, ot *p
 	if goexperiment.DetSched {
 		detGC.finSeq++
 		s.det.seq = detGC.finSeq
+		s.det.where = detGCWhere()
 	}
 	s.fn = f
 	s.nret = nret
@@ -2163,6 +2164,8 @@ type specialCleanup struct {
 	cleanup cleanupFn
 	// Globally unique ID for the cleanup, obtained from mheap_.cleanupID.
 	id uint64
+
+	det detGCTag // see detGCFlush
 }
 
 // addCleanup attaches a cleanup function to the object. Multiple
@@ -2182,6 +2185,12 @@ func addCleanup(p unsafe.Pointer, c cleanupFn) uint64 {
 	s.special.kind = _KindSpecialCleanup
 	s.cleanup = c
 	s.id = id
+	if goexperiment.DetSched {
+		s.det = detGCWhere()
+		if s.det.bubble != 0 {
+			createfing() // which runs it in its bubble; see detGCDispatch
+		}
+	}
 
 	mp := acquirem()
 	addspecial(p, &s.special, true)
@@ -2798,6 +2807,11 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 			detGC.fins = detGCPush(detGC.fins, s)
 			break
 		}
+		if goexperiment.DetSched && sf.det.where.bubble != 0 {
+			sf.det.p = p
+			detGCDefer(&detGC.bubbleFins, &detGC.bubbleFinsTail, s)
+			break
+		}
 		queuefinalizer(p, sf.fn, sf.nret, sf.fint, sf.ot)
 		lock(&mheap_.speciallock)
 		mheap_.specialfinalizeralloc.free(unsafe.Pointer(sf))
@@ -2826,6 +2840,10 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 		sc := (*specialCleanup)(unsafe.Pointer(s))
 		if goexperiment.DetSched && detGC.sweeping {
 			detGC.cleanups = detGCPush(detGC.cleanups, s)
+			break
+		}
+		if goexperiment.DetSched && sc.det.bubble != 0 {
+			detGCDefer(&detGC.bubbleCleanups, &detGC.bubbleCleanupsTail, s)
 			break
 		}
 		// Cleanups, unlike finalizers, do not resurrect the objects

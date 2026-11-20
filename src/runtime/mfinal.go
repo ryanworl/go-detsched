@@ -9,6 +9,7 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/gc"
 	"internal/runtime/sys"
@@ -207,6 +208,11 @@ func runFinalizers() {
 		fb := finq
 		finq = nil
 		if fb == nil {
+			if goexperiment.DetSched && (detGC.bubbleFins != nil || detGC.bubbleCleanups != nil) {
+				unlock(&finlock)
+				detGCDispatch()
+				continue
+			}
 			gopark(finalizercommit, unsafe.Pointer(&finlock), waitReasonFinalizerWait, traceBlockSystemGoroutine, 1)
 			continue
 		}

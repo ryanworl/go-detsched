@@ -17,6 +17,7 @@ import (
 
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/assert"
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/buggify"
+	"github.com/ryanworl/go-detsched/misc/detsched/sdk/lifecycle"
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/sim"
 )
 
@@ -173,5 +174,44 @@ func TestLostUpdate(t *testing.T) {
 		default:
 		}
 		assert.Always(finished, "the transfer finishes within 60s", nil)
+	})
+}
+
+// TestUnsyncedDir creates a file and fsyncs it but not its directory,
+// with strict directory syncs enabled, then cuts the power: the file is
+// lost only on the runs that enable them. The summary must report the
+// fault, count it, and say that the failure needs it. Before, a strict
+// disk never reported it as injected, so these runs counted as runs
+// without faults.
+func TestUnsyncedDir(t *testing.T) {
+	if !sim.Supported() {
+		t.Skip("needs GOEXPERIMENT=detsched")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		buggify.Disable("sim.disk.fsyncfail", "sim.disk.enospc", "sim.disk.readerror", "sim.disk.torn", "sim.disk.partialcrash")
+		buggify.Enable("sim.disk.strictdirsync")
+		w := sim.NewWorld(sim.Config{})
+		defer w.Close()
+		n := w.AddNode("a", "10.0.0.1")
+		<-n.Start(func() {
+			os.Mkdir("/d", 0o755)
+			if d, err := os.Open("/"); err == nil {
+				d.Sync()
+				d.Close()
+			}
+			lifecycle.SetupComplete(nil)
+			f, err := os.Create("/d/f")
+			if err != nil {
+				return
+			}
+			f.Write([]byte("ok"))
+			f.Sync()
+			f.Close()
+		})
+		n.Kill()
+		<-n.Start(func() {
+			_, err := os.Stat("/d/f")
+			assert.Always(err == nil, "a synced file survives a power failure", map[string]any{"err": fmt.Sprint(err)})
+		})
 	})
 }

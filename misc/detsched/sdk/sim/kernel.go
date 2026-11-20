@@ -99,6 +99,23 @@ func (w *World) noNodeSocket(domain uintptr) bool {
 	return true
 }
 
+// noWatch refuses a node the call name, which creates a watcher of file
+// system changes: inotify_init1 on Linux, kqueue on macOS. Its events
+// would come from the real file system, which the node's disk is not, and
+// a goroutine waiting for them would wait on the OS, which the scheduler
+// cannot tell apart from a hang. The first refusal says so on standard
+// error, written directly, as noNodeSocket does.
+func (w *World) noWatch(name string) uintptr {
+	if !w.watchMsg {
+		w.watchMsg = true
+		msg := "sim: a node called " + name + ", which creates a watcher of file system changes (such as fsnotify.NewWatcher); " +
+			"watchers are not simulated, and their events would come from the real file system, so the call fails with ENOSYS. " +
+			"On nodes, notice changes another way, such as by polling with os.Stat, or turn the watcher off in the harness.\n"
+		syscall.RawSyscall(syscall.SYS_WRITE, 2, uintptr(unsafe.Pointer(unsafe.StringData(msg))), uintptr(len(msg)))
+	}
+	return uintptr(syscall.ENOSYS)
+}
+
 // The next descriptors newFD allocates. No number is used twice, not
 // even by a later world: the runtime finds a simulated socket's poll
 // descriptor by its number, and keeps those of the sockets that a world's
@@ -428,6 +445,9 @@ func nextMapAddr(length uintptr) uintptr {
 	return hint
 }
 
+// zeroPage is a page of zeros, which a file holds past its data.
+var zeroPage [pageSize]byte
+
 // writeBackMem copies the program's stores in b, the memory of a mapping
 // of n's bytes from off, into the file, as the kernel writes back a
 // mapping's dirty pages: they become unsynced writes of the file, which
@@ -438,7 +458,7 @@ func nextMapAddr(length uintptr) uintptr {
 // known to be unchanged; the loop runs over them all the same, so that the schedule's
 // ticks do not depend on what the kernel populated.
 func (w *World) writeBackMem(n *inode, b []byte, off int64, written []bool) {
-	end := min(int64(len(b)), int64(len(n.data))-off)
+	end := min(int64(len(b)), n.size-off)
 	if end <= 0 {
 		return
 	}
@@ -449,7 +469,7 @@ func (w *World) writeBackMem(n *inode, b []byte, off int64, written []bool) {
 		}
 		wr := pwrite{off: off + lo, data: slices.Clone(b[lo:hi])}
 		n.wroteSectors(wr.off, off+hi)
-		copy(n.data[off+lo:off+hi], wr.data)
+		n.data, _ = applyWrite(n.data, n.size, wr)
 		n.alloc = max(n.alloc, off+hi) // a full disk would fault, which is not simulated
 		n.pending = append(n.pending, corrupt(wr))
 		n.mtime = wallNow()
@@ -462,7 +482,12 @@ func (w *World) writeBackMem(n *inode, b []byte, off int64, written []bool) {
 	}
 	for p := int64(0); p < end; {
 		pe := min((p/pageSize+1)*pageSize, end)
-		got, want := b[p:pe], n.data[off+p:off+pe]
+		got, want := b[p:pe], zeroPage[:pe-p] // zeros past n.data
+		if have := int64(len(n.data)); off+pe <= have {
+			want = n.data[off+p : off+pe]
+		} else if off+p < have {
+			want = append(slices.Clone(n.data[off+p:]), zeroPage[:off+pe-have]...)
+		}
 		if written != nil && !written[p/pageSize] || string(got) == string(want) {
 			flush()
 			p = pe

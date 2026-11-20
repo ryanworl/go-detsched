@@ -392,6 +392,18 @@ func TestSearchDirected(t *testing.T) {
 	}
 }
 
+// TestSearchDirectedHolds checks that runs directed at a predicted
+// deadlock that cannot happen pass when goroutines lock their own mutexes
+// at the predicted site: holding each there must not make the run look
+// like a livelock, as about 1 in 25 runs did when holders yielded to each
+// other.
+func TestSearchDirectedHolds(t *testing.T) {
+	s := runSearch(t, "../../testdata/lockholds", 300)
+	if len(s.predicted) == 0 || s.directed[0] == 0 || s.failed != 0 {
+		t.Errorf("want a predicted deadlock, directed runs, and no failure:\n%s", searchReport(s))
+	}
+}
+
 // TestSearchSetup checks that the search starts its runs right after the
 // program's setup, that an assertion failure counts as a failure that its
 // command replays, and that the summary says how many runs evaluated the
@@ -630,6 +642,20 @@ func TestSearchBadHarness(t *testing.T) {
 			t.Errorf("want the group to need loss:\n%s", r)
 		}
 	})
+	t.Run("TestUnsyncedDir", func(t *testing.T) {
+		s := search(t, "TestUnsyncedDir", 60)
+		r := searchReport(s)
+		if len(s.groups) != 1 || s.groups[0].status != "reproduced" {
+			t.Fatalf("want one group, reproduced:\n%s", r)
+		}
+		if !regexp.MustCompile(`runs that reached each fault assertion: [^\n]*sim\.disk\.strictdirsync \d`).MatchString(r) || !strings.HasPrefix(s.groups[0].attrib, "needs") || !strings.Contains(s.groups[0].attrib, "sim.disk.strictdirsync") {
+			t.Errorf("want the fault counted, and the group to need it:\n%s", r)
+		}
+		// A World reads TMPDIR, which a new shell has.
+		if strings.Contains(s.groups[0].replay, "TMPDIR") {
+			t.Errorf("replay line %s sets TMPDIR", s.groups[0].replay)
+		}
+	})
 	t.Run("TestSlowServer", func(t *testing.T) {
 		s := search(t, "TestSlowServer", 40)
 		r := searchReport(s)
@@ -666,7 +692,8 @@ func TestSearchReports(t *testing.T) {
 // and that each failure's command replays it in a new shell, in place of
 // the composer branch it failed in, setting the variable that plants the
 // bug and no other, and unsetting the one the program read but the search
-// did not have, which would change the schedule.
+// did not have, which would change the schedule, and not one whose
+// presence changes nothing.
 func TestSearchCompose(t *testing.T) {
 	t.Setenv("SIMCOMPOSE_BUG", "1")
 	t.Setenv("SIMCOMPOSE_UNREAD", "1")
@@ -688,8 +715,8 @@ func TestSearchCompose(t *testing.T) {
 		if g.status != "reproduced" {
 			t.Errorf("%s: the replay %s", g.sig, g.status)
 		}
-		if !strings.Contains(g.replay, " env -u SIMCOMPOSE_EXTRA ") {
-			t.Errorf("%s: replay %s does not unset SIMCOMPOSE_EXTRA", g.sig, g.replay)
+		if !strings.Contains(g.replay, " env -u SIMCOMPOSE_EXTRA ") || strings.Contains(g.replay, "SIMCOMPOSE_UNUSED") {
+			t.Errorf("%s: replay %s does not unset SIMCOMPOSE_EXTRA, or unsets SIMCOMPOSE_UNUSED, which changes nothing", g.sig, g.replay)
 		}
 	}
 	cmd := exec.Command("sh", "-c", s.groups[0].replay)
@@ -877,8 +904,9 @@ func TestSearchShard(t *testing.T) {
 	for _, g := range s.groups {
 		m := seed.FindStringSubmatch(g.replay)
 		n, _ := strconv.ParseUint(m[1], 10, 64)
-		if n <= base+1 || n > base+100 || !strings.HasSuffix(g.replay, " "+s.bin) || s.bin == bin {
-			t.Errorf("%s: replay %s, want a seed from %d to %d and a copy of %s", g.sig, g.replay, base+2, base+100, bin)
+		// Seed 1 is every shard's base run.
+		if n != 1 && (n <= base+1 || n > base+100) || !strings.HasSuffix(g.replay, " "+s.bin) || s.bin == bin {
+			t.Errorf("%s: replay %s, want seed 1 or a seed from %d to %d, and a copy of %s", g.sig, g.replay, base+2, base+100, bin)
 		}
 		if g.status != "reproduced" {
 			t.Errorf("%s: the replay %s", g.sig, g.status)
@@ -973,7 +1001,9 @@ func TestMutationCheck(t *testing.T) {
 		code, out := check(t, "../../testdata/mutate", "TestWeak")
 		for _, want := range []string{
 			"caught 2 of 10 mistakes",
-			"survived: store.go:36 drop the Lock and Unlock of c.mu",
+			// Named by its path in its module, as a module can have
+			// many store.go files.
+			"survived: testdata/mutate/store.go:36 drop the Lock and Unlock of c.mu",
 		} {
 			if code != 1 || !strings.Contains(out, want) {
 				t.Errorf("exit status %d, want 1 and %q in:\n%s", code, want, out)

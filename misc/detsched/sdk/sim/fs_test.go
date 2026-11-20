@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"testing"
 	"testing/synctest"
+	"unsafe"
 
 	"github.com/ryanworl/go-detsched/misc/detsched/sdk/buggify"
 )
@@ -30,7 +31,7 @@ func TestTruncateRetains(t *testing.T) {
 	file := func(name string) *inode {
 		n := d.newInode(false, 0o644)
 		d.setEnt(d.root, name, n)
-		n.data = make([]byte, 8192)
+		n.data, n.size = make([]byte, 8192), 8192
 		n.pending = []pwrite{{off: 0, data: n.data}}
 		return n
 	}
@@ -41,8 +42,8 @@ func TestTruncateRetains(t *testing.T) {
 		t.Fatalf("journaling disk: truncated file not kept for the next commit")
 	}
 	d.fsync(b)
-	if len(d.truncated) != 0 || len(a.ddata) != 100 {
-		t.Errorf("journaling disk: after another file's fsync, %d files kept, durable size %d; want 0, 100", len(d.truncated), len(a.ddata))
+	if len(d.truncated) != 0 || a.dsize != 100 {
+		t.Errorf("journaling disk: after another file's fsync, %d files kept, durable size %d; want 0, 100", len(d.truncated), a.dsize)
 	}
 
 	buggify.Force("sim.disk.strictdirsync", true)
@@ -56,8 +57,8 @@ func TestTruncateRetains(t *testing.T) {
 	e := file("e")
 	w.truncate(d, e, 50)
 	d.fsync(e)
-	if len(e.ddata) != 50 {
-		t.Errorf("strict disk: durable size after the file's own fsync is %d; want 50", len(e.ddata))
+	if e.dsize != 50 {
+		t.Errorf("strict disk: durable size after the file's own fsync is %d; want 50", e.dsize)
 	}
 }
 
@@ -160,5 +161,48 @@ func TestDescriptorRanges(t *testing.T) {
 	}
 	if !isSimFD(uintptr(sock)) || sock < fdSockBase || sock == file {
 		t.Errorf("socket descriptor %#x is not in the socket range [%#x, %#x) apart from file %#x", sock, fdSockBase, fdLimit, file)
+	}
+}
+
+// TestPreallocateSparse checks that preallocating a file, as a log does
+// for each segment, gives it its size without memory for its bytes: only
+// what the program writes takes memory, through a power failure too, and
+// the rest reads as zeros. Before, a 64 MB segment took 64 MB, and a
+// program with a few dozen segments ran a run out of memory.
+func TestPreallocateSparse(t *testing.T) {
+	if !Supported() {
+		t.Skip("requires GOEXPERIMENT=detsched")
+	}
+	var w World
+	d := newDisk(1)
+	n := d.newInode(false, 0o644)
+	d.setEnt(d.root, "seg", n)
+	fd := &fdesc{file: &openFile{disk: d, ino: n, flags: syscall.O_RDWR}}
+	const size = 64 << 20
+	if e := preallocate(&w, fd, size); e != 0 {
+		t.Fatalf("preallocating %d bytes: errno %d", size, e)
+	}
+	buf := []byte("header")
+	if _, e := w.fileCall(fd, sysPwrite64, [6]uintptr{0, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0}); e != 0 {
+		t.Fatalf("pwrite: errno %d", e)
+	}
+	if _, e := w.fileCall(fd, sysFsync, [6]uintptr{}); e != 0 {
+		t.Fatalf("fsync: errno %d", e)
+	}
+	d.powerFail()
+	if n.size != size || n.dsize != size || len(n.data) > 4096 || len(n.ddata) > 4096 {
+		t.Errorf("after a power failure: size %d, durable %d, %d and %d bytes in memory; want %d, %d, at most a page", n.size, n.dsize, len(n.data), len(n.ddata), size, size)
+	}
+	end := make([]byte, 8192)
+	for i := range end {
+		end[i] = 0xff
+	}
+	r, e := w.fileCall(fd, sysPread64, [6]uintptr{0, uintptr(unsafe.Pointer(&end[0])), uintptr(len(end)), size - 4096})
+	if e != 0 || r != 4096 || !allZero(end[:4096]) || end[4096] != 0xff {
+		t.Errorf("reading the last page: %d bytes, errno %d, zeros %v; want 4096 zeros", r, e, allZero(end[:4096]))
+	}
+	head := make([]byte, len(buf))
+	if r, _ := w.fileCall(fd, sysPread64, [6]uintptr{0, uintptr(unsafe.Pointer(&head[0])), uintptr(len(head)), 0}); r != uintptr(len(buf)) || string(head) != string(buf) {
+		t.Errorf("reading the header: %q, want %q", head[:r], buf)
 	}
 }

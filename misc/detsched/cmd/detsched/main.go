@@ -65,6 +65,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 var (
@@ -227,6 +228,8 @@ type search struct {
 	baseTrace   string       // the trace line of the base run, seed 1
 	unstable    string       // how seed 1 ran two schedules, or ""
 	newShell    bool         // seed 1 runs another schedule in a new shell, for variables findVars did not find
+	unsetTried  []string     // variables seed 1 read without having them, tried set
+	unset       []string     // those of them whose presence changes its schedule
 	rechecked   sync.Once    // runs recheck
 	built       bool         // whether the search built the binary (not -exec)
 	debugBin    string       // a build without optimizations that ran seed 1's schedule, or ""
@@ -256,7 +259,7 @@ type search struct {
 	passed      int            // runs that passed
 	yieldSites  []string
 	predicted   []string                // deadlocks the lock order predicts
-	directed    [2]int                  // runs directed at predicted deadlocks, and those that failed
+	directed    [3]int                  // runs directed at predicted deadlocks, those that failed, and those that did not finish
 	bigOutput   int64                   // the most output a run wrote
 	asserts     map[string]*assertCount // always, sometimes and reachable assertions, by kind and message
 	catalog     []assertSite            // the assertion calls in the program's source, if built here
@@ -677,15 +680,19 @@ func (s *search) replayLine(r *result, debug bool) string {
 	}
 	// Set the variables the program read as the run had them, and unset
 	// those it did not have, since the shell the line runs in may have
-	// others, such as NO_COLOR, which can change the schedule.
+	// others, such as NO_COLOR, which can change the schedule: of those
+	// seed 1 read, only the ones whose presence changed its schedule (see
+	// findUnset).
 	var unset []string
 	for _, k := range s.envRead(r) {
 		if slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, k+"=") }) {
 			continue
 		}
 		if v, ok := lookupEnv(slices.Concat(os.Environ(), s.env, r.env), k); !ok {
-			unset = append(unset, k)
-		} else if !slices.Contains([]string{"HOME", "PATH", "USER", "LOGNAME", "SHELL", "PWD"}, k) {
+			if !slices.Contains(s.unsetTried, k) || slices.Contains(s.unset, k) {
+				unset = append(unset, k)
+			}
+		} else if !slices.Contains([]string{"HOME", "PATH", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR"}, k) {
 			env = append(env, k+"="+v)
 		}
 	}
@@ -972,6 +979,71 @@ func (s *search) findVars(ctx context.Context, run func(vars []string) *exec.Cmd
 	return need, r.trace() == trace, nil
 }
 
+// findUnset sets s.unset to the variables that seed 1 read without
+// having them whose presence changes its schedule, which replay lines
+// unset, as the shell they run in may have them. It runs seed 1 with all
+// of them set to 1, and splits a group that changes the schedule until
+// it finds the variables that do; a program reads many it never has, such
+// as configuration it looks for in init, and few change anything. env is
+// what base ran with beyond the search's environment.
+func (s *search) findUnset(ctx context.Context, base *result, env []string) error {
+	var absent []string
+	for _, k := range s.envRead(base) {
+		if _, ok := lookupEnv(slices.Concat(os.Environ(), s.env), k); !ok {
+			absent = append(absent, k)
+		}
+	}
+	trace := base.trace()
+	sem := make(chan bool, max(s.workers, 1))
+	changes := func(names []string) (bool, error) {
+		sem <- true
+		defer func() { <-sem }()
+		cmd := s.plain(1, env...)
+		for _, k := range names {
+			cmd.Env = append(cmd.Env, k+"=1")
+		}
+		r, err := s.exec(ctx, cmd)
+		return err == nil && r.trace() != trace, err
+	}
+	var find func(names []string) ([]string, error)
+	find = func(names []string) ([]string, error) {
+		if changed, err := changes(names); err != nil || !changed {
+			return nil, err
+		}
+		if len(names) == 1 {
+			return names, nil
+		}
+		var (
+			wg   sync.WaitGroup
+			got  [2][]string
+			errs [2]error
+		)
+		for i, half := range [2][]string{names[:len(names)/2], names[len(names)/2:]} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				got[i], errs[i] = find(half)
+			}()
+		}
+		wg.Wait()
+		if len(got[0])+len(got[1]) == 0 {
+			return names, errors.Join(errs[:]...) // only together
+		}
+		return slices.Concat(got[0], got[1]), errors.Join(errs[:]...)
+	}
+	if len(absent) == 0 {
+		return nil
+	}
+	unset, err := find(absent)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.unsetTried, s.unset = absent, unset
+	s.mu.Unlock()
+	return nil
+}
+
 var shellSafe = regexp.MustCompile(`^[\w@%+=:,./-]+$`)
 
 func quote(s string) string {
@@ -1042,29 +1114,81 @@ var errCanceled = errors.New("canceled")
 // forks, and stops the group when the run takes longer than s.timeout or
 // ctx is done.
 func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
-	var out cappedOutput
-	cmd.Stdout, cmd.Stderr = &out, &out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.WaitDelay = time.Second // a branch left behind may hold the output open
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
+	// The run's output comes through a pipe of our own, so that we can
+	// tell when the branches it left behind closed it, and still reap the
+	// run after stopping them.
+	pr, pw, err := os.Pipe()
+	if err != nil {
 		return nil, err
 	}
+	cmd.Stdout, cmd.Stderr = pw, pw
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	start := time.Now()
+	err = cmd.Start()
+	pw.Close()
+	if err != nil {
+		pr.Close()
+		return nil, err
+	}
+	var out cappedOutput
+	copied := make(chan bool)
+	go func() {
+		io.Copy(&out, pr)
+		close(copied)
+	}()
+	defer pr.Close()
+	// Signal the group only until the run is reaped: its pid, the group's
+	// ID, is not reused while it is a zombie, and may be after.
 	pgid := cmd.Process.Pid
-	defer syscall.Kill(-pgid, syscall.SIGKILL)
-	untrack := s.track(start, pgid, func(sig syscall.Signal) { syscall.Kill(-pgid, sig) })
+	var mu sync.Mutex
+	reaped := false
+	kill := func(sig syscall.Signal) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !reaped {
+			syscall.Kill(-pgid, sig)
+		}
+	}
+	untrack := s.track(start, pgid, kill)
 	defer untrack()
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() {
+		// Once the run ends, give the branches it left behind, which may
+		// hold the output open, a second to write it, then kill them,
+		// before reaping it.
+		var err error
+		waited := waitExited(pgid) != nil
+		if waited {
+			err = cmd.Wait() // waitid failed: reap it first, and kill what is left
+		} else {
+			select {
+			case <-copied:
+			case <-time.After(time.Second):
+			}
+		}
+		mu.Lock()
+		syscall.Kill(-pgid, syscall.SIGKILL)
+		reaped = true
+		mu.Unlock()
+		if !waited {
+			err = cmd.Wait()
+		}
+		select {
+		case <-copied:
+		case <-time.After(time.Second): // a process out of the group has the output
+			pr.Close()
+			<-copied
+		}
+		done <- err
+	}()
 	r := &result{env: s.env}
 	timer := time.NewTimer(s.timeout)
 	defer timer.Stop()
-	var err error
 	select {
 	case err = <-done:
 	case <-ctx.Done():
 		if !s.mayHang(start) {
-			syscall.Kill(-pgid, syscall.SIGKILL)
+			kill(syscall.SIGKILL)
 			<-done
 			return nil, errCanceled
 		}
@@ -1074,11 +1198,11 @@ func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
 	}
 	if r.timedOut {
 		// SIGQUIT, for the goroutines' stacks.
-		syscall.Kill(-pgid, syscall.SIGQUIT)
+		kill(syscall.SIGQUIT)
 		select {
 		case err = <-done:
 		case <-time.After(10 * time.Second):
-			syscall.Kill(-pgid, syscall.SIGKILL)
+			kill(syscall.SIGKILL)
 			err = <-done
 		}
 	}
@@ -1087,10 +1211,26 @@ func (s *search) exec(ctx context.Context, cmd *exec.Cmd) (*result, error) {
 	r.output, r.outputSize = out.bytes(), out.n
 	if ee, ok := err.(*exec.ExitError); ok {
 		r.exitCode = ee.ExitCode()
-	} else if err != nil && !errors.Is(err, exec.ErrWaitDelay) {
+	} else if err != nil {
 		return nil, err
 	}
 	return r, nil
+}
+
+// waitExited waits for process pid, a child, to exit, and leaves it a
+// zombie, unreaped (waitid with WNOWAIT).
+func waitExited(pid int) error {
+	var info [128]byte // a siginfo_t
+	const pPID = 1     // idtype_t P_PID, on Linux and macOS
+	for {
+		_, _, e := syscall.Syscall6(syscall.SYS_WAITID, pPID, uintptr(pid), uintptr(unsafe.Pointer(&info)), syscall.WEXITED|syscall.WNOWAIT, 0, 0)
+		if e != syscall.EINTR {
+			if e != 0 {
+				return e
+			}
+			return nil
+		}
+	}
 }
 
 // run runs the base run, then launches until ctx is done or, if n is not
@@ -1234,7 +1374,9 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	s.runs++
 	if a == armDirected {
 		s.directed[0]++
-		if r.failed() && !r.runaway() && !r.outOfMem {
+		if r.runaway() || r.outOfMem {
+			s.directed[2]++
+		} else if r.failed() {
 			s.directed[1]++
 		}
 	}
@@ -1748,10 +1890,14 @@ func (s *search) summary(w io.Writer, final bool) {
 	if len(s.vars) > 0 {
 		fmt.Fprintf(w, "detsched: replay lines set these variables of detsched's environment, which the schedule depends on: %s\n", strings.Join(s.vars, " "))
 	}
+	unfinished := ""
+	if s.directed[2] > 0 {
+		unfinished = fmt.Sprintf(" (another %d did not finish, which a deadlock does not explain)", s.directed[2])
+	}
 	if len(s.predicted) > 0 && s.directed[1] == 0 {
-		fmt.Fprintf(w, "detsched: %d lock orders predicted a deadlock, and none of the %d runs directed at them failed, so they are likely false alarms (a freed lock's memory reused for another)\n", len(s.predicted), s.directed[0])
+		fmt.Fprintf(w, "detsched: %d lock orders predicted a deadlock, and none of the %d runs directed at them failed%s, so they are likely false alarms (a freed lock's memory reused for another)\n", len(s.predicted), s.directed[0], unfinished)
 	} else if len(s.predicted) > 0 {
-		fmt.Fprintf(w, "detsched: lock orders that predict a deadlock, at which %d runs were directed, %d of which failed (a prediction no directed run fails is likely a false alarm: a freed lock's memory reused for another):\n", s.directed[0], s.directed[1])
+		fmt.Fprintf(w, "detsched: lock orders that predict a deadlock, at which %d runs were directed, %d of which failed%s (a prediction no directed run fails is likely a false alarm: a freed lock's memory reused for another):\n", s.directed[0], s.directed[1], unfinished)
 		for _, p := range s.predicted {
 			fmt.Fprintf(w, "\t%s\n", p)
 		}

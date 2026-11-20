@@ -59,17 +59,35 @@ func (s *search) attribution(ctx context.Context, g *group, r *result) (string, 
 	lim := s.limits()
 	at, where := uint64(1), "its start"
 	if s.setup {
-		at, where = s.stop, fmt.Sprintf("setup's end (switch %d)", s.stop)
+		at = s.stop
+		// The run's own setup's end, which seed 1's may not be: a branch
+		// point past the run's end would leave every variant the run.
+		if m := setupLine.FindSubmatch(r.output); m != nil {
+			at = atou(string(m[1])) + 1
+		}
+		where = fmt.Sprintf("setup's end (switch %d)", at)
 	}
 	s.mu.Unlock()
 	branch, _ := r.stopped()
+	// The run's branch points before the variants', which they keep.
+	var prefix []string
+	last := uint64(0) // the run's last branch point, where faultoff starts in it
+	for _, e := range strings.Split(r.tape, ",") {
+		if pos, _, ok := strings.Cut(e, ":"); ok {
+			if atou(pos) < at {
+				prefix = append(prefix, e)
+			}
+			last = atou(pos)
+		}
+	}
 	// run runs variant v with the faults in off turned off past the
 	// branch point, and reports whether it failed as g's runs do and
 	// which faults it injected.
 	run := func(v int, off string) (bool, []string, error) {
 		seed := mix(r.seed, uint64(g.index), uint64(v))
 		// feedback=1, for the reports of the faults it injected.
-		fields := slices.Concat([]string{fmt.Sprintf("tape=%d:%d", at, seed), "feedback=1"}, yieldField(r.yield), lim.fields)
+		tape := strings.Join(append(slices.Clone(prefix), fmt.Sprintf("%d:%d", at, seed)), ",")
+		fields := slices.Concat([]string{"tape=" + tape, "feedback=1"}, yieldField(r.yield), lim.fields)
 		if off != "" {
 			fields = append(fields, "faultoff="+off)
 		}
@@ -80,13 +98,7 @@ func (s *search) attribution(ctx context.Context, g *group, r *result) (string, 
 			return false, nil, err
 		}
 		v2.limits = lim
-		var fs []string
-		for _, f := range injectedFaults(v2.output) {
-			if n := faultName(f); !slices.Contains(fs, n) {
-				fs = append(fs, n)
-			}
-		}
-		return v2.key() == g.key, fs, nil
+		return v2.key() == g.key, kindsIn(v2.output), nil
 	}
 	// batch runs variants from to to+attribBatch, at most s.workers at a
 	// time, and returns how many failed and the faults each injected.
@@ -138,7 +150,44 @@ func (s *search) attribution(ctx context.Context, g *group, r *result) (string, 
 		}
 	}
 	if base < attribMinFails {
-		return fmt.Sprintf("not found: %d of %d variants of its first run, reseeded at %s, failed this way, too few to tell which faults it needs", base, n, where), nil
+		// Too few variants fail to compare, as for a failure that needs
+		// a fault only some branch points enable: turn each kind its
+		// first run injected off in that run itself instead, from its
+		// last branch point.
+		var needs, not []string
+		kinds := kindsIn(r.output)
+		for _, f := range kinds[:min(len(kinds), attribKinds)] {
+			fields := slices.Concat([]string{"feedback=1"}, yieldField(r.yield), lim.fields, []string{"faultoff=" + faultOffName(f)})
+			if r.tape != "" {
+				fields = append(fields, "tape="+r.tape)
+			}
+			cmd := s.plain(r.seed, "GODETBRANCH="+strconv.Itoa(branch))
+			cmd.Env = addSearch(cmd.Env, fields...)
+			v, err := s.exec(ctx, cmd)
+			if err != nil {
+				return "", err
+			}
+			v.limits = lim
+			if v.key() == g.key {
+				not = append(not, faultLabel(f))
+			} else {
+				needs = append(needs, faultLabel(f))
+			}
+		}
+		from := "from its start"
+		if last > 1 {
+			from = fmt.Sprintf("from switch %d", last)
+		}
+		line := fmt.Sprintf("%d of %d variants of its first run, reseeded at %s, failed this way, too few to compare", base, n, where)
+		switch {
+		case len(needs) > 0:
+			line = fmt.Sprintf("needs, in its first run, which passes with it off %s: %s; %s", from, strings.Join(needs, ", "), line)
+		case len(not) > 0:
+			line = fmt.Sprintf("not found: its first run still fails with each of its faults off %s (%s); %s", from, strings.Join(not, ", "), line)
+		default:
+			line = "not found: " + line
+		}
+		return line, nil
 	}
 	if len(in) == 0 {
 		return fmt.Sprintf("none: %d of %d variants of its first run, reseeded at %s, failed this way, and they injected no faults", base, n, where), nil
@@ -187,6 +236,17 @@ func (s *search) attribution(ctx context.Context, g *group, r *result) (string, 
 		parts = append(parts, name+": "+strings.Join(ks, "), ")+")")
 	}
 	return strings.Join(parts, "; ") + fmt.Sprintf("; %d of %d fail with every fault, in variants of its first run reseeded at %s", base, n, where), nil
+}
+
+// kindsIn returns the kinds of fault a run's output says it injected.
+func kindsIn(out []byte) []string {
+	var fs []string
+	for _, f := range injectedFaults(out) {
+		if n := faultName(f); !slices.Contains(fs, n) {
+			fs = append(fs, n)
+		}
+	}
+	return fs
 }
 
 // faultOffName returns the name GODETSEARCH's faultoff knows fault f by,

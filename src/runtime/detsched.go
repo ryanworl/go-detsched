@@ -178,6 +178,12 @@ type detGState struct {
 	// until it takes the mutex; see detsimSemrelease.
 	woke uintptr
 
+	// holding is set while the goroutine yields in detFeedHold.
+	holding bool
+
+	// records are the finalizers and cleanups detGCRunBubble runs.
+	records *detGCRecord
+
 	// Mutexes the goroutine holds, for feedback; see detfeed.go.
 	heldGoid uint64 // the goroutine held belongs to
 	nheld    int32

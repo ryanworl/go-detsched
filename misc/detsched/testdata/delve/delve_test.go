@@ -37,6 +37,7 @@ package delve
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -75,10 +76,20 @@ func findFailure(t *testing.T) *failure {
 			failErr = err
 			return
 		}
-		cmd := exec.Command("detsched", "-n", "100")
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), "SIMCOMPOSE_BUG=1")
-		out, _ := cmd.CombinedOutput()
+		// Every run a search forks shares seed 1's setup, so how often
+		// they fail depends on that setup, which any change to the
+		// schedule moves: search again from other fresh seeds until a
+		// run fails.
+		var out []byte
+		for i := range 5 {
+			cmd := exec.Command("detsched", "-n", "200", "-seed-base", strconv.Itoa(i<<32))
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(), "SIMCOMPOSE_BUG=1")
+			out, _ = cmd.CombinedOutput()
+			if bytes.Contains(out, []byte("\n\treplay: ")) {
+				break
+			}
+		}
 		last := func(key string) string {
 			var v string
 			for _, line := range strings.Split(string(out), "\n") {

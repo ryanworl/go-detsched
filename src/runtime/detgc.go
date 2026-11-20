@@ -5,8 +5,11 @@
 package runtime
 
 import (
+	"internal/abi"
+	"internal/goarch"
 	"internal/goexperiment"
 	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -59,12 +62,39 @@ var detGC = struct {
 	sweeping       bool
 	fins, cleanups *special
 	finSeq         uint64
+
+	// The due finalizers and cleanups set in a bubble, in the order
+	// they were set, linked through special.next, which the finalizer
+	// goroutine runs in their bubble (detGCDispatch), and where the
+	// next of each goes.
+	bubbleFins, bubbleCleanups         *special
+	bubbleFinsTail, bubbleCleanupsTail **special
 }{next: detStopNone}
 
 // detFinalizer is the det-mode part of a specialfinalizer.
 type detFinalizer struct {
-	seq uint64         // the order of the runtime.SetFinalizer call
-	p   unsafe.Pointer // the object, once the finalizer is due
+	seq   uint64         // the order of the runtime.SetFinalizer call
+	p     unsafe.Pointer // the object, once the finalizer is due
+	where detGCTag
+}
+
+// A detGCTag says where a finalizer or cleanup was set: in which bubble,
+// by its ID (the special is not in the GC'd heap, so it cannot hold the
+// bubble), and on which simulated node, by the handle of its incarnation.
+// Zero for none.
+type detGCTag struct {
+	bubble uint64
+	node   int32
+}
+
+// detGCWhere returns the tag of a finalizer or cleanup the running
+// goroutine sets.
+func detGCWhere() detGCTag {
+	gp := getg().m.curg
+	if gp == nil || gp.bubble == nil {
+		return detGCTag{}
+	}
+	return detGCTag{gp.bubble.id, detsimNode(gp)}
 }
 
 // detGCEpochSpecials is the number of finalizers, cleanups and weak
@@ -180,7 +210,11 @@ func detGCPush(l, s *special) *special {
 }
 
 // detGCFlush queues the finalizers and cleanups that the sweep found due,
-// in the order they were set, and frees their specials.
+// in the order they were set, and frees their specials. Those set in a
+// bubble wait for the finalizer goroutine instead, which runs them in
+// their bubble (detGCDispatch): run outside it, a finalizer that closes a
+// channel of the bubble or wakes one of its goroutines would end the
+// program with a fatal error.
 func detGCFlush() {
 	fins := detGCSort(detGC.fins, func(s *special) uint64 {
 		return (*specialfinalizer)(unsafe.Pointer(s)).det.seq
@@ -192,6 +226,11 @@ func detGCFlush() {
 	for s := fins; s != nil; {
 		next := s.next
 		sf := (*specialfinalizer)(unsafe.Pointer(s))
+		if sf.det.where.bubble != 0 {
+			detGCDefer(&detGC.bubbleFins, &detGC.bubbleFinsTail, s)
+			s = next
+			continue
+		}
 		queuefinalizer(sf.det.p, sf.fn, sf.nret, sf.fint, sf.ot)
 		lock(&mheap_.speciallock)
 		mheap_.specialfinalizeralloc.free(unsafe.Pointer(sf))
@@ -201,6 +240,11 @@ func detGCFlush() {
 	for s := cleanups; s != nil; {
 		next := s.next
 		sc := (*specialCleanup)(unsafe.Pointer(s))
+		if sc.det.bubble != 0 {
+			detGCDefer(&detGC.bubbleCleanups, &detGC.bubbleCleanupsTail, s)
+			s = next
+			continue
+		}
 		gcCleanups.enqueue(sc.cleanup)
 		lock(&mheap_.speciallock)
 		mheap_.specialCleanupAlloc.free(unsafe.Pointer(sc))
@@ -210,6 +254,226 @@ func detGCFlush() {
 	if cleanups != nil {
 		// The last sweeper flushed the queue before these.
 		gcCleanups.flush()
+	}
+}
+
+// detGCDefer appends the due finalizer or cleanup s, set in a bubble, to
+// the list l, whose end is *tail, for the finalizer goroutine to run in
+// its bubble (see detGCDispatch).
+func detGCDefer(l *(*special), tail *(**special), s *special) {
+	if *l == nil {
+		*tail = l
+	}
+	s.next = nil
+	**tail, *tail = s, &s.next
+	fingStatus.Or(fingWake)
+}
+
+// detGCScanPending marks what the finalizers and cleanups waiting for
+// detGCDispatch need, as markroot does the finalizer queue's.
+func detGCScanPending(gcw *gcWork) {
+	for s := detGC.bubbleFins; s != nil; s = s.next {
+		sf := (*specialfinalizer)(unsafe.Pointer(s))
+		scanblock(uintptr(unsafe.Pointer(&sf.fn)), goarch.PtrSize, &oneptrmask[0], gcw, nil)
+		scanblock(uintptr(unsafe.Pointer(&sf.det.p)), goarch.PtrSize, &oneptrmask[0], gcw, nil)
+	}
+	for s := detGC.bubbleCleanups; s != nil; s = s.next {
+		gcScanCleanup((*specialCleanup)(unsafe.Pointer(s)), gcw)
+	}
+}
+
+// A detGCRecord is a due finalizer or cleanup, which detGCRunBubble runs.
+type detGCRecord struct {
+	next    *detGCRecord
+	fin     finalizer // fn is nil for a cleanup
+	cleanup cleanupFn
+}
+
+// detGCDispatch runs the due finalizers and cleanups that were set in a
+// bubble, called by the finalizer goroutine, or by a bubble's root
+// goroutine before its clock moves (see synctestRun). Those set on a
+// simulated node whose incarnation has crashed or stopped are dropped, as
+// a process that died runs none of its finalizers. Each of the others
+// runs in a new goroutine of its bubble, on its node, one per bubble and
+// node, in the order they were set: it can use the bubble's channels and
+// mutexes, and the bubble does not idle, advance its clock, or report a
+// deadlock until it ends; blocked for good, it is in the deadlock's
+// report as any other goroutine. One whose bubble has ended runs as
+// finalizers and cleanups set outside a bubble do.
+func detGCDispatch() {
+	type group struct {
+		bubble *synctestBubble
+		node   int32
+		head   *detGCRecord
+		tail   **detGCRecord
+	}
+	var groups []*group
+	add := func(where detGCTag, r *detGCRecord) bool {
+		if where.node != 0 && int(where.node) < len(detsim.state) && detsim.state[where.node] == detsimDead {
+			return true // dropped
+		}
+		var bubble *synctestBubble
+		for b := detBubbles; b != nil; b = b.detNext {
+			if b.id == where.bubble {
+				bubble = b
+			}
+		}
+		if bubble == nil {
+			return false
+		}
+		var g *group
+		for _, gr := range groups {
+			if gr.bubble == bubble && gr.node == where.node {
+				g = gr
+			}
+		}
+		if g == nil {
+			g = &group{bubble: bubble, node: where.node}
+			g.tail = &g.head
+			groups = append(groups, g)
+		}
+		*g.tail, g.tail = r, &r.next
+		return true
+	}
+	fins, cleanups := detGC.bubbleFins, detGC.bubbleCleanups
+	detGC.bubbleFins, detGC.bubbleCleanups = nil, nil
+	queued := false
+	for s := fins; s != nil; {
+		next := s.next
+		sf := (*specialfinalizer)(unsafe.Pointer(s))
+		r := &detGCRecord{fin: finalizer{fn: sf.fn, arg: sf.det.p, nret: sf.nret, fint: sf.fint, ot: sf.ot}}
+		where := sf.det.where
+		lock(&mheap_.speciallock)
+		mheap_.specialfinalizeralloc.free(unsafe.Pointer(sf))
+		unlock(&mheap_.speciallock)
+		if !add(where, r) {
+			queuefinalizer(r.fin.arg, r.fin.fn, r.fin.nret, r.fin.fint, r.fin.ot)
+		}
+		s = next
+	}
+	for s := cleanups; s != nil; {
+		next := s.next
+		sc := (*specialCleanup)(unsafe.Pointer(s))
+		r := &detGCRecord{cleanup: sc.cleanup}
+		where := sc.det
+		lock(&mheap_.speciallock)
+		mheap_.specialCleanupAlloc.free(unsafe.Pointer(sc))
+		unlock(&mheap_.speciallock)
+		if !add(where, r) {
+			gcCleanups.enqueue(r.cleanup)
+			queued = true
+		}
+		s = next
+	}
+	if queued {
+		gcCleanups.flush()
+	}
+	gp := getg()
+	f := detGCRunBubble
+	fv := *(**funcval)(unsafe.Pointer(&f))
+	pc := sys.GetCallerPC()
+	bubble, spawn := gp.bubble, detG(gp).spawn
+	for _, g := range groups {
+		// The new goroutine takes its bubble and node from its creator,
+		// as one Node.Go starts does.
+		gp.bubble, detG(gp).spawn = g.bubble, g.node+1
+		lock(&g.bubble.mu)
+		// Where the root goroutine is not parked waiting for the
+		// bubble to block, it woke already or is about to judge the
+		// bubble blocked, so it must wait for the new goroutine (see
+		// synctestRun). Where it is, the new goroutine's own blocking
+		// wakes it.
+		root := g.bubble.root
+		if g.bubble.running == 0 || readgstatus(root)&^_Gscan != _Gwaiting || root.waitreason != waitReasonSynctestRun {
+			g.bubble.detRejoined = true
+		}
+		g.bubble.detStarted++
+		unlock(&g.bubble.mu)
+		systemstack(func() {
+			newg := newproc1(fv, gp, pc, false, waitReasonZero)
+			detG(newg).records = g.head
+			runqput(getg().m.p.ptr(), newg, true)
+		})
+		gp.bubble, detG(gp).spawn = bubble, spawn
+	}
+}
+
+// detGCBeforeDeadlock runs a GC epoch in the root goroutine of bubble,
+// before it reports a deadlock, if the program has finalizers, cleanups,
+// or weak pointers and a goroutine ran since the last epoch, as
+// detGCIdleEpoch does where no goroutine can run. It reports whether the
+// epoch started goroutines in the bubble to run finalizers or cleanups,
+// for which the root waits instead. Called with bubble.mu held, by the
+// root goroutine.
+func detGCBeforeDeadlock(bubble *synctestBubble) bool {
+	lock(&mheap_.speciallock)
+	n := mheap_.specialfinalizeralloc.inuse + mheap_.specialCleanupAlloc.inuse + mheap_.specialWeakHandleAlloc.inuse
+	unlock(&mheap_.speciallock)
+	if !detGC.ran || n == 0 {
+		return false
+	}
+	detGC.ran = false
+	started := bubble.detStarted
+	unlock(&bubble.mu)
+	GC()
+	if detGCPendingIn(bubble) {
+		detGCDispatch()
+	}
+	lock(&bubble.mu)
+	bubble.detRejoined = false
+	return bubble.detStarted != started
+}
+
+// detGCPendingIn reports whether finalizers or cleanups set in bubble
+// wait for detGCDispatch.
+func detGCPendingIn(bubble *synctestBubble) bool {
+	for _, l := range [2]*special{detGC.bubbleFins, detGC.bubbleCleanups} {
+		for s := l; s != nil; s = s.next {
+			where := (*specialCleanup)(unsafe.Pointer(s)).det
+			if s.kind == _KindSpecialFinalizer {
+				where = (*specialfinalizer)(unsafe.Pointer(s)).det.where
+			}
+			if where.bubble == bubble.id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// detGCRunBubble runs the finalizers and cleanups detGCDispatch gave its
+// goroutine, in order.
+func detGCRunBubble() {
+	gp := getg()
+	r := detG(gp).records
+	detG(gp).records = nil
+	for ; r != nil; r = r.next {
+		if r.fin.fn == nil {
+			r.cleanup.call(r.cleanup.fn, r.cleanup.arg)
+			continue
+		}
+		f := &r.fin
+		var regs abi.RegArgs
+		framesz := unsafe.Sizeof((any)(nil)) + f.nret
+		frame := mallocgc(framesz, nil, true)
+		p := frame
+		if intArgRegs > 0 {
+			p = unsafe.Pointer(&regs.Ints)
+		}
+		switch f.fint.Kind() {
+		case abi.Pointer:
+			*(*unsafe.Pointer)(p) = f.arg
+		case abi.Interface:
+			ityp := (*interfacetype)(unsafe.Pointer(f.fint))
+			(*eface)(p)._type = &f.ot.Type
+			(*eface)(p).data = f.arg
+			if len(ityp.Methods) != 0 {
+				(*iface)(p).tab = assertE2I(ityp, (*eface)(p)._type)
+			}
+		default:
+			throw("bad type kind in finalizer")
+		}
+		reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz), uint32(framesz), &regs)
 	}
 }
 

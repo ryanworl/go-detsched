@@ -240,6 +240,9 @@ func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 			cnt := uintptr(atomic.Load(&fb.cnt))
 			scanblock(uintptr(unsafe.Pointer(&fb.fin[0])), cnt*unsafe.Sizeof(fb.fin[0]), &finptrmask[0], gcw, nil)
 		}
+		if goexperiment.DetSched {
+			detGCScanPending(gcw)
+		}
 
 	case i == fixedRootFreeGStacks:
 		// Switch to the system stack so we can call

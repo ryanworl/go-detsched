@@ -180,6 +180,12 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 			return
 		}
 		return uintptr(inc.pid()), 0, 0, true
+
+	case syscall.SYS_INOTIFY_INIT1, sysInotifyInit:
+		if inc == nil {
+			return
+		}
+		return ^uintptr(0), 0, w.noWatch("inotify_init1"), true // -1, which callers check
 	}
 	return
 }
@@ -420,7 +426,7 @@ func (w *World) syncShm(n *inode, lo, hi int64) {
 // there (see syncShm).
 func (w *World) writeBackShm(n *inode) {
 	s := n.shm
-	end := min(s.size, int64(len(n.data)))
+	end := min(s.size, n.size)
 	if end <= 0 {
 		return
 	}

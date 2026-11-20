@@ -1500,6 +1500,9 @@ func isSystemGoroutine(gp *g, fixed bool) bool {
 	if f.funcID == abi.FuncID_runtime_main || f.funcID == abi.FuncID_corostart || f.funcID == abi.FuncID_handleAsyncEvent {
 		return false
 	}
+	if goexperiment.DetSched && funcname(f) == "runtime.detGCRunBubble" {
+		return false // it runs finalizers and cleanups in a bubble
+	}
 	if f.funcID == abi.FuncID_runFinalizers {
 		// We include the finalizer goroutine if it's calling
 		// back into user code.

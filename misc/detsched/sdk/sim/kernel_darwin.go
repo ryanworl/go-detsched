@@ -24,9 +24,10 @@ import (
 // trampoline by its name, once per address. handle translates the calls
 // the kernel handles into Linux's form: open(path, ...) becomes
 // openat(AT_FDCWD, path, ...), stat becomes newfstatat, accept becomes
-// accept4, fcntl(F_FULLFSYNC) becomes fsync. The calls Linux doesn't have
-// are darwin's own: fcntl(F_DUPFD_CLOEXEC), fdopendir, readdir_r, and
-// closedir (fs_darwin.go).
+// accept4, fcntl(F_FULLFSYNC) becomes fsync, and fcntl(F_PREALLOCATE)
+// allocates blocks as fallocate with FALLOC_FL_KEEP_SIZE does. The calls
+// Linux doesn't have are darwin's own: fcntl(F_DUPFD_CLOEXEC), fdopendir,
+// readdir_r, and closedir (fs_darwin.go).
 //
 // Name resolution goes through libc on darwin, even without cgo; on a
 // node, getaddrinfo, getnameinfo, and libresolv's res_9_nsearch find no
@@ -129,6 +130,7 @@ const (
 	fnSocket
 	fnSocketpair
 	fnGetpid
+	fnKqueue
 
 	fnGetaddrinfo
 	fnGetnameinfo
@@ -170,7 +172,7 @@ var libcFns = map[string]libcFn{
 	"mmap": fnMmap, "munmap": fnMunmap, "madvise": fnMadvise,
 	"mprotect": fnMprotect, "msync": fnMsync,
 
-	"socket": fnSocket, "socketpair": fnSocketpair, "getpid": fnGetpid,
+	"socket": fnSocket, "socketpair": fnSocketpair, "getpid": fnGetpid, "kqueue": fnKqueue,
 
 	"getaddrinfo": fnGetaddrinfo, "getnameinfo": fnGetnameinfo,
 	"res_9_ninit": fnResNinit, "res_9_nsearch": fnResNsearch, "res_9_nclose": fnResNclose,
@@ -378,6 +380,11 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 	case fn == fnGetpid:
 		if inc != nil {
 			return uintptr(inc.pid()), 0, 0, true
+		}
+
+	case fn == fnKqueue:
+		if inc != nil {
+			return result(fn, 0, w.noWatch("kqueue"))
 		}
 
 	case fn == fnSocket || fn == fnSocketpair:

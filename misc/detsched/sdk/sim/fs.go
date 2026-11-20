@@ -71,7 +71,9 @@ import (
 //     fail with ENOSPC. A file has blocks up to the end of its furthest
 //     write or fallocate: a truncation that grows it leaves a hole, whose
 //     writes need blocks, as on Linux. Node.SetDiskFull sets it
-//     explicitly.
+//     explicitly. Blocks are only counted: the zeros a growing
+//     truncation or fallocate adds take no memory until written, so a
+//     log can preallocate large segments.
 //
 // Nemesis.StopFaults and Stop end a full disk and slow syncs, and clear
 // latent errors. The nemesis's FaultDisk slows a node's syncs or stalls
@@ -94,6 +96,7 @@ type disk struct {
 	full       bool            // set by Node.SetDiskFull
 	fullUntil  int64           // full because of "sim.disk.enospc" until then
 	syncFailed bool            // an fsync failed since the last power failure
+	strictSkip bool            // a strict fsync left entries a journaling one would commit
 	syncExempt []string        // set by Node.SetSyncFaultExempt
 
 	// The device's speed (drawDisk), and the nemesis's FaultDisk: syncs
@@ -146,9 +149,11 @@ type inode struct {
 	perm  uint32
 	mtime int64
 
-	data    []byte
+	data    []byte   // up to its last write: zeros follow, up to size
+	size    int64    // its size, which a truncation or fallocate can grow without memory
 	pending []pwrite // writes since the last fsync
-	ddata   []byte   // durable data
+	ddata   []byte   // durable data, as data is
+	dsize   int64    // durable size
 	alloc   int64    // data has blocks up to here (see "sim.disk.enospc")
 	shm     *shmem   // the memory its shared mappings map, or nil
 
@@ -201,11 +206,29 @@ func newDisk(dev int) *disk {
 	d.root = &inode{ino: 1, dir: true, perm: 0o755, ents: map[string]*inode{}}
 	d.root.parent = d.root
 	d.dirty[d.root] = true
-	tmp := d.newInode(true, 0o1777)
-	tmp.parent, tmp.name = d.root, "tmp"
-	d.setEnt(d.root, "tmp", tmp)
-	d.commitMeta()
+	d.mkdirAll("/tmp")
 	return d
+}
+
+// mkdirAll creates the directory path, absolute, and those above it, as
+// a new disk's /tmp, durably. A World gives every node's disk the host's
+// os.TempDir too, such as macOS's per-user directory under /var/folders,
+// so that os.CreateTemp and os.MkdirTemp work on nodes.
+func (d *disk) mkdirAll(path string) {
+	dir := d.root
+	for _, name := range strings.Split(path, "/") {
+		if name == "" {
+			continue
+		}
+		c := dir.ents[name]
+		if c == nil {
+			c = d.newInode(true, 0o1777)
+			c.parent, c.name = dir, name
+			d.setEnt(dir, name, c)
+		}
+		dir = c
+	}
+	d.commitMeta()
 }
 
 // drawDisk draws the speed of a new node's disk from the fault stream:
@@ -303,11 +326,12 @@ func (d *disk) commitMeta() {
 	for n := range d.truncated {
 		for _, w := range n.pending {
 			if w.trunc {
-				n.ddata = applyWrite(n.ddata, w)
+				n.ddata, n.dsize = applyWrite(n.ddata, n.dsize, w)
 			}
 		}
 	}
 	clear(d.truncated)
+	d.strictSkip = false
 	// Each directory commits on its own, so the order does not matter.
 	for n := range d.dirty {
 		if d.inTree(n) {
@@ -405,19 +429,33 @@ func (d *disk) fsync(n *inode) {
 	if n.dir {
 		if strict() {
 			d.commitDir(n)
+			d.strictSkip = d.strictSkip || d.uncommitted()
 		} else {
 			d.commitMeta()
 		}
 		return
 	}
 	for _, w := range n.pending {
-		n.ddata = applyWrite(n.ddata, wholePages(n, w))
+		n.ddata, n.dsize = applyWrite(n.ddata, n.dsize, wholePages(n, w))
 	}
 	n.pending = nil
 	delete(d.truncated, n) // its truncations are durable now
 	if !strict() {
 		d.commitMeta()
+	} else {
+		d.strictSkip = d.strictSkip || d.uncommitted()
 	}
+}
+
+// uncommitted reports whether a directory in the tree has entries that
+// are not durable.
+func (d *disk) uncommitted() bool {
+	for n := range d.dirty {
+		if (n.dents == nil || len(n.changed) > 0) && d.inTree(n) {
+			return true
+		}
+	}
+	return false
 }
 
 // wholePages extends w to the pages it covers with the page cache's bytes
@@ -425,14 +463,14 @@ func (d *disk) fsync(n *inode) {
 // that an earlier fsync failed to write become durable with it.
 func wholePages(n *inode, w pwrite) pwrite {
 	end := w.off + int64(len(w.data))
-	lo, hi := w.off&^(pageSize-1), min((end+pageSize-1)&^(pageSize-1), int64(len(n.data)))
+	lo, hi := w.off&^(pageSize-1), min((end+pageSize-1)&^(pageSize-1), n.size)
 	if w.trunc || end > hi || lo == w.off && end == hi {
 		return w
 	}
-	data := make([]byte, 0, hi-lo)
-	data = append(data, n.data[lo:w.off]...)
-	data = append(data, w.data...)
-	data = append(data, n.data[end:hi]...)
+	data := make([]byte, hi-lo) // zeros past n.data
+	copy(data, n.data[min(lo, int64(len(n.data))):min(w.off, int64(len(n.data)))])
+	copy(data[w.off-lo:], w.data)
+	copy(data[end-lo:], n.data[min(end, int64(len(n.data))):min(hi, int64(len(n.data)))])
 	return pwrite{off: lo, data: data}
 }
 
@@ -559,11 +597,15 @@ func (d *disk) powerFail() {
 	partial := buggify.Active("sim.disk.partialcrash")
 	torn := buggify.Active("sim.disk.torn")
 	unsynced := false // writes the power failure could keep some of
+	// A strict disk loses entries a journaling disk would have kept only
+	// when an fsync since their change did not commit them.
+	strictLost := d.strictSkip && d.uncommitted()
+	d.strictSkip = false
 	var walk func(n, parent *inode)
 	walk = func(n, parent *inode) {
 		n.parent = parent
 		if !n.dir {
-			data := slices.Clone(n.ddata)
+			data, size := slices.Clone(n.ddata), n.dsize
 			kept := false // a write survived, so ddata changes too
 			unsynced = unsynced || len(n.pending) > 0
 			for _, w := range n.pending {
@@ -572,22 +614,22 @@ func (d *disk) powerFail() {
 					for off := w.off; off < w.off+int64(len(w.data)); {
 						end := min((off/sectorSize+1)*sectorSize, w.off+int64(len(w.data)))
 						if buggify.Uint64()&1 == 0 {
-							data = applyWrite(data, pwrite{off: off, data: w.data[off-w.off : end-w.off]})
+							data, size = applyWrite(data, size, pwrite{off: off, data: w.data[off-w.off : end-w.off]})
 							kept = true
 						}
 						off = end
 					}
 				case partial || torn:
 					if buggify.Uint64()&1 == 0 {
-						data = applyWrite(data, w)
+						data, size = applyWrite(data, size, w)
 						kept = true
 					}
 				}
 			}
-			n.data, n.pending = data, nil
-			n.alloc = int64(len(data))
+			n.data, n.size, n.pending = data, size, nil
+			n.alloc = size
 			if kept {
-				n.ddata = slices.Clone(data)
+				n.ddata, n.dsize = slices.Clone(data), size
 			}
 			return
 		}
@@ -614,25 +656,28 @@ func (d *disk) powerFail() {
 		injected("fault: sim.disk.partialcrash")
 		world.logEvent(d.nodeName(), "power failure keeps some unsynced writes")
 	}
+	if strictLost {
+		injected("fault: sim.disk.strictdirsync")
+		world.logEvent(d.nodeName(), "power failure loses directory entries that a file's fsync would have committed on a journaling disk")
+	}
 	// The directories in the tree have all their entries durable now, and
 	// those out of it keep theirs for relist.
 	clear(d.dirty)
 	d.fullUntil = 0
 }
 
-func applyWrite(data []byte, w pwrite) []byte {
+// applyWrite applies w to a file's data and size. A truncation that grows
+// the file only sets its size: the zeros past data take no memory.
+func applyWrite(data []byte, size int64, w pwrite) ([]byte, int64) {
 	if w.trunc {
-		if int64(len(data)) > w.off {
-			return data[:w.off]
-		}
-		return append(data, make([]byte, w.off-int64(len(data)))...)
+		return data[:min(int64(len(data)), w.off)], w.off
 	}
 	end := w.off + int64(len(w.data))
 	if int64(len(data)) < end {
 		data = append(data, make([]byte, end-int64(len(data)))...)
 	}
 	copy(data[w.off:], w.data)
-	return data
+	return data, max(size, end)
 }
 
 func sortedNames(m map[string]*inode) []string {
@@ -996,6 +1041,33 @@ func (w *World) ownerOf(inc *incarnation, dk *disk) *incarnation {
 	return nil
 }
 
+// fallocate gives f's file blocks from off to off+size, and with grow
+// makes it at least that long, as a truncation would. Blocks count for a
+// full disk ("sim.disk.enospc"); the file's bytes take no memory until
+// written.
+func (w *World) fallocate(f *openFile, grow bool, off, size int64) uintptr {
+	n := f.ino
+	switch {
+	case n.dir:
+		return uintptr(syscall.ENODEV)
+	case f.flags&syscall.O_ACCMODE == syscall.O_RDONLY:
+		return eBADF
+	case off < 0 || size <= 0:
+		return uintptr(syscall.EINVAL)
+	}
+	if e := checkSize(off + size); e != 0 {
+		return e
+	}
+	if f.disk.noSpace() {
+		return uintptr(syscall.ENOSPC)
+	}
+	n.alloc = max(n.alloc, off+size)
+	if grow && off+size > n.size {
+		w.truncate(f.disk, n, off+size)
+	}
+	return 0
+}
+
 // truncate sets n's size. The new size is metadata, as a journaling file
 // system logs it: an fsync of any file commits it unless the disk is
 // strict (see commitMeta), while the data written before it stays
@@ -1003,8 +1075,8 @@ func (w *World) ownerOf(inc *incarnation, dk *disk) *incarnation {
 // not keep n, which commitMeta would rarely if ever release.
 func (w *World) truncate(d *disk, n *inode, size int64) {
 	w.writeBackFile(n)
-	old := int64(len(n.data))
-	n.data = applyWrite(n.data, pwrite{off: size, trunc: true})
+	old := n.size
+	n.data, n.size = applyWrite(n.data, n.size, pwrite{off: size, trunc: true})
 	n.pending = append(n.pending, pwrite{off: size, trunc: true})
 	n.alloc = min(n.alloc, size)
 	if !strict() {
@@ -1074,17 +1146,19 @@ func (w *World) fileCall(d *fdesc, trap uintptr, a [6]uintptr) (uintptr, uintptr
 		for _, b := range bufs {
 			size += len(b)
 		}
-		if e := f.disk.readSectors(n, off, min(off+int64(size), int64(len(n.data)))); e != 0 {
+		if e := f.disk.readSectors(n, off, min(off+int64(size), n.size)); e != 0 {
 			return 0, e
 		}
 		total := 0
 		for _, b := range bufs {
-			if off >= int64(len(n.data)) {
+			if off >= n.size {
 				break
 			}
-			m := copy(b, n.data[off:])
-			off += int64(m)
-			total += m
+			b = b[:min(int64(len(b)), n.size-off)]
+			m := copy(b, n.data[min(off, int64(len(n.data))):])
+			clear(b[m:]) // zeros past n.data
+			off += int64(len(b))
+			total += len(b)
 		}
 		if trap != sysPread64 {
 			f.off = off
@@ -1109,7 +1183,7 @@ func (w *World) fileCall(d *fdesc, trap uintptr, a [6]uintptr) (uintptr, uintptr
 			bufs = [][]byte{mem(a[1], a[2])}
 		}
 		if f.flags&syscall.O_APPEND != 0 && trap != sysPwrite64 {
-			off = int64(len(n.data))
+			off = n.size
 		}
 		size := 0
 		for _, b := range bufs {
@@ -1129,7 +1203,7 @@ func (w *World) fileCall(d *fdesc, trap uintptr, a [6]uintptr) (uintptr, uintptr
 		for _, b := range bufs {
 			wr := pwrite{off: off, data: slices.Clone(b)}
 			n.wroteSectors(wr.off, wr.off+int64(len(b)))
-			n.data = applyWrite(n.data, wr)
+			n.data, n.size = applyWrite(n.data, n.size, wr)
 			n.pending = append(n.pending, corrupt(wr))
 			w.mapped(n, wr.off, wr.off+int64(len(wr.data)))
 			off += int64(len(b))
@@ -1152,7 +1226,7 @@ func (w *World) fileCall(d *fdesc, trap uintptr, a [6]uintptr) (uintptr, uintptr
 		case 1:
 			base = f.off
 		case 2:
-			base = int64(len(n.data))
+			base = n.size
 		default:
 			return 0, uintptr(syscall.EINVAL)
 		}
@@ -1186,30 +1260,14 @@ func (w *World) fileCall(d *fdesc, trap uintptr, a [6]uintptr) (uintptr, uintptr
 		fillStatfs(f.disk, ptr(a[1]))
 		return 0, 0
 	case sysFallocate:
-		// Allocation itself is not simulated: mode 0 extends the file
-		// as a truncation would, and FALLOC_FL_KEEP_SIZE does nothing.
-		mode, off, size := a[1], int64(a[2]), int64(a[3])
-		switch {
-		case n.dir:
-			return 0, uintptr(syscall.ENODEV)
-		case acc == syscall.O_RDONLY:
-			return 0, eBADF
-		case off < 0 || size <= 0:
-			return 0, uintptr(syscall.EINVAL)
-		case mode&^1 != 0: // anything but FALLOC_FL_KEEP_SIZE
+		mode := a[1]
+		if mode&^1 != 0 { // anything but FALLOC_FL_KEEP_SIZE
+			if n.dir {
+				return 0, uintptr(syscall.ENODEV)
+			}
 			return 0, uintptr(syscall.EOPNOTSUPP)
 		}
-		if e := checkSize(off + size); e != 0 {
-			return 0, e
-		}
-		if f.disk.noSpace() {
-			return 0, uintptr(syscall.ENOSPC)
-		}
-		n.alloc = max(n.alloc, off+size)
-		if mode == 0 && off+size > int64(len(n.data)) {
-			w.truncate(f.disk, n, off+size)
-		}
-		return 0, 0
+		return 0, w.fallocate(f, mode == 0, int64(a[2]), int64(a[3]))
 	case sysFchmod:
 		n.perm = uint32(a[1]) & 0o7777
 		return 0, 0
@@ -1260,6 +1318,8 @@ func (w *World) fileCall(d *fdesc, trap uintptr, a [6]uintptr) (uintptr, uintptr
 				return 0, n.lock(f, lockOFD, fl.Type == syscall.F_WRLCK, a[1] == _F_OFD_SETLKW)
 			}
 			return 0, uintptr(syscall.EINVAL)
+		case _F_PREALLOCATE:
+			return 0, w.preallocate(f, ptr(a[2]))
 		case _F_OFD_GETLK:
 			fl := (*syscall.Flock_t)(ptr(a[2]))
 			if n.conflicts(f, lockOFD, fl.Type == syscall.F_WRLCK) {

@@ -738,6 +738,19 @@ func TestSimPrograms(t *testing.T) {
 		// runnable goroutine before it looked at the finalizer
 		// goroutine, and with seed 3 none ran.
 		{pkg: "simfinalizer", search: "perturb=pct", seeds: []string{"1", "3"}},
+		// Every node has os.TempDir, here macOS's per-user directory.
+		{pkg: "simtempdir"},
+		// A watcher of file system changes on a node fails, and says why.
+		{pkg: "simwatch", want: []string{"which creates a watcher of file system changes"}},
+		// Finalizers and cleanups set in a bubble run in it, on their
+		// node, and not at all once their node crashed. Before, they ran
+		// outside every bubble, and closing a channel of the bubble ended
+		// the program. With GODETSEED=7 the epoch comes from outside the
+		// bubble while all its goroutines are blocked.
+		{pkg: "simbubblefin", seeds: []string{"1", "2", "7"}},
+		{pkg: "simbubblefin", search: "perturb=pct", seeds: []string{"1", "2"}},
+		// One that blocks for good is in the bubble's deadlock report.
+		{pkg: "simfinblock", exit: 2, want: []string{"main bubble goroutine has exited but blocked goroutines remain", "simfinblock.open.func1"}},
 		// The CPU work of a simulation's nodes takes simulated time.
 		{pkg: "simbusy"},
 		// A run in which only the simulation's events run collects their
@@ -869,8 +882,9 @@ func TestManyRunnable(t *testing.T) {
 }
 
 // TestPowerFailReports checks that a power failure reports torn writes
-// as injected only on a node with unsynced writes
-// (testdata/simkill's TestPowerFailReports).
+// as injected only on a node with unsynced writes, and lost entries of a
+// strict disk only where a journaling disk would have kept them
+// (testdata/simkill's TestPowerFailReports and TestStrictLossReports).
 func TestPowerFailReports(t *testing.T) {
 	bin, cleanup, err := build(config{}, "../../testdata/simkill")
 	if err != nil {
@@ -878,13 +892,15 @@ func TestPowerFailReports(t *testing.T) {
 	}
 	defer cleanup()
 	cmd := command(bin, "GODETSEED=1", "GODETSEARCH=feedback=1")
-	cmd.Args = append(cmd.Args, "-test.run=^TestPowerFailReports$")
+	cmd.Args = append(cmd.Args, "-test.run=^(TestPowerFailReports|TestStrictLossReports)$")
 	o, _, err := run(cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m := regexp.MustCompile(`(?m)^detsched: assert reachable true=(\d+) false=\d+ fault: sim.disk.torn$`).FindStringSubmatch(o.stderr); o.exitCode != 0 || m == nil || m[1] != "1" {
-		t.Errorf("exit status %d, torn writes reported %v times, want 1:\n%s", o.exitCode, m, o.stderr)
+	for _, kind := range []string{"torn", "strictdirsync"} {
+		if m := regexp.MustCompile(`(?m)^detsched: assert reachable true=(\d+) false=\d+ fault: sim.disk.` + kind + `$`).FindStringSubmatch(o.stderr); o.exitCode != 0 || m == nil || m[1] != "1" {
+			t.Errorf("exit status %d, sim.disk.%s reported %v times, want 1:\n%s", o.exitCode, kind, m, o.stderr)
+		}
 	}
 }
 

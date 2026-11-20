@@ -13,6 +13,8 @@
 // it, syncing every 50ms instead, so that a power failure loses puts it
 // acknowledged. SIMCOMPOSE_EXTRA, when set, starts one more goroutine,
 // which changes the schedule, as NO_COLOR can a logger's.
+// SIMCOMPOSE_UNUSED is read and changes nothing, as most variables a
+// program looks for in init.
 package simcompose
 
 import (
@@ -152,6 +154,7 @@ func TestCompose(t *testing.T) {
 	if os.Getenv("SIMCOMPOSE_EXTRA") != "" {
 		go func() {}()
 	}
+	_ = os.Getenv("SIMCOMPOSE_UNUSED")
 	synctest.Test(t, func(t *testing.T) {
 		// The server does not survive disk errors: it ignores a failed
 		// read of its log, and a failed append can leave half a line.

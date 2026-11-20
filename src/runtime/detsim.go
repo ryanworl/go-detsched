@@ -86,6 +86,7 @@
 package runtime
 
 import (
+	"internal/goarch"
 	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"unsafe"
@@ -345,6 +346,15 @@ func detsimSetForked(f func()) {
 	detsim.forked = f
 }
 
+// inotify_init1 and inotify_init, which package syscall makes raw and
+// RawSyscall offers too, so that the simulation can refuse a node a
+// watcher of the real file system. They are not among the rawTraps the
+// simulation registers, whose number older SDKs fix.
+const (
+	detsimSysInotifyInit1 = 294*goarch.IsAmd64 + 26*goarch.IsArm64 + 1<<20*(1-goarch.IsAmd64-goarch.IsArm64)
+	detsimSysInotifyInit  = 253*goarch.IsAmd64 + 1<<20*(1-goarch.IsAmd64)
+)
+
 // syscall_detsimSyscall offers a system call to the simulation. It must
 // not grow the stack: the arguments may point into it.
 //
@@ -354,7 +364,7 @@ func syscall_detsimSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr, raw bool) (r1, 
 	if detsim.handler == nil {
 		return
 	}
-	if raw && trap != detsim.rawTraps[0] && trap != detsim.rawTraps[1] && trap != detsim.rawTraps[2] && trap != detsim.rawTraps[3] {
+	if raw && trap != detsim.rawTraps[0] && trap != detsim.rawTraps[1] && trap != detsim.rawTraps[2] && trap != detsim.rawTraps[3] && trap != detsimSysInotifyInit1 && trap != detsimSysInotifyInit {
 		return
 	}
 	gp := getg()
@@ -616,6 +626,10 @@ func detsimFreeze(gp *g) bool {
 		detsimLeaveBubble(gp, _Grunnable)
 		gp.waitreason = waitReasonZero
 		s.frozen = true
+		if s.holding { // it never returns from detFeedHold
+			s.holding = false
+			detFeed.holding--
+		}
 		if s.woke != 0 {
 			// Only goroutines of its crashed node wait for the
 			// mutex it was woken for: it keeps the turn frozen, as

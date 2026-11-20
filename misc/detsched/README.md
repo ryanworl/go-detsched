@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched30
+v=go1.27.4-detsched31
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -130,8 +130,12 @@ FAIL 82 of 6848 runs: detsched: assertion failed: acknowledged write survives
   one the failure `needs`; one without which as many fail is `not
   needed`. Variants part at setup's end because a failure noticed long
   after its cause, such as a stall caught at a deadline, would fail in
-  every variant reseeded later. When too few variants fail, the line
-  says `not found` and how many did. A search of `-n` runs waits for
+  every variant reseeded later. When too few variants fail to compare,
+  as for a failure that needs a fault only some runs enable, `detsched`
+  turns each kind the first run injected off in that run itself, from
+  its last branch point, and says which kinds it `needs` there (it
+  passes without them); with none, the line says `not found` and how
+  many variants failed. A search of `-n` runs waits for
   this before its summary; a search that ends otherwise says it was not
   found. Plain loss on a link (`Link.Drop`) counts as the fault
   `sim.net.loss`.
@@ -417,9 +421,11 @@ kept binary, and its arguments. It sets:
   was printed for`);
 - the variables of `detsched`'s environment the schedule depends on, and
   every other variable the program read, as the run had them, and unsets
-  with `env -u` those it read that the run did not have (`TZ`, which
-  package `time` reads, is the usual one), so the line runs the same in
-  any shell.
+  with `env -u` those it read that the run did not have and whose
+  presence changes the schedule, so the line runs the same in any shell.
+  Before the search, seed 1 runs with every variable it read but did
+  not have set to `1`, and then with halves of them, to find those; a
+  variable only later runs read is unset untested.
 
 The run prints `detsched: trace=0x... switches=N syncs=M` at exit (a hash
 of the schedule, the goroutine switches, and the synchronization points
@@ -505,10 +511,11 @@ code under test and searches each such mutant:
 
 ```
 detsched -check: caught 6 of 12 mistakes planted in code the passing runs reached, with 100 runs each (1 more did not compile and was skipped)
-	survived: store.go:36 drop the Lock and Unlock of c.mu
-	caught:   store.go:65 ignore the error in err != nil: detsched: assertion failed: the log counts the syncs that succeeded
+	survived: internal/store/store.go:36 drop the Lock and Unlock of c.mu
+	caught:   internal/store/store.go:65 ignore the error in err != nil: detsched: assertion failed: the log counts the syncs that succeeded
 ```
 
+- Each mistake is named by its file's path in its module and the line.
 - It first searches the unmutated program with the same runs, and stops
   if any run fails: fix those failures first, since a mutant's could not
   be told from them.
@@ -569,10 +576,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched30:
+and release N's version is v0.N.0, so with go1.27.4-detsched31:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.30.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.31.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
@@ -676,7 +683,10 @@ is set, as on a passing seed's replay line to check what the harness did.
   `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`, the ECN bits of the TOS
   byte, `IP_PKTINFO`, and segmentation offload (`UDP_SEGMENT`).
   `Node.SetNAT` puts a node behind a NAT, which `Node.Rebind` rebinds.
-- **Disk.** Writes stay in a page cache until fsync. With an ordered
+- **Disk.** A node's disk starts with `/tmp` and the host's
+  `os.TempDir()` (on macOS a per-user directory under `/var/folders`), so
+  `os.CreateTemp("", ...)` works on every node. Writes stay in a page
+  cache until fsync. With an ordered
   journal's semantics, fsync of any file commits the namespace. A killed
   node loses everything unsynced. `mmap` of a file is coherent: a write or
   truncation through a descriptor shows through its mappings at once,
@@ -685,6 +695,8 @@ is set, as on a passing seed's replay line to check what the harness did.
   and on macOS each is a copy. Stores to a shared writable mapping reach
   the page cache before any call on one of the file's descriptors, and on
   `msync` (with `MS_SYNC`, an fsync), `munmap`, `mremap`, and a crash.
+  Preallocation (`fallocate`, `fcntl(F_PREALLOCATE)` on macOS, a growing
+  truncation) takes no memory until written.
   Calls that wait for the device (fsync, fdatasync, `F_FULLFSYNC`,
   `O_SYNC` and `O_DSYNC` writes, `msync` with `MS_SYNC`) block the calling
   goroutine in simulated time while other goroutines and nodes run on.
@@ -763,6 +775,11 @@ is set, as on a passing seed's replay line to check what the harness did.
   such as a client the test body starts, cannot open an Internet socket:
   the call fails with `EPERM`, and the first one prints why. Run such
   code with `Node.Go` or on a node.
+- **No file watchers.** On a node, creating a watcher of file system
+  changes (`inotify_init1` on Linux, `kqueue` on macOS, as
+  `fsnotify.NewWatcher` does) fails with `ENOSYS`, and the first one
+  prints why: its events would come from the real file system. Notice
+  changes by polling on nodes, or turn the watcher off in the harness.
 - **Faults.** All of the simulation's choices come from the fault stream,
   which `GODETSEED` seeds. The simulation's own faults are buggify sites:
   `sim.net.retransmit`, `sim.net.reset`, `sim.net.udpdrop`, `udpdup`,
@@ -770,7 +787,9 @@ is set, as on a passing seed's replay line to check what the harness did.
   `sim.disk.slowsync`, `sim.disk.readerror`, `sim.disk.enospc`,
   `sim.disk.partialcrash` (a crash keeps some unsynced writes),
   `sim.disk.torn` (sector by sector), and the opt-in
-  `sim.disk.strictdirsync` (only directory fsyncs commit entries),
+  `sim.disk.strictdirsync` (only directory fsyncs commit entries, which
+  is reported when a power failure loses entries that a file's fsync
+  since would have committed on a journaling disk),
   `sim.disk.bitflip`, and `sim.disk.misdirect`. They fire only once setup
   has completed (see [No faults](#no-faults)) and outside a nemesis's
   calms, and each one that fires is reported as the assertion
@@ -871,9 +890,14 @@ cleanups, and weak pointers; or a point where no goroutine can run,
 before the program idles or reports a deadlock. So a goroutine that
 blocks until a finalizer or cleanup runs sees it run, but one that waits
 for one by sleeping in a loop inside a bubble keeps the bubble's clock
-jumping instead; call `runtime.GC` there. Finalizers and cleanups run
-outside every bubble, as upstream, so they must not use a bubble's
-channels or stop its timers.
+jumping instead; call `runtime.GC` there. A finalizer or cleanup set
+in a bubble runs in a goroutine of that bubble, on the simulated node
+that set it, so it may use the bubble's channels and timers, and the
+bubble neither moves its clock nor reports a deadlock until it returns
+(one that blocks for good is in the deadlock's report); one set on a
+node whose process has since crashed or stopped never runs, as a dead
+process runs none. Those set outside a bubble, or in one that has
+ended, run outside every bubble, as upstream.
 
 synctest bubbles never wait in real time. When no goroutine anywhere can
 run, and none is in a system call or waiting on the network, the blocked

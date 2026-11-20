@@ -9,6 +9,7 @@
 package simkill
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -255,5 +256,60 @@ func TestPowerFailReports(t *testing.T) {
 		})
 		<-wrote
 		b.Kill()
+	})
+}
+
+// TestStrictLossReports cuts the power of three nodes with strict
+// directory syncs forced on: a fsynced a new file but not its directory,
+// b fsynced both, and c created a file and fsynced nothing. Only a lost
+// an entry that a journaling disk would have kept, so only a's may report
+// sim.disk.strictdirsync as injected (TestPowerFailReports in
+// cmd/detsched counts the reports): before, none did, so runs that it
+// failed counted as runs without faults.
+func TestStrictLossReports(t *testing.T) {
+	if !sim.Supported() {
+		t.Skip("needs GOEXPERIMENT=detsched")
+	}
+	buggify.Force("sim.disk.strictdirsync", true)
+	defer buggify.Force("sim.disk.strictdirsync", false)
+	synctest.Test(t, func(t *testing.T) {
+		w := sim.NewWorld(sim.Config{})
+		defer w.Close()
+		write := func(n *sim.Node, syncFile, syncDir bool) {
+			done := make(chan bool)
+			n.Go(func() {
+				defer close(done)
+				f, err := os.Create("/f")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				f.Write([]byte("data"))
+				if syncFile {
+					f.Sync()
+				}
+				f.Close()
+				if syncDir {
+					d, _ := os.Open("/")
+					d.Sync()
+					d.Close()
+				}
+			})
+			<-done
+		}
+		for i, c := range []struct{ syncFile, syncDir, survives bool }{{true, false, false}, {true, true, true}, {false, false, false}} {
+			n := w.AddNode(string(rune('a'+i)), fmt.Sprintf("10.0.0.%d", i+1))
+			n.Start(func() {})
+			write(n, c.syncFile, c.syncDir)
+			n.Kill()
+			found := make(chan bool)
+			n.Start(func() {
+				_, err := os.Stat("/f")
+				found <- err == nil
+			})
+			if got := <-found; got != c.survives {
+				t.Errorf("node %d: file survived %v, want %v", i, got, c.survives)
+			}
+		}
 	})
 }

@@ -26,7 +26,12 @@ const (
 	_F_OFD_GETLK  = 36
 	_F_OFD_SETLK  = 37
 	_F_OFD_SETLKW = 38
+
+	// Linux has no fcntl(F_PREALLOCATE); no fcntl command matches it.
+	_F_PREALLOCATE = 1<<20 + 42
 )
+
+func (w *World) preallocate(*openFile, unsafe.Pointer) uintptr { panic("unreachable") }
 
 // fillStatfs fills the statfs result at p for dk: an ext4 file system of
 // 64GiB that is empty unless the disk is full, as free space is not
@@ -50,7 +55,7 @@ func fillStat(dk *disk, n *inode, st *syscall.Stat_t) {
 		st.Nlink = 2
 	} else {
 		st.Mode |= syscall.S_IFREG
-		st.Size = int64(len(n.data))
+		st.Size = n.size
 		st.Blocks = (st.Size + 511) / 512
 	}
 	st.Blksize = 4096

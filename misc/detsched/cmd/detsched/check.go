@@ -16,6 +16,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -39,6 +40,7 @@ const (
 type mutation struct {
 	op    string // the operator, for spreading the mutants over them
 	file  string // absolute path, where it is reported
+	name  string // file's path in its module, as reports name it
 	line  int
 	desc  string // such as "drop the Lock and Unlock of s.mu"
 	edits []edit
@@ -58,7 +60,7 @@ type site struct {
 	line int
 }
 
-func (m *mutation) where() string { return fmt.Sprintf("%s:%d", filepath.Base(m.file), m.line) }
+func (m *mutation) where() string { return fmt.Sprintf("%s:%d", m.name, m.line) }
 
 // files returns the files m edits.
 func (m *mutation) files() []string {
@@ -175,6 +177,7 @@ func mutationCheck(ctx context.Context, pkg, run string, n uint64, workers int, 
 			return 2, err
 		}
 		for _, m := range ms {
+			m.name = path.Join(p.dir, filepath.Base(m.file))
 			if slices.ContainsFunc(m.ran, func(s site) bool { return reached(s.file, s.line) }) {
 				muts = append(muts, m)
 			}
@@ -282,6 +285,7 @@ func mutationCheck(ctx context.Context, pkg, run string, n uint64, workers int, 
 // A checkPackage is a package of the code under test.
 type checkPackage struct {
 	path  string
+	dir   string   // its directory in its module, such as "internal/store"
 	files []string // its non-test Go files, absolute
 }
 
@@ -330,7 +334,7 @@ func checkPackages(pkg string) ([]checkPackage, []string, error) {
 		if len(files) == 0 || slices.ContainsFunc(ps, func(p checkPackage) bool { return p.path == path }) {
 			continue
 		}
-		ps = append(ps, checkPackage{path: path, files: files})
+		ps = append(ps, checkPackage{path: path, dir: strings.TrimPrefix(strings.TrimPrefix(path, mod), "/"), files: files})
 	}
 	return ps, mods, nil
 }

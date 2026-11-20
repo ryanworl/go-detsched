@@ -5,6 +5,7 @@
 package main
 
 import (
+	"internal/goexperiment"
 	"internal/synctest"
 	"runtime"
 	"runtime/metrics"
@@ -83,6 +84,12 @@ func main() {
 		}
 		println("finalizers/cleanups failed to run after", iterations, "cycles")
 	})
+	if goexperiment.DetSched {
+		// Under detsched, a finalizer or cleanup set in a bubble runs in
+		// it (see runtime/detgc.go), so the channels it made are bubbled.
+		println("success")
+		return
+	}
 	// Close the channels created by the finalizer and cleanup func.
 	// If the funcs improperly ran inside the bubble, these channels are bubbled
 	// and trying to close them will panic.
