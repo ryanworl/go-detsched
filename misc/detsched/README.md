@@ -18,7 +18,7 @@ https://github.com/ryanworl/go-detsched/releases and put its `bin`, which
 has `go`, `detsched` and Delve's `dlv`, on your `PATH`:
 
 ```
-v=go1.27.4-detsched38
+v=go1.27.4-detsched39
 mkdir -p ~/sdk
 curl -fsSL https://github.com/ryanworl/go-detsched/releases/download/$v/$v.linux-amd64.tar.gz | tar -C ~/sdk -xz
 export PATH=$HOME/sdk/$v/bin:$PATH
@@ -405,6 +405,21 @@ the branch's check does not run, and the branch keeps its number, so
 `GODETBRANCH` still counts the branches after it right. The fix is the
 reason's.
 
+### Shared descriptor
+
+Each simulated node's file and socket descriptors are its own, as a
+process's are, and so are each start's: a node's call on a descriptor
+that another node opened, or an earlier start of the same node, fails
+with `EBADF`, and the first such call of a World prints
+`sim: node B (start 1) called write on descriptor N, which node A (start
+1) opened`, adding `before it crashed or stopped` for an earlier start's.
+It comes from a harness that keeps an `*os.File`, a `net.Conn`, or a
+client that holds one in a package variable or other state that several
+nodes, or several starts of a node, reach. Such runs often pass, as code
+ignores the error of a call such as `Close`, so the summary counts them
+and gives the replay line of the first, whose output has the message.
+Open files and connections in the code each node runs.
+
 ### Replay did not reproduce
 
 `detsched` runs each group's replay line in a new shell. When it ends
@@ -657,7 +672,7 @@ before the search starts, such as when the package does not build, the
 file has only `end`, with `exit_status` 2 and `error`.
 
 ```json
-{"event":"start","time":"...","schema":1,"detsched":"go1.27.4-detsched38","mode":"search","package":".","binary":"/tmp/detsched-123/store.test","binary_sha256":"8aef...","cwd":"/src/store","args":["-test.run=^TestStore$"],"run":"^TestStore$","p":7,"seed_base":0,"n":1000,"timeout_s":600,"out":"/tmp/detsched-123"}
+{"event":"start","time":"...","schema":1,"detsched":"go1.27.4-detsched39","mode":"search","package":".","binary":"/tmp/detsched-123/store.test","binary_sha256":"8aef...","cwd":"/src/store","args":["-test.run=^TestStore$"],"run":"^TestStore$","p":7,"seed_base":0,"n":1000,"timeout_s":600,"out":"/tmp/detsched-123"}
 {"event":"run","time":"...","seed":7,"tape":"45:7,51:9","arm":"cell","forked":true,"result":"fail","exit_code":1,"trace":"0x180bd2a3779a224","switches":948814,"syncs":27753685,"machine":"p4096.f7ffdffff.h1f8bfbff.g2.s606a6","elapsed_s":41.2,"signature":"detsched: assertion failed: ...","branch":0,"group":1,"log":"/tmp/detsched-123/fail-1-1.log"}
 {"event":"fallback","time":"...","kind":"seed-1-ran-two-schedules","what":"...","cost":"...","fix":"...","docs":".../README.md#seed-1-ran-two-schedules"}
 {"event":"group","time":"...","id":1,"signature":"...","message":"...","details":"...","runs":147,"logs":["..."],"first":{"seed":7,"tape":"45:7,51:9","branch":0,"log":"..."},"replay":{"cwd":"/src/store","set":{"GODETSEED":"7","GODETBRANCH":"0","GODETSEARCH":"tape=45:7,51:9 trace=0x180bd2a3779a224 machine=..."},"unset":["NO_COLOR"],"argv":["/tmp/detsched-123/store.test","-test.run=^TestStore$"]},"replay_line":"cd /src/store && env -u NO_COLOR GODETSEED=7 ...","debug":{...,"argv":["dlv","exec","--disable-aslr","/tmp/detsched-123/debug/store.test","--","-test.run=^TestStore$"]},"debug_line":"...","reproduced":true,"replay_status":"reproduced","also":[{"signature":"...","runs":14,"log":"...","replay":{...}}],"faults":"needs: sim.disk.fsyncfail ..."}
@@ -779,10 +794,10 @@ and gives each at least a tenth of the runs; it picks cells the same way.
 
 Packages under `sdk` let a test tell `detsched` what matters. They are the
 module `github.com/ryanworl/go-detsched/misc/detsched` in this directory,
-and release N's version is v0.N.0, so with go1.27.4-detsched38:
+and release N's version is v0.N.0, so with go1.27.4-detsched39:
 
 ```
-go get github.com/ryanworl/go-detsched/misc/detsched@v0.38.0
+go get github.com/ryanworl/go-detsched/misc/detsched@v0.39.0
 ```
 
 Without the experiment they do nothing, or print, so tests build and pass
@@ -998,6 +1013,13 @@ is set, as on a passing seed's replay line to check what the harness did.
   `fsnotify.NewWatcher` does) fails with `ENOSYS`, and the first one
   prints why: its events would come from the real file system. Notice
   changes by polling on nodes, or turn the watcher off in the harness.
+- **Descriptors are per process.** A node's file and socket descriptors
+  are its own and its start's, as a process's are: another node's call
+  on one, or a later start's, fails with `EBADF`, and the first such call
+  prints which node and start opened it and which used it in which call
+  (see [Shared descriptor](#shared-descriptor)). Goroutines of no node,
+  such as the test body, may use any node's, and a finalizer or cleanup
+  runs on the node that set it.
 - **Faults.** All of the simulation's choices come from the fault stream,
   which `GODETSEED` seeds. The simulation's own faults are buggify sites:
   `sim.net.retransmit`, `sim.net.reset`, `sim.net.udpdrop`, `udpdup`,

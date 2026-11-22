@@ -146,6 +146,10 @@ type World struct {
 	canInject []string               // fault sites reached (see fault)
 
 	fds map[int]*fdesc
+	// The descriptors that crashes closed, by the incarnation that had
+	// them open, so that a later use says whose they were (see fd).
+	closedFDs map[int]*incarnation
+	call      uintptr // the call handle is handling, which messages name (see callName)
 
 	events   map[uint64]func()
 	nextConn uint64
@@ -163,6 +167,7 @@ type World struct {
 	closing   bool // Close is killing the nodes
 	noNodeMsg bool // printed noNodeSocket's message
 	watchMsg  bool // printed noWatch's message
+	fdMsg     bool // printed foreignFD's message
 }
 
 // Node is a machine in a World: an address, a disk, and, while it is up,
@@ -196,6 +201,7 @@ type Node struct {
 type incarnation struct {
 	node   *Node
 	handle int32
+	start  int // the node's start it is, from 1
 	alive  bool
 	cwd    *inode
 	ports  map[uint16]*socket // bound and listening TCP sockets
@@ -207,6 +213,11 @@ type incarnation struct {
 	down     chan struct{} // closed when the incarnation ends
 	ended    chan struct{} // closed when the start function returns or the incarnation ends
 	endOnce  sync.Once
+}
+
+// name names inc, as the runtime names its goroutines' node.
+func (inc *incarnation) name() string {
+	return inc.node.name + " (start " + strconv.Itoa(inc.start) + ")"
 }
 
 // end closes inc.ended, once.
@@ -591,7 +602,8 @@ func (n *Node) Start(f func()) <-chan struct{} {
 		n.w.netChanged()
 	})
 	n.starts++
-	runtime_nodeName(inc.handle, n.name+" (start "+strconv.Itoa(n.starts)+")")
+	inc.start = n.starts
+	runtime_nodeName(inc.handle, inc.name())
 	n.applyCPU()
 	n.applyClock(false)
 	n.w.logEvent(n.name, "start")

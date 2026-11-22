@@ -178,6 +178,18 @@ var libcFns = map[string]libcFn{
 	"res_9_ninit": fnResNinit, "res_9_nsearch": fnResNsearch, "res_9_nclose": fnResNclose,
 }
 
+// callName returns the name of the libc function that the trampoline at
+// pc calls, for messages.
+func callName(pc uintptr) string {
+	if f := runtime.FuncForPC(pc); f != nil {
+		name := f.Name()
+		name = name[strings.LastIndex(name, ".")+1:]
+		name = strings.TrimSuffix(name, "_trampoline")
+		return strings.TrimPrefix(name, "libc_")
+	}
+	return "a libc function"
+}
+
 // libcByTrampoline caches libcOf.
 var libcByTrampoline = map[uintptr]libcFn{}
 
@@ -266,6 +278,7 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 	if fn == fnUnknown {
 		return
 	}
+	w.call = trap
 	inc := w.incs[node]
 	if node != 0 && inc == nil {
 		// A goroutine of a crashed node, running on to release a
@@ -292,11 +305,11 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 			}
 			return
 		}
-		d := w.fds[int(a[0])]
-		if d == nil {
-			return result(fn, 0, eBADF)
+		d, e := w.fd(inc, a[0])
+		if e != 0 {
+			return result(fn, 0, e)
 		}
-		var r, e uintptr
+		var r uintptr
 		switch {
 		case fn == fnDup || fn == fnFcntl && (a[1] == syscall.F_DUPFD_CLOEXEC || a[1] == syscall.F_DUPFD):
 			r, e = w.dup(d)
@@ -349,8 +362,8 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 		if !isSimFD(a[4]) {
 			return
 		}
-		d := w.fds[int(a[4])]
-		if d == nil || d.file == nil {
+		d, e := w.fd(inc, a[4])
+		if e != 0 || d.file == nil {
 			return result(fn, 0, eBADF)
 		}
 		r, e := w.mmap(d.file, d.inc, trap, a)

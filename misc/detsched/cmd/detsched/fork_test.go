@@ -688,6 +688,19 @@ func TestSearchReports(t *testing.T) {
 	}
 }
 
+// TestSearchSharedDescriptor checks that runs in which a node used
+// another incarnation's descriptor (testdata/simsharedfd) are in the
+// summary, as a fallback that says how many, what the first did, and how
+// to replay it: the runs pass, as code often ignores the EBADF, and the
+// message in their output was the only sign.
+func TestSearchSharedDescriptor(t *testing.T) {
+	s := runSearch(t, "../../testdata/simsharedfd", 4)
+	want := regexp.MustCompile(`\n  - in 4 of 4 runs a simulated node used a file or socket descriptor that another node, or an earlier start of the same node, opened; first: node b \(start 1\) called write on descriptor \d+, which node a \(start 1\) opened; replay it: cd .* GODETSEED=1 .*\n    cost: those calls failed with EBADF.*\n    fix:  .*\n    docs: .*README\.md#shared-descriptor\n`)
+	if r := searchReport(s); len(s.groups) > 0 || !want.MatchString(r) {
+		t.Errorf("summary:\n%s\nwant no failure, and a fallback matching %s", r, want)
+	}
+}
+
 // TestSearchCompose checks that the search finds simcompose's seeded bug,
 // and that each failure's command replays it in a new shell, in place of
 // the composer branch it failed in, setting the variable that plants the

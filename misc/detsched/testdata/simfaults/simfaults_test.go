@@ -1053,17 +1053,21 @@ func TestUDP(t *testing.T) {
 			})
 		})
 		toB := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 4001}
-		// recv reads one datagram on b within d.
+		// recv reads one datagram on b within d, on b, whose socket it
+		// is: another node's call on it would fail with EBADF.
 		recv := func(size int, d time.Duration) (n int, tos byte, from *net.UDPAddr, flags int, err error) {
-			buf, oob := make([]byte, size), make([]byte, 128)
-			cb.SetReadDeadline(time.Now().Add(d))
-			n, oobn, flags, from, err := cb.ReadMsgUDP(buf, oob)
-			msgs, _ := syscall.ParseSocketControlMessage(oob[:oobn])
-			for _, m := range msgs {
-				if m.Header.Level == syscall.IPPROTO_IP && m.Header.Type == syscall.IP_TOS {
-					tos = m.Data[0]
+			as(b, func() {
+				buf, oob := make([]byte, size), make([]byte, 128)
+				cb.SetReadDeadline(time.Now().Add(d))
+				var oobn int
+				n, oobn, flags, from, err = cb.ReadMsgUDP(buf, oob)
+				msgs, _ := syscall.ParseSocketControlMessage(oob[:oobn])
+				for _, m := range msgs {
+					if m.Header.Level == syscall.IPPROTO_IP && m.Header.Type == syscall.IP_TOS {
+						tos = m.Data[0]
+					}
 				}
-			}
+			})
 			return n, tos, from, flags, err
 		}
 		as(a, func() {
@@ -1132,7 +1136,7 @@ func TestUDP(t *testing.T) {
 			ca.WriteToUDP([]byte("n"), toB)
 			_, _, pub, _, err := recv(16, time.Second)
 			logf("udp from behind a NAT: from a public port %v %s", pub != nil && pub.Port != 4000, describe(err))
-			cb.WriteToUDP([]byte("r"), pub)
+			as(b, func() { cb.WriteToUDP([]byte("r"), pub) })
 			ca.SetReadDeadline(time.Now().Add(time.Second))
 			_, err = ca.Read(make([]byte, 16))
 			logf("udp a reply to the public port: %s", describe(err))
@@ -1140,7 +1144,7 @@ func TestUDP(t *testing.T) {
 			ca.WriteToUDP([]byte("n"), toB)
 			_, _, pub2, _, err := recv(16, time.Second)
 			logf("udp after a rebinding: from a new port %v %s", pub2 != nil && pub != nil && pub2.Port != pub.Port, describe(err))
-			cb.WriteToUDP([]byte("r"), pub)
+			as(b, func() { cb.WriteToUDP([]byte("r"), pub) })
 			ca.SetReadDeadline(time.Now().Add(time.Second))
 			_, err = ca.Read(make([]byte, 16))
 			logf("udp a reply to the old public port: %s", describe(err))

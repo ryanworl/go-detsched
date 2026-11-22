@@ -754,8 +754,8 @@ func (w *World) startDir(inc *incarnation, dirfd uintptr) (*disk, *inode, uintpt
 		}
 		return inc.node.disk, inc.cwd, 0
 	}
-	d := w.fds[int(dirfd)]
-	if d == nil || d.file == nil {
+	d, e := w.fd(inc, dirfd)
+	if e != 0 || d.file == nil {
 		return nil, nil, eBADF
 	}
 	if !d.file.ino.dir {

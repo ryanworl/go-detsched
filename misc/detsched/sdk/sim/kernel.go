@@ -9,6 +9,7 @@ package sim
 import (
 	"cmp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -116,6 +117,56 @@ func (w *World) noWatch(name string) uintptr {
 	return uintptr(syscall.ENOSYS)
 }
 
+// fd returns the descriptor fd, which a goroutine of incarnation inc, or
+// of no node (nil), passes to the call handle is handling, or EBADF. A
+// node's descriptors are its own, as a process's are: one that another
+// incarnation opened, on another node or in an earlier start of the same
+// node, is EBADF on the node, though all of them share one table here,
+// and the first such use says so (see foreignFD). A goroutine of no node,
+// such as the test's own, or the simulation's, uses any descriptor; a
+// finalizer or cleanup set on a node runs on that node.
+func (w *World) fd(inc *incarnation, fd uintptr) (*fdesc, uintptr) {
+	d := w.fds[int(fd)]
+	if inc == nil {
+		if d == nil {
+			return nil, eBADF
+		}
+		return d, 0
+	}
+	if d == nil {
+		if owner := w.closedFDs[int(fd)]; owner != nil && owner != inc {
+			w.foreignFD(inc, owner, fd, true)
+		}
+		return nil, eBADF
+	}
+	if d.inc != nil && d.inc != inc {
+		w.foreignFD(inc, d.inc, fd, false)
+		return nil, eBADF
+	}
+	return d, 0
+}
+
+// foreignFD says once, on standard error, that incarnation inc called
+// w.call on descriptor fd, which owner opened, and which closed says a
+// crash or stop of owner has closed since. Code often ignores the error
+// of a call such as Close, so the message names both incarnations and
+// the call. It is written directly, as noNodeSocket's is.
+func (w *World) foreignFD(inc, owner *incarnation, fd uintptr, closed bool) {
+	if w.fdMsg {
+		return
+	}
+	w.fdMsg = true
+	whose := "which node " + owner.name() + " opened"
+	if closed {
+		whose += " before it crashed or stopped"
+	}
+	msg := "sim: node " + inc.name() + " called " + callName(w.call) + " on descriptor " + strconv.Itoa(int(fd)) + ", " + whose + "; " +
+		"each node's descriptors are its own, as a process's are, so the call fails with EBADF. " +
+		"A harness that keeps an *os.File, a net.Conn, or a client that holds one where several nodes, or several starts of a node, reach it, " +
+		"such as in a package variable, shares it between them: open it in the code each node runs instead.\n"
+	syscall.RawSyscall(syscall.SYS_WRITE, 2, uintptr(unsafe.Pointer(unsafe.StringData(msg))), uintptr(len(msg)))
+}
+
 // The next descriptors newFD allocates. No number is used twice, not
 // even by a later world: the runtime finds a simulated socket's poll
 // descriptor by its number, and keeps those of the sockets that a world's
@@ -197,6 +248,10 @@ func (w *World) crash(inc *incarnation, process bool) {
 				d.file.ino.unlock(d.file)
 			}
 			delete(w.fds, fd)
+			if w.closedFDs == nil {
+				w.closedFDs = make(map[int]*incarnation)
+			}
+			w.closedFDs[fd] = inc
 		}
 	}
 	for s := range inc.socks {

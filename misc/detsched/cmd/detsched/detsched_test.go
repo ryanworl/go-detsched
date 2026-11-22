@@ -984,6 +984,15 @@ func TestSimPrograms(t *testing.T) {
 		{pkg: "simtempdir"},
 		// A watcher of file system changes on a node fails, and says why.
 		{pkg: "simwatch", want: []string{"which creates a watcher of file system changes"}},
+		// A node's use of a descriptor another node opened, or an
+		// earlier start of the same node, fails with EBADF, and the
+		// simulation says once per World whose it was, and in which
+		// call; the owner's and the test body's uses work.
+		{pkg: "simsharedfd", want: []string{
+			"sim: node b (start 1) called write on descriptor ", ", which node a (start 1) opened; each node's descriptors are its own",
+			"sim: node other (start 1) called write on descriptor ", ", which node client (start 1) opened; each",
+			"sim: node r (start 2) called write on descriptor ", ", which node r (start 1) opened before it crashed or stopped; each",
+		}},
 		// Finalizers and cleanups set in a bubble run in it, on their
 		// node, and not at all once their node crashed. Before, they ran
 		// outside every bubble, and closing a channel of the bubble ended

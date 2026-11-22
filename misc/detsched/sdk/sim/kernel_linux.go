@@ -10,6 +10,7 @@ import (
 	"cmp"
 	"runtime"
 	"slices"
+	"strconv"
 	"syscall"
 	"unsafe"
 )
@@ -50,6 +51,7 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 	if w == nil {
 		return
 	}
+	w.call = trap
 	inc := w.incs[node]
 	if node != 0 && inc == nil {
 		// A goroutine of a crashed node, running on to release a
@@ -83,9 +85,9 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 			}
 			return
 		}
-		d := w.fds[int(a[0])]
-		if d == nil {
-			return 0, 0, eBADF, true
+		d, e := w.fd(inc, a[0])
+		if e != 0 {
+			return 0, 0, e, true
 		}
 		if d.sock != nil {
 			r1, errno = w.sockCall(d, trap, a)
@@ -124,8 +126,8 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 		if !isSimFD(a[4]) {
 			return
 		}
-		d := w.fds[int(a[4])]
-		if d == nil || d.file == nil {
+		d, e := w.fd(inc, a[4])
+		if e != 0 || d.file == nil {
 			return 0, 0, eBADF, true
 		}
 		r1, errno = w.mmap(d.file, d.inc, a)
@@ -188,6 +190,37 @@ func handle(node int32, trap uintptr, a [6]uintptr) (r1, r2, errno uintptr, ok b
 		return ^uintptr(0), 0, w.noWatch("inotify_init1"), true // -1, which callers check
 	}
 	return
+}
+
+// callName returns the name of system call trap, for messages: those of
+// the calls handle passes a simulated descriptor to.
+func callName(trap uintptr) string {
+	if name, ok := callNames[trap]; ok {
+		return name
+	}
+	return "system call " + strconv.Itoa(int(trap))
+}
+
+var callNames = map[uintptr]string{
+	syscall.SYS_READ: "read", syscall.SYS_WRITE: "write", syscall.SYS_PREAD64: "pread64",
+	syscall.SYS_PWRITE64: "pwrite64", syscall.SYS_CLOSE: "close", syscall.SYS_FSTAT: "fstat",
+	syscall.SYS_LSEEK: "lseek", syscall.SYS_FSYNC: "fsync", syscall.SYS_FDATASYNC: "fdatasync",
+	syscall.SYS_FTRUNCATE: "ftruncate", syscall.SYS_GETDENTS64: "getdents64", syscall.SYS_FCNTL: "fcntl",
+	syscall.SYS_FLOCK: "flock", syscall.SYS_FCHMOD: "fchmod", syscall.SYS_FCHOWN: "fchown",
+	syscall.SYS_FCHDIR: "fchdir", syscall.SYS_FSTATFS: "fstatfs", syscall.SYS_FALLOCATE: "fallocate",
+	syscall.SYS_SYNC_FILE_RANGE: "sync_file_range", syscall.SYS_READV: "readv", syscall.SYS_WRITEV: "writev",
+	syscall.SYS_SHUTDOWN: "shutdown", syscall.SYS_GETSOCKOPT: "getsockopt", syscall.SYS_SETSOCKOPT: "setsockopt",
+	syscall.SYS_BIND: "bind", syscall.SYS_LISTEN: "listen", syscall.SYS_ACCEPT4: "accept4",
+	syscall.SYS_CONNECT: "connect", syscall.SYS_GETSOCKNAME: "getsockname", syscall.SYS_GETPEERNAME: "getpeername",
+	syscall.SYS_RECVFROM: "recvfrom", syscall.SYS_SENDTO: "sendto", syscall.SYS_RECVMSG: "recvmsg",
+	syscall.SYS_SENDMSG: "sendmsg", syscall.SYS_RECVMMSG: "recvmmsg", sysSendmmsg: "sendmmsg",
+	syscall.SYS_DUP: "dup", syscall.SYS_DUP3: "dup3", syscall.SYS_MMAP: "mmap",
+	syscall.SYS_OPENAT: "openat", sysNewfstatat: "newfstatat", syscall.SYS_MKDIRAT: "mkdirat",
+	syscall.SYS_UNLINKAT: "unlinkat", syscall.SYS_RENAMEAT: "renameat", sysRenameat2: "renameat2",
+	syscall.SYS_READLINKAT: "readlinkat", syscall.SYS_FACCESSAT: "faccessat", sysFaccessat2: "faccessat2",
+	syscall.SYS_FCHMODAT: "fchmodat", syscall.SYS_FCHOWNAT: "fchownat", syscall.SYS_UTIMENSAT: "utimensat",
+	syscall.SYS_SYMLINKAT: "symlinkat", syscall.SYS_LINKAT: "linkat", syscall.SYS_MKNODAT: "mknodat",
+	sysStatx: "statx", sysOpenat2: "openat2", syscall.SYS_INOTIFY_ADD_WATCH: "inotify_add_watch",
 }
 
 // realPrefixes are the read-only system files that nodes read from the

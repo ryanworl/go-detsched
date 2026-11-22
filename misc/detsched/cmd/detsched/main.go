@@ -297,6 +297,8 @@ type search struct {
 	refusal     uint64         // why the search stopped forking, or 0
 	skipped     int            // runs in which a branch of a composer timeline did not run
 	skipWhy     map[uint64]int // those runs, by why
+	sharedFD    int            // runs in which a node used another incarnation's descriptor
+	sharedFirst string         // what the first of them did, and its replay line
 	cut         int            // runs whose output was cut
 	passed      int            // runs that passed
 	yieldSites  []string
@@ -535,6 +537,7 @@ var (
 	failureLine   = regexp.MustCompile(`(?m)^(detsched: assertion failed: |panic: |fatal error: ).*`)
 	testFailure   = regexp.MustCompile(`(?m)^\s*--- FAIL: \S+`)
 	branchLine    = regexp.MustCompile(`(?m)^detsched: branch (\d+) \(GODETBRANCH=\d+ runs it in place\)$`)
+	sharedFDLine  = regexp.MustCompile(`(?m)^sim: (node .+ called \S+ on descriptor \d+, which node .+ opened(?: before it crashed or stopped)?); each node's descriptors are its own`)
 	skippedLine   = regexp.MustCompile(`(?m)^detsched: branch \d+ did not run: the process cannot fork now \((.*)\)$`)
 	assertDetails = regexp.MustCompile(`^detsched: assertion failed: .*?( map\[| \(and \d+ more failures?\)$)`)
 	errDetails    = regexp.MustCompile(`^map\[err:("(?:[^"\\]|\\.)*"|[^ "]*)\]( \(and \d+ more failures?\))?$`)
@@ -1688,6 +1691,11 @@ func (s *search) record(ctx context.Context, r *result, a int) error {
 	s.countAsserts(r.output)
 	s.countFaults(r.output)
 	s.countSkipped(r.output)
+	if m := sharedFDLine.FindSubmatch(r.output); m != nil {
+		if s.sharedFD++; s.sharedFD == 1 {
+			s.sharedFirst = string(m[1]) + "; replay it: " + s.replayLine(r, false)
+		}
+	}
 	s.bigOutput = max(s.bigOutput, r.outputSize)
 	if r.outputSize > maxOutput {
 		s.cut++
@@ -2122,6 +2130,11 @@ func (s *search) fallbacks() []fallback {
 		add("branch-did-not-run", fmt.Sprintf("in %d of %d runs a branch of the composer timeline did not run: the process could not fork (%s)", s.skipped, s.runs, forkReasons[most].why),
 			"those branches' Eventually and Finally checks did not run",
 			forkReasons[most].fix)
+	}
+	if s.sharedFD > 0 {
+		add("shared-descriptor", fmt.Sprintf("in %d of %d runs a simulated node used a file or socket descriptor that another node, or an earlier start of the same node, opened; first: %s", s.sharedFD, s.runs, s.sharedFirst),
+			"those calls failed with EBADF, which code often ignores, as from Close, so those runs tested nodes that share state no two processes share",
+			"open files and connections in the code each node runs, not in a package variable or other state that several nodes, or starts of a node, reach")
 	}
 	var bad, unchecked []string
 	for _, g := range s.groups {
