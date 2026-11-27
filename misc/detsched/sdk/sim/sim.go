@@ -139,6 +139,7 @@ type World struct {
 	nodes     []*Node
 	byIP      map[[4]byte]*Node
 	incs      map[int32]*incarnation // by node handle
+	frozen    int                    // goroutines that crashes froze, counted at each crash
 	failed    map[string]bool        // assertions that failed, which the timeline shows
 	quiet     int64                  // no buggify faults before then (calm)
 	setup     bool                   // true until setup completes (see calm)
@@ -925,6 +926,7 @@ func (n *Node) crashAs(process bool, ev string) {
 		n.throttled = false
 		n.throttlePaused = false
 		runtime_crash(inc.handle)
+		n.w.frozen += runtime_count(inc.handle)
 	})
 	if self {
 		if crashed {

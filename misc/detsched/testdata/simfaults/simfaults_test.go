@@ -1421,3 +1421,62 @@ func TestExclude(t *testing.T) {
 		logf("an excluded node: node faults hit it: %v, hit servers: %v, partitioned with some servers and not others: %v, an end of a faulty link: %v, clogged: %v", hitC, hitServers, split, link, clog)
 	})
 }
+
+// TestCrashCap checks that the nemesis stops crashing nodes once crashes
+// have frozen 10000 goroutines, and only then: a node that runs 1001
+// goroutines crashes 10 times in 10 hours of crash storms, and one that
+// runs none crashes again and again.
+func TestCrashCap(t *testing.T) {
+	if !sim.Supported() {
+		t.Skip("needs GOEXPERIMENT=detsched")
+	}
+	crashes := func(goroutines, hours int) int {
+		var n int
+		synctest.Test(t, func(t *testing.T) {
+			w := sim.NewWorld(sim.Config{})
+			defer w.Close()
+			block := make(chan struct{})
+			serve := func() {
+				for range goroutines - 1 {
+					go func() { <-block }()
+				}
+				if goroutines > 0 {
+					<-block
+				}
+			}
+			w.AddNode("a", "10.0.0.1").Start(serve)
+			cfg := sim.NemesisConfig{
+				// Only kills and process kills, so that every storm
+				// crashes the node as often as it can.
+				Disable: []string{sim.FaultPartition, sim.FaultClog, sim.FaultLink, sim.FaultRestore, sim.FaultStop, sim.FaultPause, sim.FaultThrottle, sim.FaultClockSkip, sim.FaultDisk, sim.FaultClockRate},
+				Restart: func(nd *sim.Node) { nd.Start(serve) },
+				Event: func(ev sim.Event) {
+					if ev.Start && (ev.Kind == sim.FaultKill || ev.Kind == sim.FaultKillProcess) {
+						n++
+					}
+				},
+			}
+			// Each nemesis draws a run's shape, and some runs have no
+			// faults. Stop at 11 crashes of the large node, before an
+			// uncapped nemesis fills memory with frozen goroutines.
+			for range hours {
+				nm := w.NewNemesis(cfg)
+				nm.Start()
+				for range 60 {
+					if goroutines > 0 && n > 10 {
+						break
+					}
+					time.Sleep(time.Minute)
+				}
+				nm.Stop()
+			}
+		})
+		return n
+	}
+	if n := crashes(1001, 10); n != 10 {
+		t.Errorf("a node of 1001 goroutines crashed %d times, want 10", n)
+	}
+	if n := crashes(0, 2); n < 100 {
+		t.Errorf("a node of no goroutines crashed %d times in 2 hours, want at least 100", n)
+	}
+}

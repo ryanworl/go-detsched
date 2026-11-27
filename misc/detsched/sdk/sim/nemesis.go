@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,13 @@ import (
 // of a search draws the shape and the current storm or calm again. A
 // process kill is three times as likely as any other kind.
 //
+// Once crashes have frozen 10000 goroutines in all, the nemesis kills,
+// process kills, and stops no more nodes for the rest of the run: a
+// crashed incarnation's goroutines, and the memory they hold, stay for
+// the rest of the test, so a long storm of crashes of a large server
+// would fill memory and slow the run until it timed out. The fault
+// timeline says when crashes stop.
+//
 // The nemesis reports each action as an assertion (assert.Reachable, such
 // as "nemesis: clog jammed"), in the fault timeline that a failing run
 // prints, and to NemesisConfig.Event, through which a harness can track
@@ -63,6 +71,7 @@ type Nemesis struct {
 	active []*activeFault // faults to end, by end time
 	down   map[*Node]bool // nodes the nemesis took down or paused
 	rated  map[*Node]bool // nodes whose clock rate the nemesis changed
+	capped bool           // crashes stopped at frozenMax
 
 	storm    bool          // in a storm; otherwise in a calm
 	calls    uint32        // harness callbacks begun and ended; see nemesisNode
@@ -118,6 +127,10 @@ const (
 	gapMin, gapMax         = 50 * time.Millisecond, 5 * time.Second
 	durMin, durMax         = 100 * time.Millisecond, 20 * time.Second
 )
+
+// frozenMax is how many goroutines crashes may freeze in all before the
+// nemesis stops crashing nodes.
+const frozenMax = 10000
 
 // NemesisConfig configures a Nemesis.
 type NemesisConfig struct {
@@ -597,6 +610,14 @@ func (nm *Nemesis) inject() {
 		return
 	case FaultKill, FaultKillProcess, FaultStop, FaultPause, FaultThrottle:
 		if len(nm.down) >= maxDown {
+			return
+		}
+		if kind != FaultPause && kind != FaultThrottle && w.frozen >= frozenMax {
+			if !nm.capped {
+				nm.capped = true
+				assert.Reachable("nemesis: crashes stop at the frozen goroutine cap", nil)
+				w.logEvent("nemesis", "no more crashes:", strconv.Itoa(w.frozen), "goroutines of crashed nodes are frozen")
+			}
 			return
 		}
 		focused := slices.Contains(nodes, nm.focus)
